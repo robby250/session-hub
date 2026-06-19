@@ -12,7 +12,11 @@ sed "s|@PROJECT_DIR@|$PROJECT_DIR|g" \
   "$PROJECT_DIR/session-hub.desktop.in" \
   > "$APPLICATIONS_DIR/session-hub.desktop"
 
-chmod +x "$PROJECT_DIR/session_hub.py" "$BIN_DIR/session-hub"
+chmod +x \
+  "$PROJECT_DIR/session_hub.py" \
+  "$BIN_DIR/session-hub" \
+  "$APPLICATIONS_DIR/session-hub.desktop"
+gio set "$APPLICATIONS_DIR/session-hub.desktop" metadata::trusted true 2>/dev/null || true
 update-desktop-database "$APPLICATIONS_DIR" 2>/dev/null || true
 
 echo "Session Hub installed."

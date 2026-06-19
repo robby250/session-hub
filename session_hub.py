@@ -154,13 +154,18 @@ def claude_history_index() -> dict[str, dict]:
     return index
 
 
+def claude_project_key(path: str) -> str:
+    """Return the directory key Claude uses below ~/.claude/projects."""
+    return path.replace("/", "-").replace(".", "-")
+
+
 def inspect_claude_file(path: Path) -> dict:
     result: dict = {}
-    bytes_read = 0
+    project_key = path.parent.name
+    cwd_counts: dict[str, int] = {}
     try:
         with path.open(encoding="utf-8", errors="replace") as handle:
             for line in handle:
-                bytes_read += len(line)
                 if len(line) > 2_000_000:
                     continue
                 try:
@@ -169,8 +174,11 @@ def inspect_claude_file(path: Path) -> dict:
                     continue
                 if row.get("type") == "ai-title" and row.get("aiTitle"):
                     result["title"] = row["aiTitle"]
-                if row.get("cwd") and not result.get("cwd"):
-                    result["cwd"] = row["cwd"]
+                cwd = row.get("cwd")
+                if cwd:
+                    cwd_counts[cwd] = cwd_counts.get(cwd, 0) + 1
+                    if claude_project_key(cwd) == project_key:
+                        result["project_cwd"] = cwd
                 if row.get("timestamp"):
                     try:
                         stamp = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00"))
@@ -180,10 +188,10 @@ def inspect_claude_file(path: Path) -> dict:
                         )
                     except (TypeError, ValueError):
                         pass
-                if bytes_read > 4_000_000 and result.get("title") and result.get("cwd"):
-                    break
     except OSError:
         pass
+    if not result.get("project_cwd") and cwd_counts:
+        result["observed_cwd"] = max(cwd_counts, key=cwd_counts.get)
     return result
 
 
@@ -195,12 +203,18 @@ def claude_sessions() -> list[Session]:
         info = dict(history.get(session_id, {}))
         file_info = inspect_claude_file(path)
         info.update({key: value for key, value in file_info.items() if value})
+        cwd = (
+            info.get("project_cwd")
+            or info.get("cwd")
+            or info.get("observed_cwd")
+            or str(HOME)
+        )
         sessions.append(
             Session(
                 "Claude",
                 session_id,
                 clean_title(info.get("title", ""), f"Claude {session_id[:8]}"),
-                info.get("cwd") or str(HOME),
+                cwd,
                 int(info.get("updated_ms") or path.stat().st_mtime * 1000),
                 path,
             )

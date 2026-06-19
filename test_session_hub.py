@@ -1,4 +1,6 @@
 import os
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -27,6 +29,24 @@ class SessionHubTests(unittest.TestCase):
         self.assertEqual(window.table.rowCount(), len(window.sessions))
         self.assertGreater(window.table.rowCount(), 0)
         window.close()
+
+    def test_claude_project_directory_beats_home_cwd(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "-home-user-projects-example-project"
+            project.mkdir()
+            history = project / "session.jsonl"
+            rows = [
+                {"type": "user", "cwd": "/home/user"},
+                {"type": "assistant", "cwd": "/home/user/projects/example-project"},
+            ]
+            history.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            info = session_hub.inspect_claude_file(history)
+            self.assertEqual(
+                info["project_cwd"], "/home/user/projects/example-project"
+            )
 
     @patch("session_hub.shutil.which")
     def test_codex_resume_uses_new_gnome_terminal_window(self, which):
