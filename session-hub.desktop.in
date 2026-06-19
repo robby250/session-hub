@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Session Hub
+Comment=Browse and resume Claude Code and Codex sessions
+Exec=python3 @PROJECT_DIR@/session_hub.py
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;
+StartupNotify=true
+Keywords=Claude;Codex;AI;Session;
