@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import select
 import shutil
 import sqlite3
 import subprocess
@@ -13,11 +15,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import QDateTime, Qt
+from PyQt6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFrame,
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -25,6 +33,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -50,12 +59,203 @@ class Session:
     session_id: str
     title: str
     cwd: str
+    source_cwd: str
     updated_ms: int
     path: Path
 
     @property
     def key(self) -> str:
         return f"{self.provider}:{self.session_id}"
+
+
+@dataclass
+class UsageWindow:
+    name: str
+    used_percent: int
+    resets: str
+
+
+def format_reset_timestamp(timestamp: int | None) -> str:
+    if not timestamp:
+        return "Reset time unavailable"
+    value = datetime.fromtimestamp(timestamp)
+    return f"Resets {value.strftime('%Y-%m-%d %H:%M')}"
+
+
+def format_claude_reset(value: str, now: datetime | None = None) -> str:
+    """Normalize Claude's English reset text to the same local format as Codex."""
+    match = re.fullmatch(
+        r"([A-Z][a-z]{2})\s+(\d{1,2}),\s+(\d{1,2})(?::(\d{2}))?(am|pm)"
+        r"(?:\s+\([^)]+\))?",
+        value.strip(),
+    )
+    if not match:
+        return f"Resets {value.strip()}"
+    month_name, day, hour, minute, meridiem = match.groups()
+    months = {
+        "Jan": 1,
+        "Feb": 2,
+        "Mar": 3,
+        "Apr": 4,
+        "May": 5,
+        "Jun": 6,
+        "Jul": 7,
+        "Aug": 8,
+        "Sep": 9,
+        "Oct": 10,
+        "Nov": 11,
+        "Dec": 12,
+    }
+    current = now or datetime.now()
+    hour_value = int(hour) % 12 + (12 if meridiem == "pm" else 0)
+    reset = datetime(
+        current.year,
+        months[month_name],
+        int(day),
+        hour_value,
+        int(minute or 0),
+    )
+    if reset < current:
+        reset = reset.replace(year=current.year + 1)
+    return f"Resets {reset.strftime('%Y-%m-%d %H:%M')}"
+
+
+def parse_claude_usage(text: str) -> list[UsageWindow]:
+    pattern = re.compile(
+        r"^(Current session|Current week \(all models\)):\s*"
+        r"(\d+)% used\s*[·•]\s*resets (.+)$",
+        re.MULTILINE,
+    )
+    return [
+        UsageWindow(
+            "5-hour" if label == "Current session" else "Weekly",
+            max(0, min(100, int(percent))),
+            format_claude_reset(reset),
+        )
+        for label, percent, reset in pattern.findall(text)
+    ]
+
+
+def read_codex_usage(timeout: float = 12.0) -> list[UsageWindow]:
+    process = subprocess.Popen(
+        [executable("codex"), "app-server", "--listen", "stdio://"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    requests = (
+        {
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "session-hub",
+                    "title": "Session Hub",
+                    "version": "0.2.0",
+                }
+            },
+        },
+        {"method": "initialized", "params": {}},
+        {"id": 2, "method": "account/rateLimits/read", "params": None},
+    )
+    try:
+        if process.stdin is None or process.stdout is None:
+            raise RuntimeError("Could not communicate with the Codex app server.")
+        for request in requests:
+            process.stdin.write(json.dumps(request) + "\n")
+            process.stdin.flush()
+        deadline = datetime.now().timestamp() + timeout
+        while datetime.now().timestamp() < deadline:
+            ready, _, _ = select.select([process.stdout], [], [], 0.25)
+            if not ready:
+                if process.poll() is not None:
+                    break
+                continue
+            line = process.stdout.readline()
+            if not line:
+                continue
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if response.get("id") != 2:
+                continue
+            snapshot = response.get("result", {}).get("rateLimits", {})
+            windows = []
+            for key, fallback in (("primary", "5-hour"), ("secondary", "Weekly")):
+                window = snapshot.get(key)
+                if not window:
+                    continue
+                duration = window.get("windowDurationMins")
+                name = (
+                    f"{duration // 60}-hour"
+                    if duration and duration < 1440
+                    else "Weekly" if duration else fallback
+                )
+                windows.append(
+                    UsageWindow(
+                        name,
+                        max(0, min(100, int(window.get("usedPercent", 0)))),
+                        format_reset_timestamp(window.get("resetsAt")),
+                    )
+                )
+            if windows:
+                return windows
+            raise RuntimeError("Codex returned no usage windows.")
+        raise TimeoutError("Codex usage request timed out.")
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
+def read_claude_usage(timeout: float = 15.0) -> list[UsageWindow]:
+    result = subprocess.run(
+        [
+            executable("claude"),
+            "-p",
+            "/usage",
+            "--no-session-persistence",
+            "--output-format",
+            "json",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "Claude usage request failed.")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Claude returned invalid usage data.") from error
+    windows = parse_claude_usage(str(payload.get("result") or ""))
+    if not windows:
+        raise RuntimeError("Claude returned no recognizable usage windows.")
+    return windows
+
+
+class UsageWorkerSignals(QObject):
+    finished = pyqtSignal(str, object, str)
+
+
+class UsageWorker(QRunnable):
+    def __init__(self, provider: str) -> None:
+        super().__init__()
+        self.provider = provider
+        self.signals = UsageWorkerSignals()
+
+    def run(self) -> None:
+        try:
+            reader = read_codex_usage if self.provider == "Codex" else read_claude_usage
+            self.signals.finished.emit(self.provider, reader(), "")
+        except Exception as error:
+            self.signals.finished.emit(self.provider, [], str(error))
 
 
 def read_metadata() -> dict:
@@ -101,6 +301,7 @@ def codex_sessions() -> list[Session]:
                             session_id,
                             clean_title(title, f"Codex {session_id[:8]}"),
                             cwd or str(HOME),
+                            cwd or str(HOME),
                             int(updated_ms or path.stat().st_mtime * 1000),
                             path,
                         )
@@ -119,6 +320,7 @@ def codex_sessions() -> list[Session]:
                     "Codex",
                     session_id,
                     f"Codex {session_id[:8]}",
+                    payload.get("cwd") or str(HOME),
                     payload.get("cwd") or str(HOME),
                     int(path.stat().st_mtime * 1000),
                     path,
@@ -215,6 +417,7 @@ def claude_sessions() -> list[Session]:
                 session_id,
                 clean_title(info.get("title", ""), f"Claude {session_id[:8]}"),
                 cwd,
+                cwd,
                 int(info.get("updated_ms") or path.stat().st_mtime * 1000),
                 path,
             )
@@ -240,17 +443,69 @@ def executable(name: str) -> str:
     return str(local)
 
 
+class SettingsDialog(QDialog):
+    def __init__(self, settings: dict, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Session Hub Settings")
+        self.setMinimumWidth(520)
+        layout = QVBoxLayout(self)
+
+        group = QGroupBox("Global launch permissions")
+        group_layout = QVBoxLayout(group)
+        self.codex_danger = QCheckBox(
+            "Codex: bypass approvals and sandbox for every Session Hub launch"
+        )
+        self.claude_danger = QCheckBox(
+            "Claude: skip permission prompts for every Session Hub launch"
+        )
+        self.codex_danger.setChecked(bool(settings.get("codex_danger_mode", False)))
+        self.claude_danger.setChecked(bool(settings.get("claude_danger_mode", False)))
+        group_layout.addWidget(self.codex_danger)
+        group_layout.addWidget(self.claude_danger)
+        layout.addWidget(group)
+
+        warning = QLabel(
+            "Danger mode lets an agent execute commands and modify files without "
+            "normal approval checks. These switches affect launches from Session Hub only."
+        )
+        warning.setWordWrap(True)
+        warning.setStyleSheet("color: #d9534f;")
+        layout.addWidget(warning)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> dict:
+        return {
+            "codex_danger_mode": self.codex_danger.isChecked(),
+            "claude_danger_mode": self.claude_danger.isChecked(),
+        }
+
+
 class SessionHub(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.metadata = read_metadata()
         self.sessions: list[Session] = []
+        self.usage_widgets: dict[str, list[tuple[QLabel, QProgressBar, QLabel]]] = {}
+        self.usage_workers: dict[str, UsageWorker] = {}
+        self.thread_pool = QThreadPool.globalInstance()
         self.setWindowTitle("Session Hub")
         self.setWindowIcon(QIcon.fromTheme("utilities-terminal"))
-        self.resize(1280, 760)
-        self.setMinimumSize(900, 520)
+        self.resize(1280, 900)
+        self.setMinimumSize(900, 650)
         self.build_ui()
         self.refresh()
+        QTimer.singleShot(0, self.refresh_usage)
+        self.usage_timer = QTimer(self)
+        self.usage_timer.setInterval(5 * 60 * 1000)
+        self.usage_timer.timeout.connect(self.refresh_usage)
+        self.usage_timer.start()
 
     def build_ui(self) -> None:
         root = QWidget()
@@ -266,12 +521,39 @@ class SessionHub(QMainWindow):
         for label, slot in (
             ("New Codex", lambda: self.launch_new("Codex")),
             ("New Claude", lambda: self.launch_new("Claude")),
-            ("Refresh", self.refresh),
+            ("Refresh", self.refresh_all),
+            ("Settings", self.open_settings),
         ):
             button = QPushButton(label)
             button.clicked.connect(slot)
             toolbar.addWidget(button)
         layout.addLayout(toolbar)
+
+        usage_frame = QFrame()
+        usage_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        usage_layout = QGridLayout(usage_frame)
+        usage_layout.setContentsMargins(12, 8, 12, 8)
+        usage_layout.setHorizontalSpacing(18)
+        usage_layout.setVerticalSpacing(4)
+        for column, provider in enumerate(("Codex", "Claude")):
+            offset = column * 2
+            usage_layout.addWidget(QLabel(f"<b>{provider} usage</b>"), 0, offset, 1, 2)
+            rows = []
+            for index, window_name in enumerate(("5-hour", "Weekly")):
+                label = QLabel(window_name)
+                bar = QProgressBar()
+                bar.setRange(0, 100)
+                bar.setValue(0)
+                bar.setFormat("Loading…")
+                detail = QLabel("")
+                detail.setStyleSheet("color: #888;")
+                row = 1 + index * 2
+                usage_layout.addWidget(label, row, offset)
+                usage_layout.addWidget(bar, row, offset + 1)
+                usage_layout.addWidget(detail, row + 1, offset, 1, 2)
+                rows.append((label, bar, detail))
+            self.usage_widgets[provider] = rows
+        layout.addWidget(usage_frame)
 
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
@@ -310,6 +592,68 @@ class SessionHub(QMainWindow):
             actions.addWidget(button)
         layout.addLayout(actions)
         self.setCentralWidget(root)
+
+        settings_menu = self.menuBar().addMenu("Settings")
+        permissions_action = QAction("Launch permissions…", self)
+        permissions_action.triggered.connect(self.open_settings)
+        settings_menu.addAction(permissions_action)
+
+    def settings(self) -> dict:
+        return self.metadata.setdefault("settings", {})
+
+    def open_settings(self) -> None:
+        dialog = SettingsDialog(self.settings(), self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.metadata["settings"] = dialog.values()
+            write_metadata(self.metadata)
+
+    def refresh_usage(self) -> None:
+        if self.usage_workers:
+            return
+        for provider, rows in self.usage_widgets.items():
+            for _, bar, detail in rows:
+                bar.setValue(0)
+                bar.setFormat("Loading…")
+                bar.setStyleSheet("")
+                detail.setText("")
+            worker = UsageWorker(provider)
+            worker.signals.finished.connect(self.usage_loaded)
+            self.usage_workers[provider] = worker
+            self.thread_pool.start(worker)
+
+    def usage_loaded(
+        self, provider: str, windows: list[UsageWindow], error: str
+    ) -> None:
+        self.usage_workers.pop(provider, None)
+        rows = self.usage_widgets[provider]
+        if error:
+            for index, (_, bar, detail) in enumerate(rows):
+                bar.setFormat("Unavailable")
+                detail.setText(error if index == 0 else "")
+        else:
+            by_name = {window.name: window for window in windows}
+            for expected, (_, bar, detail) in zip(("5-hour", "Weekly"), rows):
+                window = by_name.get(expected)
+                if not window:
+                    bar.setFormat("Unavailable")
+                    detail.setText("")
+                    continue
+                remaining = 100 - window.used_percent
+                bar.setValue(remaining)
+                bar.setFormat(f"{remaining}% left ({window.used_percent}% used)")
+                detail.setText(window.resets)
+                color = (
+                    "#3da35d"
+                    if remaining > 40
+                    else "#d69e2e" if remaining > 15 else "#d9534f"
+                )
+                bar.setStyleSheet(
+                    "QProgressBar { text-align: center; } "
+                    f"QProgressBar::chunk {{ background-color: {color}; }}"
+                )
+    def refresh_all(self) -> None:
+        self.refresh()
+        self.refresh_usage()
 
     def refresh(self) -> None:
         self.sessions = discover_sessions(self.metadata)
@@ -377,8 +721,16 @@ class SessionHub(QMainWindow):
         if directory:
             self.save_override(session, "cwd", directory)
 
-    def terminal_command(self, provider: str, session_id: str | None, cwd: str) -> list[str]:
+    def terminal_command(
+        self,
+        provider: str,
+        session_id: str | None,
+        cwd: str,
+        source_cwd: str | None = None,
+    ) -> list[str]:
         title = f"{provider} — {Path(cwd).name or cwd}"
+        launch_cwd = source_cwd if provider == "Claude" and session_id else cwd
+        launch_cwd = launch_cwd or cwd
         terminal = shutil.which("gnome-terminal")
         if not terminal:
             terminal = shutil.which("x-terminal-emulator")
@@ -387,29 +739,53 @@ class SessionHub(QMainWindow):
 
         command = [terminal]
         if Path(terminal).name == "gnome-terminal":
-            command += ["--window", f"--working-directory={cwd}", f"--title={title}", "--"]
+            command += [
+                "--window",
+                f"--working-directory={launch_cwd}",
+                f"--title={title}",
+                "--",
+            ]
         else:
             command += ["-e"]
 
         if provider == "Codex":
             command += [executable("codex")]
+            if self.settings().get("codex_danger_mode", False):
+                command += ["--dangerously-bypass-approvals-and-sandbox"]
             if session_id:
                 command += ["resume", "-C", cwd, session_id]
             else:
                 command += ["-C", cwd]
         else:
             command += [executable("claude")]
+            if self.settings().get("claude_danger_mode", False):
+                command += ["--dangerously-skip-permissions"]
             if session_id:
                 command += ["--resume", session_id]
+                if Path(launch_cwd) != Path(cwd):
+                    command += [f"/cd {cwd}"]
         return command
 
-    def launch(self, provider: str, session_id: str | None, cwd: str) -> None:
+    def launch(
+        self,
+        provider: str,
+        session_id: str | None,
+        cwd: str,
+        source_cwd: str | None = None,
+    ) -> None:
         if not Path(cwd).is_dir():
             QMessageBox.warning(self, "Missing directory", f"This directory does not exist:\n{cwd}")
             return
+        if source_cwd and not Path(source_cwd).is_dir():
+            QMessageBox.warning(
+                self,
+                "Missing original directory",
+                f"The session's original directory does not exist:\n{source_cwd}",
+            )
+            return
         try:
             subprocess.Popen(
-                self.terminal_command(provider, session_id, cwd),
+                self.terminal_command(provider, session_id, cwd, source_cwd),
                 start_new_session=True,
             )
         except (OSError, RuntimeError) as error:
@@ -418,7 +794,12 @@ class SessionHub(QMainWindow):
     def resume_selected(self) -> None:
         session = self.selected()
         if session:
-            self.launch(session.provider, session.session_id, session.cwd)
+            self.launch(
+                session.provider,
+                session.session_id,
+                session.cwd,
+                session.source_cwd,
+            )
 
     def launch_new(self, provider: str) -> None:
         directory = QFileDialog.getExistingDirectory(

@@ -7,6 +7,9 @@ A small Linux desktop launcher for local Claude Code and Codex sessions.
 - Lists local sessions from both agents
 - Filters by title, agent, directory, or session ID
 - Stores custom names and working-directory overrides without modifying history files
+- Shows remaining 5-hour and weekly usage with reset times for both agents
+- Supports optional per-agent danger-mode launch settings
+- Automatically changes Claude's directory after resuming from its original project
 - Resumes every session in a separate terminal window
 - Starts new Claude or Codex sessions in a chosen directory
 - Moves deleted histories into recoverable application trash
