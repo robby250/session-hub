@@ -1,17 +1,25 @@
 # Session Hub
 
-A small Linux desktop launcher for local Claude Code and Codex sessions.
+A small Linux desktop launcher for local Codex, Claude Code, and Antigravity sessions.
 
 ## Features
 
 - Lists local sessions from both agents
 - Filters by title, agent, directory, or session ID
 - Stores custom names and working-directory overrides without modifying history files
-- Shows remaining 5-hour and weekly usage with reset times for both agents
+- Shows Codex and Claude 5-hour/weekly usage plus Antigravity's two weekly model pools
 - Supports optional per-agent danger-mode launch settings
 - Automatically changes Claude's directory after resuming from its original project
+- Offers Home, configurable Primary/Secondary project roots, and existing folders
+- Moves projects safely between primary and secondary roots in either direction
+- Remembers the window size and position
+- Restores or permanently deletes trashed sessions from Settings
+- Optionally purges deleted sessions after 7, 30, or 90 days
+- Continues a task with the other agent through a local context handoff
+- Groups linked native transcripts across all three agents into one visible logical session
+- Can ask the active agent to prepare a structured full-session handoff summary
 - Resumes every session in a separate terminal window
-- Starts new Claude or Codex sessions in a chosen directory
+- Starts new Codex, Claude, or Antigravity sessions in a chosen directory
 - Moves deleted histories into recoverable application trash
 
 ## Requirements
@@ -19,7 +27,7 @@ A small Linux desktop launcher for local Claude Code and Codex sessions.
 - Python 3
 - PyQt6
 - GNOME Terminal
-- Claude Code and/or Codex installed
+- Codex, Claude Code, and/or Antigravity CLI installed
 
 ## Install
 

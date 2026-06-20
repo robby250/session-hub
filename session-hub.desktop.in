@@ -1,10 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=Session Hub
-Comment=Browse and resume Claude Code and Codex sessions
+Comment=Browse and resume Codex, Claude Code, and Antigravity sessions
 Exec=@PROJECT_DIR@/session_hub.py
-Icon=utilities-terminal
+Icon=session-hub
 Terminal=false
 Categories=Development;
 StartupNotify=true
-Keywords=Claude;Codex;AI;Session;
+StartupWMClass=session-hub
+Keywords=Claude;Codex;Antigravity;Gemini;AI;Session;
