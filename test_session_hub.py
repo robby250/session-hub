@@ -823,7 +823,65 @@ class SessionHubTests(unittest.TestCase):
             values["secondary_projects_dir"],
             str(Path("~/synced-code").expanduser()),
         )
+        self.assertTrue(values["enable_codex"])
+        self.assertTrue(values["enable_claude"])
+        self.assertTrue(values["enable_antigravity"])
+
+        # Test validation: uncheck two, remaining one should be disabled
+        dialog.enable_codex.setChecked(False)
+        dialog.enable_claude.setChecked(False)
+        self.assertFalse(dialog.enable_antigravity.isEnabled())
+        
+        # Checking one back should re-enable it
+        dialog.enable_codex.setChecked(True)
+        self.assertTrue(dialog.enable_antigravity.isEnabled())
         dialog.close()
+
+    def test_settings_toggles_hide_providers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fake_metadata = Path(temp) / "metadata.json"
+            fake_metadata.write_text(json.dumps({
+                "settings": {
+                    "enable_codex": False,
+                    "enable_claude": True,
+                    "enable_antigravity": True
+                }
+            }))
+            with (
+                patch("session_hub.METADATA_PATH", fake_metadata),
+                patch("session_hub.codex_sessions", return_value=[
+                    session_hub.Session("Codex", "id", "C", "/cwd", "/cwd", 0, Path("/p"))
+                ]),
+                patch("session_hub.claude_sessions", return_value=[]),
+                patch("session_hub.antigravity_sessions", return_value=[]),
+            ):
+                # 1. Discover sessions: Codex sessions should be skipped
+                sessions = session_hub.discover_sessions(session_hub.read_metadata())
+                self.assertEqual(len(sessions), 0)
+
+                # 2. Open Settings dialog and check visibility toggle UI update
+                window = session_hub.SessionHub()
+                window.usage_headers = {
+                    "Codex": session_hub.QLabel(),
+                    "Claude": session_hub.QLabel(),
+                    "Antigravity": session_hub.QLabel(),
+                }
+                window.usage_widgets = {
+                    "Codex": [(session_hub.QLabel(), session_hub.QProgressBar(), session_hub.QLabel())],
+                    "Claude": [],
+                    "Antigravity": [],
+                }
+                window.update_usage_visibility()
+                self.assertFalse(window.usage_headers["Codex"].isVisible())
+                self.assertTrue(window.usage_headers["Claude"].isVisible())
+
+                # 3. New dropdown should only list enabled providers
+                window.update_new_provider_list()
+                items = [window.new_provider.itemText(i) for i in range(window.new_provider.count())]
+                self.assertNotIn("Codex", items)
+                self.assertIn("Claude", items)
+
+                window.close()
 
     def test_project_move_works_in_both_directions(self):
         with tempfile.TemporaryDirectory() as temp:

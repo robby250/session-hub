@@ -723,7 +723,14 @@ def resolve_pending_handoffs(metadata: dict, sessions: list[Session]) -> bool:
 
 
 def discover_sessions(metadata: dict) -> list[Session]:
-    sessions = codex_sessions() + claude_sessions() + antigravity_sessions()
+    settings = metadata.get("settings", {})
+    sessions = []
+    if settings.get("enable_codex", True):
+        sessions += codex_sessions()
+    if settings.get("enable_claude", True):
+        sessions += claude_sessions()
+    if settings.get("enable_antigravity", True):
+        sessions += antigravity_sessions()
     if resolve_pending_handoffs(metadata, sessions):
         write_metadata(metadata)
     by_key = {session.native_key: session for session in sessions}
@@ -1010,6 +1017,26 @@ class SettingsDialog(QDialog):
         self.setMinimumWidth(520)
         layout = QVBoxLayout(self)
 
+        # Enabled agents
+        agents_group = QGroupBox("Enabled agents")
+        agents_layout = QHBoxLayout(agents_group)
+        self.enable_codex = QCheckBox("Codex")
+        self.enable_claude = QCheckBox("Claude")
+        self.enable_antigravity = QCheckBox("Antigravity")
+        
+        self.enable_codex.setChecked(bool(settings.get("enable_codex", True)))
+        self.enable_claude.setChecked(bool(settings.get("enable_claude", True)))
+        self.enable_antigravity.setChecked(bool(settings.get("enable_antigravity", True)))
+        
+        self.enable_codex.toggled.connect(self.validate_enabled_agents)
+        self.enable_claude.toggled.connect(self.validate_enabled_agents)
+        self.enable_antigravity.toggled.connect(self.validate_enabled_agents)
+        
+        agents_layout.addWidget(self.enable_codex)
+        agents_layout.addWidget(self.enable_claude)
+        agents_layout.addWidget(self.enable_antigravity)
+        layout.addWidget(agents_group)
+
         group = QGroupBox("Global launch permissions")
         group_layout = QVBoxLayout(group)
         self.codex_danger = QCheckBox(
@@ -1100,11 +1127,26 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self.validate_enabled_agents()
+
+    def validate_enabled_agents(self) -> None:
+        checked = [
+            cb for cb in (self.enable_codex, self.enable_claude, self.enable_antigravity)
+            if cb.isChecked()
+        ]
+        if len(checked) == 1:
+            checked[0].setEnabled(False)
+        else:
+            for cb in (self.enable_codex, self.enable_claude, self.enable_antigravity):
+                cb.setEnabled(True)
 
     def values(self) -> dict:
         values = dict(self.original_settings)
         values.update(
             {
+                "enable_codex": self.enable_codex.isChecked(),
+                "enable_claude": self.enable_claude.isChecked(),
+                "enable_antigravity": self.enable_antigravity.isChecked(),
                 "codex_danger_mode": self.codex_danger.isChecked(),
                 "claude_danger_mode": self.claude_danger.isChecked(),
                 "antigravity_danger_mode": self.antigravity_danger.isChecked(),
@@ -1604,6 +1646,7 @@ class SessionHub(QMainWindow):
         self.metadata = read_metadata()
         self.sessions: list[Session] = []
         self.usage_widgets: dict[str, list[tuple[QLabel, QProgressBar, QLabel]]] = {}
+        self.usage_headers: dict[str, QLabel] = {}
         self.usage_workers: dict[str, UsageWorker] = {}
         self.thread_pool = QThreadPool.globalInstance()
         self.setWindowTitle("Session Hub")
@@ -1613,6 +1656,8 @@ class SessionHub(QMainWindow):
         self.resize(1280, 900)
         self.setMinimumSize(900, 650)
         self.build_ui()
+        self.update_usage_visibility()
+        self.update_new_provider_list()
         self.restore_window_geometry()
         self.purge_expired_trash()
         self.refresh()
@@ -1659,7 +1704,9 @@ class SessionHub(QMainWindow):
         usage_layout.setVerticalSpacing(4)
         for column, provider in enumerate(PROVIDERS):
             offset = column * 2
-            usage_layout.addWidget(QLabel(f"<b>{provider} usage</b>"), 0, offset, 1, 2)
+            header = QLabel(f"<b>{provider} usage</b>")
+            usage_layout.addWidget(header, 0, offset, 1, 2)
+            self.usage_headers[provider] = header
             rows = []
             default_names = (
                 (
@@ -1763,12 +1810,42 @@ class SessionHub(QMainWindow):
             write_metadata(latest)
         super().closeEvent(event)
 
+    def update_usage_visibility(self) -> None:
+        settings = self.settings()
+        for provider in PROVIDERS:
+            enabled = bool(settings.get(f"enable_{provider.lower()}", True))
+            if provider in self.usage_headers:
+                self.usage_headers[provider].setVisible(enabled)
+            if provider in self.usage_widgets:
+                for label, bar, detail in self.usage_widgets[provider]:
+                    label.setVisible(enabled)
+                    bar.setVisible(enabled)
+                    detail.setVisible(enabled)
+
+    def update_new_provider_list(self) -> None:
+        settings = self.settings()
+        current = self.new_provider.currentText()
+        self.new_provider.clear()
+        enabled_providers = [
+            provider for provider in PROVIDERS
+            if bool(settings.get(f"enable_{provider.lower()}", True))
+        ]
+        self.new_provider.addItems(enabled_providers)
+        idx = self.new_provider.findText(current)
+        if idx >= 0:
+            self.new_provider.setCurrentIndex(idx)
+        elif self.new_provider.count() > 0:
+            self.new_provider.setCurrentIndex(0)
+
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.settings(), self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.metadata["settings"] = dialog.values()
             write_metadata(self.metadata)
             self.purge_expired_trash()
+            self.update_usage_visibility()
+            self.update_new_provider_list()
+            self.refresh()
 
     def open_deleted_sessions(self) -> None:
         DeletedSessionsDialog(self, self).exec()
@@ -1927,7 +2004,10 @@ class SessionHub(QMainWindow):
     def refresh_usage(self) -> None:
         if self.usage_workers:
             return
+        settings = self.settings()
         for provider, rows in self.usage_widgets.items():
+            if not bool(settings.get(f"enable_{provider.lower()}", True)):
+                continue
             for _, bar, detail in rows:
                 bar.setValue(0)
                 bar.setFormat("Loading…")
@@ -2321,7 +2401,19 @@ class SessionHub(QMainWindow):
         session = self.selected()
         if not session:
             return
-        targets = [provider for provider in PROVIDERS if provider != session.provider]
+        settings = self.settings()
+        targets = [
+            provider for provider in PROVIDERS
+            if provider != session.provider and bool(settings.get(f"enable_{provider.lower()}", True))
+        ]
+        if not targets:
+            QMessageBox.information(
+                self,
+                "Continue with other agent",
+                "There are no other enabled agents to continue with. "
+                "You can enable more agents in Settings.",
+            )
+            return
         target, accepted = QInputDialog.getItem(
             self,
             "Continue with another agent",
