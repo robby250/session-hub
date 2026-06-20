@@ -95,6 +95,26 @@ class UsageWindow:
     name: str
     used_percent: int
     resets: str
+    window_minutes: int | None = None
+    reset_epoch: float | None = None
+
+
+def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | None:
+    """Compare actual usage against an even pace across the window's duration."""
+    if not window.window_minutes or not window.reset_epoch:
+        return None
+    window_seconds = window.window_minutes * 60
+    if window_seconds <= 0:
+        return None
+    now_epoch = (now or datetime.now()).timestamp()
+    remaining_seconds = max(0.0, window.reset_epoch - now_epoch)
+    elapsed_fraction = max(0.0, min(1.0, 1 - remaining_seconds / window_seconds))
+    expected_percent = elapsed_fraction * 100
+    delta = window.used_percent - expected_percent
+    if abs(delta) < 0.5:
+        return f"{expected_percent:.1f}% expected · on pace"
+    direction = "over" if delta > 0 else "under"
+    return f"{expected_percent:.1f}% expected · {abs(delta):.1f}% {direction} pace"
 
 
 def format_reset_timestamp(timestamp: int | None) -> str:
@@ -104,15 +124,15 @@ def format_reset_timestamp(timestamp: int | None) -> str:
     return f"Resets {value.strftime('%Y-%m-%d %H:%M')}"
 
 
-def format_claude_reset(value: str, now: datetime | None = None) -> str:
-    """Normalize Claude's English reset text to the same local format as Codex."""
+def parse_claude_reset_datetime(value: str, now: datetime | None = None) -> datetime | None:
+    """Parse Claude's English reset text into a local datetime, if recognized."""
     match = re.fullmatch(
         r"([A-Z][a-z]{2})\s+(\d{1,2}),\s+(\d{1,2})(?::(\d{2}))?(am|pm)"
         r"(?:\s+\([^)]+\))?",
         value.strip(),
     )
     if not match:
-        return f"Resets {value.strip()}"
+        return None
     month_name, day, hour, minute, meridiem = match.groups()
     months = {
         "Jan": 1,
@@ -139,6 +159,14 @@ def format_claude_reset(value: str, now: datetime | None = None) -> str:
     )
     if reset < current:
         reset = reset.replace(year=current.year + 1)
+    return reset
+
+
+def format_claude_reset(value: str, now: datetime | None = None) -> str:
+    """Normalize Claude's English reset text to the same local format as Codex."""
+    reset = parse_claude_reset_datetime(value, now)
+    if reset is None:
+        return f"Resets {value.strip()}"
     return f"Resets {reset.strftime('%Y-%m-%d %H:%M')}"
 
 
@@ -148,14 +176,19 @@ def parse_claude_usage(text: str) -> list[UsageWindow]:
         r"(\d+)% used\s*[·•]\s*resets (.+)$",
         re.MULTILINE,
     )
-    return [
-        UsageWindow(
-            "5-hour" if label == "Current session" else "Weekly",
-            max(0, min(100, int(percent))),
-            format_claude_reset(reset),
+    windows = []
+    for label, percent, reset in pattern.findall(text):
+        reset_dt = parse_claude_reset_datetime(reset)
+        windows.append(
+            UsageWindow(
+                "5-hour" if label == "Current session" else "Weekly",
+                max(0, min(100, int(percent))),
+                format_claude_reset(reset),
+                window_minutes=300 if label == "Current session" else 10080,
+                reset_epoch=reset_dt.timestamp() if reset_dt else None,
+            )
         )
-        for label, percent, reset in pattern.findall(text)
-    ]
+    return windows
 
 
 def strip_terminal_codes(text: str) -> str:
@@ -349,6 +382,8 @@ def read_codex_usage(timeout: float = 12.0) -> list[UsageWindow]:
                         name,
                         max(0, min(100, int(window.get("usedPercent", 0)))),
                         format_reset_timestamp(window.get("resetsAt")),
+                        window_minutes=duration,
+                        reset_epoch=window.get("resetsAt"),
                     )
                 )
             if windows:
@@ -2038,7 +2073,8 @@ class SessionHub(QMainWindow):
                 remaining = 100 - window.used_percent
                 bar.setValue(remaining)
                 bar.setFormat(f"{remaining}% left ({window.used_percent}% used)")
-                detail.setText(window.resets)
+                pace = usage_pace_text(window)
+                detail.setText(f"{window.resets}\n{pace}" if pace else window.resets)
                 color = (
                     "#3da35d"
                     if remaining > 40
@@ -2387,6 +2423,8 @@ class SessionHub(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+        if existing:
+            path.unlink(missing_ok=True)
         try:
             subprocess.Popen(
                 self.summary_terminal_command(session),

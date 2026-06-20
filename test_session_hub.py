@@ -2,7 +2,7 @@ import os
 import json
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -69,6 +69,34 @@ class SessionHubTests(unittest.TestCase):
         )
         self.assertEqual(windows[0].resets, "Resets 2026-06-19 21:00")
         self.assertEqual(windows[1].resets, "Resets 2026-06-23 23:59")
+        self.assertEqual(windows[0].window_minutes, 300)
+        self.assertEqual(windows[1].window_minutes, 10080)
+        self.assertIsNotNone(windows[0].reset_epoch)
+        self.assertIsNotNone(windows[1].reset_epoch)
+
+    def test_usage_pace_flags_usage_ahead_of_even_allocation(self):
+        now = datetime(2026, 6, 19, 12, 0)
+        reset = now + timedelta(days=5)
+        window = session_hub.UsageWindow(
+            "Weekly", 30, "Resets later", window_minutes=10080, reset_epoch=reset.timestamp()
+        )
+        self.assertEqual(
+            session_hub.usage_pace_text(window, now=now),
+            "28.6% expected · 1.4% over pace",
+        )
+
+    def test_usage_pace_flags_usage_under_pace_and_missing_data(self):
+        now = datetime(2026, 6, 19, 12, 0)
+        reset = now + timedelta(days=5)
+        under = session_hub.UsageWindow(
+            "Weekly", 10, "Resets later", window_minutes=10080, reset_epoch=reset.timestamp()
+        )
+        self.assertEqual(
+            session_hub.usage_pace_text(under, now=now),
+            "28.6% expected · 18.6% under pace",
+        )
+        missing = session_hub.UsageWindow("Weekly", 10, "Resets later")
+        self.assertIsNone(session_hub.usage_pace_text(missing, now=now))
 
     def test_claude_reset_rolls_into_next_year(self):
         self.assertEqual(
