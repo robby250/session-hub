@@ -795,7 +795,16 @@ class SessionHubTests(unittest.TestCase):
         window.close()
 
     def test_new_session_toolbar_uses_selected_provider(self):
-        window = session_hub.SessionHub()
+        all_enabled = {
+            "sessions": {},
+            "settings": {
+                "enable_codex": True,
+                "enable_claude": True,
+                "enable_antigravity": True,
+            },
+        }
+        with patch("session_hub.read_metadata", return_value=all_enabled):
+            window = session_hub.SessionHub()
         self.assertEqual(
             [window.new_provider.itemText(index) for index in range(3)],
             list(session_hub.PROVIDERS),

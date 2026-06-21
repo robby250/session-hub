@@ -1769,6 +1769,13 @@ class SessionHub(QMainWindow):
                 )
                 if provider == "Antigravity":
                     label.setStyleSheet("font-size: 11px;")
+                else:
+                    # Reserve room for the reset line plus the pace line so the
+                    # panel keeps a steady height while usage is refreshing.
+                    detail.setMinimumHeight(detail.fontMetrics().lineSpacing() * 2)
+                    detail.setAlignment(
+                        Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
+                    )
                 row = 1 + index * 2
                 usage_layout.addWidget(label, row, offset)
                 usage_layout.addWidget(bar, row, offset + 1)
