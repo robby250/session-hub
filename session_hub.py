@@ -1083,6 +1083,9 @@ class SettingsDialog(QDialog):
         self.enable_codex.toggled.connect(self.validate_enabled_agents)
         self.enable_claude.toggled.connect(self.validate_enabled_agents)
         self.enable_antigravity.toggled.connect(self.validate_enabled_agents)
+        self.enable_codex.toggled.connect(self.update_danger_visibility)
+        self.enable_claude.toggled.connect(self.update_danger_visibility)
+        self.enable_antigravity.toggled.connect(self.update_danger_visibility)
         
         agents_layout.addWidget(self.enable_codex)
         agents_layout.addWidget(self.enable_claude)
@@ -1109,6 +1112,7 @@ class SettingsDialog(QDialog):
         group_layout.addWidget(self.claude_danger)
         group_layout.addWidget(self.antigravity_danger)
         layout.addWidget(group)
+        self.update_danger_visibility()
 
         warning = QLabel(
             "Danger mode lets an agent execute commands and modify files without "
@@ -1180,6 +1184,11 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self.validate_enabled_agents()
+
+    def update_danger_visibility(self) -> None:
+        self.codex_danger.setVisible(self.enable_codex.isChecked())
+        self.claude_danger.setVisible(self.enable_claude.isChecked())
+        self.antigravity_danger.setVisible(self.enable_antigravity.isChecked())
 
     def validate_enabled_agents(self) -> None:
         checked = [
@@ -1858,6 +1867,9 @@ class SessionHub(QMainWindow):
             actions.addWidget(button)
         layout.addLayout(actions)
         self.setCentralWidget(root)
+
+        refresh_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F5), self)
+        refresh_shortcut.activated.connect(self.refresh_all)
 
         settings_menu = self.menuBar().addMenu("Settings")
         permissions_action = QAction("Launch permissions…", self)

@@ -866,6 +866,21 @@ class SessionHubTests(unittest.TestCase):
             resume_selected.assert_called_once()
             window.close()
 
+    def test_f5_triggers_refresh(self):
+        from PyQt6.QtGui import QKeySequence, QShortcut
+
+        with patch.object(session_hub.SessionHub, "refresh_all") as refresh_all:
+            window = session_hub.SessionHub()
+            shortcuts = [
+                shortcut
+                for shortcut in window.findChildren(QShortcut)
+                if shortcut.key() == QKeySequence(session_hub.Qt.Key.Key_F5)
+            ]
+            self.assertTrue(shortcuts)
+            shortcuts[0].activated.emit()
+            refresh_all.assert_called_once()
+            window.close()
+
     def test_new_session_dialog_defaults_to_home(self):
         dialog = session_hub.NewSessionDialog("Codex", {})
         dialog.accept()
@@ -923,6 +938,20 @@ class SessionHubTests(unittest.TestCase):
         # Checking one back should re-enable it
         dialog.enable_codex.setChecked(True)
         self.assertTrue(dialog.enable_antigravity.isEnabled())
+        dialog.close()
+
+    def test_danger_mode_checkbox_hidden_when_agent_disabled(self):
+        dialog = session_hub.SettingsDialog({})
+        self.assertFalse(dialog.codex_danger.isHidden())
+        self.assertFalse(dialog.claude_danger.isHidden())
+        self.assertFalse(dialog.antigravity_danger.isHidden())
+
+        dialog.enable_codex.setChecked(False)
+        self.assertTrue(dialog.codex_danger.isHidden())
+        self.assertFalse(dialog.claude_danger.isHidden())
+
+        dialog.enable_codex.setChecked(True)
+        self.assertFalse(dialog.codex_danger.isHidden())
         dialog.close()
 
     def test_settings_toggles_hide_providers(self):
