@@ -167,6 +167,40 @@ class SessionHubTests(unittest.TestCase):
         window.close()
 
     @patch("session_hub.shutil.which")
+    def test_new_claude_session_passes_selected_model(self, which):
+        which.side_effect = lambda name: {
+            "gnome-terminal": "/usr/bin/gnome-terminal",
+            "claude": "/home/user/.local/bin/claude",
+        }.get(name)
+        window = session_hub.SessionHub()
+        command = window.terminal_command(
+            "Claude", None, "/home/user", model="opus"
+        )
+        self.assertEqual(command[-2:], ["--model", "opus"])
+        # Default (no model) must not append a --model flag.
+        default_command = window.terminal_command("Claude", None, "/home/user")
+        self.assertNotIn("--model", default_command)
+        window.close()
+
+    def test_new_session_dialog_offers_models_only_for_claude(self):
+        claude_dialog = session_hub.NewSessionDialog("Claude", {})
+        self.assertIsNotNone(claude_dialog.model_combo)
+        aliases = [
+            claude_dialog.model_combo.itemData(index)
+            for index in range(claude_dialog.model_combo.count())
+        ]
+        self.assertEqual(aliases[0], None)
+        self.assertIn("opus", aliases)
+        claude_dialog.model_combo.setCurrentIndex(aliases.index("opus"))
+        claude_dialog.directory = Path.home()
+        claude_dialog.accept()
+        self.assertEqual(claude_dialog.model, "opus")
+        claude_dialog.close()
+        codex_dialog = session_hub.NewSessionDialog("Codex", {})
+        self.assertIsNone(codex_dialog.model_combo)
+        codex_dialog.close()
+
+    @patch("session_hub.shutil.which")
     def test_danger_mode_adds_provider_flags(self, which):
         which.side_effect = lambda name: {
             "gnome-terminal": "/usr/bin/gnome-terminal",
@@ -815,6 +849,23 @@ class SessionHubTests(unittest.TestCase):
         launch_new.assert_called_once_with("Antigravity")
         window.close()
 
+    def test_enter_key_resumes_selected_session(self):
+        from PyQt6.QtGui import QKeySequence, QShortcut
+
+        # Patch at the class level so the QShortcut (connected during
+        # build_ui()) binds to the mock instead of the real method.
+        with patch.object(session_hub.SessionHub, "resume_selected") as resume_selected:
+            window = session_hub.SessionHub()
+            shortcuts = [
+                shortcut
+                for shortcut in window.table.findChildren(QShortcut)
+                if shortcut.key() == QKeySequence(session_hub.Qt.Key.Key_Return)
+            ]
+            self.assertTrue(shortcuts)
+            shortcuts[0].activated.emit()
+            resume_selected.assert_called_once()
+            window.close()
+
     def test_new_session_dialog_defaults_to_home(self):
         dialog = session_hub.NewSessionDialog("Codex", {})
         dialog.accept()
@@ -919,6 +970,42 @@ class SessionHubTests(unittest.TestCase):
                 self.assertIn("Claude", items)
 
                 window.close()
+
+    def test_handoff_actions_hidden_with_single_agent_enabled(self):
+        single_agent = {
+            "sessions": {},
+            "settings": {
+                "enable_codex": False,
+                "enable_claude": True,
+                "enable_antigravity": False,
+            },
+        }
+        with patch("session_hub.read_metadata", return_value=single_agent):
+            window = session_hub.SessionHub()
+        self.assertTrue(window.continue_with_other_button.isHidden())
+        self.assertTrue(window.prepare_handoff_button.isHidden())
+        labels = [label for label, _ in window.context_menu_actions()]
+        self.assertNotIn("Continue with other agent", labels)
+        self.assertNotIn("Prepare handoff summary", labels)
+        window.close()
+
+    def test_handoff_actions_shown_with_multiple_agents_enabled(self):
+        multiple_agents = {
+            "sessions": {},
+            "settings": {
+                "enable_codex": True,
+                "enable_claude": True,
+                "enable_antigravity": False,
+            },
+        }
+        with patch("session_hub.read_metadata", return_value=multiple_agents):
+            window = session_hub.SessionHub()
+        self.assertFalse(window.continue_with_other_button.isHidden())
+        self.assertFalse(window.prepare_handoff_button.isHidden())
+        labels = [label for label, _ in window.context_menu_actions()]
+        self.assertIn("Continue with other agent", labels)
+        self.assertIn("Prepare handoff summary", labels)
+        window.close()
 
     def test_project_move_works_in_both_directions(self):
         with tempfile.TemporaryDirectory() as temp:

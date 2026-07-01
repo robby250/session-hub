@@ -23,7 +23,14 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import QByteArray, QObject, QRunnable, QThreadPool, QTimer, QUrl, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QDesktopServices,
+    QIcon,
+    QKeySequence,
+    QShortcut,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -67,6 +74,16 @@ HANDOFF_DIR = DATA_DIR / "handoffs"
 SUMMARY_DIR = HANDOFF_DIR / "summaries"
 APP_ICON = Path(__file__).resolve().parent / "assets" / "session-hub.svg"
 PROVIDERS = ("Codex", "Claude", "Antigravity")
+# Claude's CLI has no command to enumerate models, but --model accepts these
+# family aliases, which always resolve to the latest model of each family, so
+# they stay valid across model refreshes. "Default" omits --model entirely.
+CLAUDE_MODELS = (
+    ("Default", None),
+    ("Opus", "opus"),
+    ("Sonnet", "sonnet"),
+    ("Haiku", "haiku"),
+    ("Fable", "fable"),
+)
 
 
 @dataclass
@@ -1237,6 +1254,7 @@ class NewSessionDialog(QDialog):
             ),
         }
         self.directory: Path | None = None
+        self.model: str | None = None
         self.setWindowTitle(f"New {provider} Session")
         self.setMinimumWidth(600)
         layout = QVBoxLayout(self)
@@ -1261,6 +1279,13 @@ class NewSessionDialog(QDialog):
         self.location.addItem("Existing folder…", "existing")
         self.location.currentIndexChanged.connect(self.update_fields)
         form.addRow("Location:", self.location)
+
+        self.model_combo: QComboBox | None = None
+        if provider == "Claude":
+            self.model_combo = QComboBox()
+            for label, alias in CLAUDE_MODELS:
+                self.model_combo.addItem(label, alias)
+            form.addRow("Model:", self.model_combo)
 
         self.project_name = QLineEdit()
         self.project_name.setPlaceholderText("project-name")
@@ -1364,6 +1389,8 @@ class NewSessionDialog(QDialog):
             QMessageBox.warning(self, "Missing folder", f"Folder not found:\n{directory}")
             return
         self.directory = directory
+        if self.model_combo is not None:
+            self.model = self.model_combo.currentData()
         super().accept()
 
 
@@ -1801,6 +1828,10 @@ class SessionHub(QMainWindow):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.table.doubleClicked.connect(self.resume_selected)
+        for key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            shortcut = QShortcut(QKeySequence(key), self.table)
+            shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            shortcut.activated.connect(self.resume_selected)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.context_menu)
         layout.addWidget(self.table, 1)
@@ -1820,6 +1851,10 @@ class SessionHub(QMainWindow):
             button.clicked.connect(slot)
             if label.startswith("Resume"):
                 button.setDefault(True)
+            if label == "Continue with other agent":
+                self.continue_with_other_button = button
+            elif label == "Prepare handoff summary":
+                self.prepare_handoff_button = button
             actions.addWidget(button)
         layout.addLayout(actions)
         self.setCentralWidget(root)
@@ -1878,6 +1913,10 @@ class SessionHub(QMainWindow):
             self.new_provider.setCurrentIndex(idx)
         elif self.new_provider.count() > 0:
             self.new_provider.setCurrentIndex(0)
+        # Handoffs need a second enabled agent to hand off to.
+        multiple_agents = len(enabled_providers) > 1
+        self.continue_with_other_button.setVisible(multiple_agents)
+        self.prepare_handoff_button.setVisible(multiple_agents)
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.settings(), self)
@@ -2181,6 +2220,7 @@ class SessionHub(QMainWindow):
         session_id: str | None,
         cwd: str,
         source_cwd: str | None = None,
+        model: str | None = None,
     ) -> list[str]:
         title = f"{provider} — {Path(cwd).name or cwd}"
         launch_cwd = source_cwd if provider == "Claude" and session_id else cwd
@@ -2214,6 +2254,8 @@ class SessionHub(QMainWindow):
             command += [executable("claude")]
             if self.settings().get("claude_danger_mode", False):
                 command += ["--dangerously-skip-permissions"]
+            if model:
+                command += ["--model", model]
             if session_id:
                 command += ["--resume", session_id]
                 if Path(launch_cwd) != Path(cwd):
@@ -2232,6 +2274,7 @@ class SessionHub(QMainWindow):
         session_id: str | None,
         cwd: str,
         source_cwd: str | None = None,
+        model: str | None = None,
     ) -> None:
         if not Path(cwd).is_dir():
             QMessageBox.warning(self, "Missing directory", f"This directory does not exist:\n{cwd}")
@@ -2245,7 +2288,7 @@ class SessionHub(QMainWindow):
             return
         try:
             subprocess.Popen(
-                self.terminal_command(provider, session_id, cwd, source_cwd),
+                self.terminal_command(provider, session_id, cwd, source_cwd, model),
                 start_new_session=True,
             )
         except (OSError, RuntimeError) as error:
@@ -2556,7 +2599,7 @@ class SessionHub(QMainWindow):
     def launch_new(self, provider: str) -> None:
         dialog = NewSessionDialog(provider, self.settings(), self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.directory:
-            self.launch(provider, None, str(dialog.directory))
+            self.launch(provider, None, str(dialog.directory), model=dialog.model)
 
     def launch_selected_provider(self) -> None:
         self.launch_new(self.new_provider.currentText())
@@ -2660,10 +2703,12 @@ class SessionHub(QMainWindow):
         self.metadata.setdefault("sessions", {}).pop(session.key, None)
         self.metadata.setdefault("links", {}).pop(session.key, None)
 
-    def context_menu(self, point) -> None:
-        if self.table.itemAt(point) is None:
-            return
-        menu = QMenu(self)
+    def context_menu_actions(self) -> list[tuple[str, object]]:
+        settings = self.settings()
+        multiple_agents = sum(
+            bool(settings.get(f"enable_{provider.lower()}", True))
+            for provider in PROVIDERS
+        ) > 1
         actions = [
             ("Resume in new terminal", self.resume_selected),
             ("Open linked conversation…", self.open_linked_conversation),
@@ -2673,7 +2718,19 @@ class SessionHub(QMainWindow):
             ("Change directory", self.change_directory),
             ("Delete", self.delete_selected),
         ]
-        for label, slot in actions:
+        if not multiple_agents:
+            actions = [
+                (label, slot)
+                for label, slot in actions
+                if label not in ("Prepare handoff summary", "Continue with other agent")
+            ]
+        return actions
+
+    def context_menu(self, point) -> None:
+        if self.table.itemAt(point) is None:
+            return
+        menu = QMenu(self)
+        for label, slot in self.context_menu_actions():
             action = QAction(label, self)
             action.triggered.connect(slot)
             menu.addAction(action)
