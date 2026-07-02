@@ -884,7 +884,7 @@ class SessionHubTests(unittest.TestCase):
     def test_new_session_dialog_defaults_to_home(self):
         dialog = session_hub.NewSessionDialog("Codex", {})
         dialog.accept()
-        self.assertEqual(dialog.directory, Path.home())
+        self.assertEqual(dialog.directory, session_hub.DEFAULT_SESSION_DIR)
         dialog.close()
 
     def test_new_session_dialog_creates_primary_project_folder(self):

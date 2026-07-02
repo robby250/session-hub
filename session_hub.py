@@ -73,6 +73,9 @@ TRASH_DIR = DATA_DIR / "trash"
 HANDOFF_DIR = DATA_DIR / "handoffs"
 SUMMARY_DIR = HANDOFF_DIR / "summaries"
 APP_ICON = Path(__file__).resolve().parent / "assets" / "session-hub.svg"
+# One-off sessions launch here instead of literally $HOME, so they don't
+# scatter loose files/clones directly in the home directory.
+DEFAULT_SESSION_DIR = HOME / "projects"
 PROVIDERS = ("Codex", "Claude", "Antigravity")
 # Claude's CLI has no command to enumerate models, but --model accepts these
 # family aliases, which always resolve to the latest model of each family, so
@@ -1341,7 +1344,7 @@ class NewSessionDialog(QDialog):
     def update_preview(self) -> None:
         location = self.location_type()
         if location == "home":
-            path = HOME
+            path = DEFAULT_SESSION_DIR
         elif location in {"primary", "secondary"}:
             root = self.project_roots[location]
             path = root / self.project_name.text().strip() if root else None
@@ -1360,7 +1363,8 @@ class NewSessionDialog(QDialog):
     def accept(self) -> None:
         location = self.location_type()
         if location == "home":
-            directory = HOME
+            directory = DEFAULT_SESSION_DIR
+            directory.mkdir(parents=True, exist_ok=True)
         elif location in {"primary", "secondary"}:
             name = self.project_name.text().strip()
             if (
