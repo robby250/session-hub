@@ -53,10 +53,43 @@ class SessionHubTests(unittest.TestCase):
                 info["project_cwd"], "/home/user/projects/example-project"
             )
 
+    def test_usage_probe_sessions_are_hidden(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "-home-user"
+            project.mkdir()
+            probe = project / "probe.jsonl"
+            probe.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in [
+                        {"type": "queue-operation", "content": "/usage"},
+                        {"type": "user", "entrypoint": "sdk-cli", "cwd": "/home/user"},
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            real = project / "real.jsonl"
+            real.write_text(
+                json.dumps({"type": "user", "entrypoint": "cli", "cwd": "/home/user"})
+                + "\n",
+                encoding="utf-8",
+            )
+            with (
+                patch.object(session_hub, "CLAUDE_PROJECTS", Path(temp)),
+                patch("session_hub.claude_history_index", return_value={}),
+            ):
+                sessions = session_hub.claude_sessions()
+        ids = {session.session_id for session in sessions}
+        self.assertIn("real", ids)
+        self.assertNotIn("probe", ids)
+
     def test_parses_claude_five_hour_and_weekly_usage(self):
         text = (
             "Current session: 75% used · resets Jun 19, 9:00pm (Europe/Bucharest)\n"
             "Current week (all models): 40% used · resets Jun 23, 11:59pm "
+            "(Europe/Bucharest)\n"
+            "Current week (Fable): 90% used · resets Jun 23, 11:59pm "
             "(Europe/Bucharest)"
         )
         with patch("session_hub.datetime") as mocked_datetime:
@@ -65,7 +98,7 @@ class SessionHubTests(unittest.TestCase):
             windows = session_hub.parse_claude_usage(text)
         self.assertEqual(
             [(window.name, window.used_percent) for window in windows],
-            [("5-hour", 75), ("Weekly", 40)],
+            [("5-hour", 75), ("Weekly", 40), ("Weekly (Fable)", 90)],
         )
         self.assertEqual(windows[0].resets, "Resets 2026-06-19 21:00")
         self.assertEqual(windows[1].resets, "Resets 2026-06-23 23:59")
@@ -73,6 +106,40 @@ class SessionHubTests(unittest.TestCase):
         self.assertEqual(windows[1].window_minutes, 10080)
         self.assertIsNotNone(windows[0].reset_epoch)
         self.assertIsNotNone(windows[1].reset_epoch)
+
+    def test_fable_usage_row_hides_when_no_fable_window(self):
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            fable_row = window.usage_widgets["Claude"][2]
+
+            def make(name, pct):
+                return session_hub.UsageWindow(name, pct, "Resets later")
+
+            # Fable window present -> row visible.
+            window.usage_loaded(
+                "Claude",
+                [make("5-hour", 10), make("Weekly", 20), make("Weekly (Fable)", 30)],
+                "",
+            )
+            self.assertFalse(fable_row[1].isHidden())
+
+            # Fable window absent (credit-only) -> row hidden, not "Unavailable".
+            window.usage_loaded(
+                "Claude", [make("5-hour", 10), make("Weekly", 20)], ""
+            )
+            self.assertTrue(fable_row[1].isHidden())
+
+            # Errors also hide the optional row rather than flagging it.
+            window.usage_loaded("Claude", [], "boom")
+            self.assertTrue(fable_row[1].isHidden())
+        finally:
+            window.close()
 
     def test_usage_pace_flags_usage_ahead_of_even_allocation(self):
         now = datetime(2026, 6, 19, 12, 0)
@@ -391,6 +458,7 @@ class SessionHubTests(unittest.TestCase):
             "claude-id",
             "/home/user/original",
             "/home/user/original",
+            session_key=claude.key,
         )
         self.assertEqual(window.metadata.get("links", {}), original_links)
         window.close()
@@ -817,15 +885,16 @@ class SessionHubTests(unittest.TestCase):
                 ],
             )
 
-    def test_manual_refresh_restarts_usage_timer(self):
+    def test_manual_refresh_refreshes_usage(self):
         window = session_hub.SessionHub()
+        self.assertFalse(hasattr(window, "usage_timer"))
         with (
-            patch.object(window.usage_timer, "start") as start,
-            patch.object(window, "refresh"),
-            patch.object(window, "refresh_usage"),
+            patch.object(window, "refresh") as refresh,
+            patch.object(window, "refresh_usage") as refresh_usage,
         ):
             window.refresh_all()
-        start.assert_called_once_with()
+        refresh.assert_called_once_with()
+        refresh_usage.assert_called_once_with()
         window.close()
 
     def test_new_session_toolbar_uses_selected_provider(self):
@@ -953,6 +1022,102 @@ class SessionHubTests(unittest.TestCase):
         dialog.enable_codex.setChecked(True)
         self.assertFalse(dialog.codex_danger.isHidden())
         dialog.close()
+
+    def test_env_editor_round_trips_custom_and_ignores_blank_names(self):
+        editor = session_hub.EnvEditor({"FOO": "1", "BAR": "two"})
+        self.assertEqual(editor.env(), {"FOO": "1", "BAR": "two"})
+        editor.add_custom_row("  ", "orphan")
+        editor.add_custom_row("BAZ", "3")
+        self.assertEqual(editor.env(), {"FOO": "1", "BAR": "two", "BAZ": "3"})
+
+    def test_env_editor_uses_typed_widgets_for_known_variables(self):
+        editor = session_hub.EnvEditor(
+            {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "65", "USE_BUILTIN_RIPGREP": "0"}
+        )
+        # Value cells for known variables are widgets, not plain text items.
+        self.assertIsNotNone(editor.table.cellWidget(0, 1))
+        self.assertEqual(
+            editor.env(),
+            {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "65", "USE_BUILTIN_RIPGREP": "0"},
+        )
+
+    def test_env_editor_percent_default_and_clamping(self):
+        editor = session_hub.EnvEditor({})
+        editor.add_known_row("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")
+        # Falls back to the spec default when no value is supplied.
+        self.assertEqual(editor.env(), {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "70"})
+
+    def test_env_editor_toggle_off_is_dropped(self):
+        editor = session_hub.EnvEditor({})
+        editor.add_known_row("DISABLE_TELEMETRY")
+        # A toggle left Off resolves to no variable at all.
+        self.assertEqual(editor.env(), {})
+
+    def test_settings_dialog_saves_global_env(self):
+        dialog = session_hub.SettingsDialog(
+            {"global_env": {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "70"}}
+        )
+        self.assertEqual(
+            dialog.env_editor.env(), {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "70"}
+        )
+        dialog.env_editor.add_known_row("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "40000")
+        self.assertEqual(
+            dialog.values()["global_env"],
+            {
+                "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "70",
+                "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "40000",
+            },
+        )
+        dialog.close()
+
+    def test_launch_env_merges_global_and_session_overrides(self):
+        metadata = {
+            "sessions": {"Claude:s1": {"env": {"FOO": "session", "ONLY": "s"}}},
+            "settings": {"global_env": {"FOO": "global", "BAR": "g"}},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            merged = window.launch_env("Claude:s1")
+            self.assertEqual(merged["FOO"], "session")
+            self.assertEqual(merged["BAR"], "g")
+            self.assertEqual(merged["ONLY"], "s")
+            self.assertEqual(merged["PATH"], os.environ["PATH"])
+            self.assertEqual(window.launch_env("Claude:other")["FOO"], "global")
+            self.assertEqual(window.launch_env(None)["BAR"], "g")
+        finally:
+            window.close()
+
+    def test_launch_env_returns_none_when_unset(self):
+        metadata = {"sessions": {}, "settings": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertIsNone(window.launch_env(None))
+            self.assertIsNone(window.launch_env("Claude:s1"))
+        finally:
+            window.close()
+
+    def test_launch_passes_resolved_env_to_spawn(self):
+        metadata = {
+            "sessions": {},
+            "settings": {"global_env": {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "70"}},
+        }
+        with (
+            patch("session_hub.read_metadata", return_value=metadata),
+            patch("session_hub.Path.is_dir", return_value=True),
+            patch("session_hub.subprocess.Popen") as popen,
+            patch.object(
+                session_hub.SessionHub, "terminal_command", return_value=["cmd"]
+            ),
+        ):
+            window = session_hub.SessionHub()
+            try:
+                window.launch("Claude", "s1", "/tmp", session_key="Claude:s1")
+            finally:
+                window.close()
+        env = popen.call_args.kwargs["env"]
+        self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "70")
 
     def test_settings_toggles_hide_providers(self):
         with tempfile.TemporaryDirectory() as temp:

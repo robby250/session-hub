@@ -51,6 +51,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSlider,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -87,6 +89,376 @@ CLAUDE_MODELS = (
     ("Haiku", "haiku"),
     ("Fable", "fable"),
 )
+# Catalog of well-known agent environment variables. Each spec drives the
+# value editor (a slider, spin box, dropdown, or text field, per "kind") and
+# the description shown when the row is selected. The editor still accepts any
+# custom name/value pair; this catalog just makes the common knobs typed and
+# self-documenting.
+#   kind "percent" -> slider + spin box, 0-100
+#   kind "int"     -> spin box with min/max/step and an optional suffix
+#   kind "toggle"  -> Off (unset) / On (1) dropdown
+#   kind "choice"  -> dropdown of (label, value) pairs
+#   kind "text"    -> line edit, or an editable dropdown when "suggestions" given
+ENV_VAR_SPECS: dict[str, dict] = {
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": {
+        "kind": "percent",
+        "default": 70,
+        "description": (
+            "Context-window fill % at which Claude Code auto-compacts the "
+            "conversation. Lower compacts earlier, keeping the working context "
+            "fresher (less rot) at the cost of more frequent, lossy summaries; "
+            "~70–75 is a good balance. The built-in default is ~92."
+        ),
+    },
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": {
+        "kind": "int", "min": 1024, "max": 200000, "step": 1024,
+        "default": 32000, "suffix": " tokens",
+        "description": "Maximum tokens Claude may produce in a single response.",
+    },
+    "MAX_THINKING_TOKENS": {
+        "kind": "int", "min": 0, "max": 128000, "step": 1024,
+        "default": 16000, "suffix": " tokens",
+        "description": (
+            "Fixed extended-thinking (reasoning) budget. Only takes effect when "
+            "adaptive reasoning is off; on current models (which manage the "
+            "budget themselves) setting it usually has no benefit."
+        ),
+    },
+    "ANTHROPIC_MODEL": {
+        "kind": "text",
+        "suggestions": ["opus", "sonnet", "haiku", "fable"],
+        "placeholder": "opus / sonnet / full model id",
+        "description": "Override the default model. A family alias or a full model id.",
+    },
+    "BASH_DEFAULT_TIMEOUT_MS": {
+        "kind": "int", "min": 1000, "max": 1800000, "step": 1000,
+        "default": 120000, "suffix": " ms",
+        "description": "Default timeout for a Bash command before it is interrupted.",
+    },
+    "BASH_MAX_TIMEOUT_MS": {
+        "kind": "int", "min": 1000, "max": 3600000, "step": 1000,
+        "default": 600000, "suffix": " ms",
+        "description": "Maximum timeout a Bash command may request.",
+    },
+    "BASH_MAX_OUTPUT_LENGTH": {
+        "kind": "int", "min": 1000, "max": 1000000, "step": 1000,
+        "default": 30000, "suffix": " chars",
+        "description": "Maximum characters of Bash output kept before truncation.",
+    },
+    "MCP_TIMEOUT": {
+        "kind": "int", "min": 1000, "max": 600000, "step": 1000,
+        "default": 30000, "suffix": " ms",
+        "description": "How long to wait for an MCP server to start up.",
+    },
+    "MCP_TOOL_TIMEOUT": {
+        "kind": "int", "min": 1000, "max": 600000, "step": 1000,
+        "default": 60000, "suffix": " ms",
+        "description": "How long to wait for a single MCP tool call to return.",
+    },
+    "MAX_MCP_OUTPUT_TOKENS": {
+        "kind": "int", "min": 1000, "max": 200000, "step": 1000,
+        "default": 25000, "suffix": " tokens",
+        "description": "Maximum tokens accepted from a single MCP tool result.",
+    },
+    "DISABLE_AUTOUPDATER": {
+        "kind": "toggle",
+        "description": "Stop Claude Code from automatically updating itself.",
+    },
+    "DISABLE_TELEMETRY": {
+        "kind": "toggle",
+        "description": "Opt out of anonymized usage telemetry (Statsig).",
+    },
+    "DISABLE_ERROR_REPORTING": {
+        "kind": "toggle",
+        "description": "Opt out of automatic error reporting (Sentry).",
+    },
+    "DISABLE_COST_WARNINGS": {
+        "kind": "toggle",
+        "description": "Hide the spending / cost-limit warning messages.",
+    },
+    "DISABLE_NON_ESSENTIAL_MODEL_CALLS": {
+        "kind": "toggle",
+        "description": "Skip non-critical background model calls such as conversation auto-titles.",
+    },
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": {
+        "kind": "toggle",
+        "description": "Disable all non-essential network traffic (telemetry, update checks, etc.).",
+    },
+    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": {
+        "kind": "toggle",
+        "description": "Stop Claude Code from updating the terminal window title.",
+    },
+    "USE_BUILTIN_RIPGREP": {
+        "kind": "choice",
+        "choices": [("Bundled ripgrep (default)", "1"), ("System ripgrep", "0")],
+        "description": "Whether to use Claude Code's bundled ripgrep or the system-installed one.",
+    },
+    "HTTPS_PROXY": {
+        "kind": "text",
+        "placeholder": "http://proxy.example:8080",
+        "description": "Route all outbound HTTPS (API) traffic through this proxy URL.",
+    },
+}
+
+CUSTOM_ENV_DESCRIPTION = "Custom variable — its value is passed through to the agent unchanged."
+
+
+def env_int(value, fallback: int) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return int(fallback)
+
+
+class EnvEditor(QWidget):
+    """Variable/Value table with typed value editors for known variables."""
+
+    def __init__(self, env: dict | None = None, parent=None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Variable", "Value"])
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self.table.verticalHeader().setVisible(False)
+        self.table.setMinimumHeight(150)
+        self.table.currentCellChanged.connect(self.update_description)
+        layout.addWidget(self.table)
+
+        self.description = QLabel("Add a variable to see what it does.")
+        self.description.setWordWrap(True)
+        self.description.setStyleSheet("color: #888;")
+        self.description.setMinimumHeight(
+            self.description.fontMetrics().lineSpacing() * 2
+        )
+        layout.addWidget(self.description)
+
+        controls = QHBoxLayout()
+        self.suggestions = QComboBox()
+        self.suggestions.addItem("Add a known variable…", None)
+        for name, spec in ENV_VAR_SPECS.items():
+            self.suggestions.addItem(name, name)
+            self.suggestions.setItemData(
+                self.suggestions.count() - 1,
+                f"{name}\n{spec['description']}",
+                Qt.ItemDataRole.ToolTipRole,
+            )
+        self.suggestions.activated.connect(self.insert_suggested)
+        add_custom = QPushButton("Add custom…")
+        add_custom.clicked.connect(self.add_custom_row)
+        remove = QPushButton("Remove selected")
+        remove.clicked.connect(self.remove_selected)
+        controls.addWidget(self.suggestions, 1)
+        controls.addWidget(add_custom)
+        controls.addWidget(remove)
+        layout.addLayout(controls)
+
+        self.set_env(env or {})
+
+    # -- value editors -----------------------------------------------------
+    def value_widget(self, name: str, value: str) -> QWidget:
+        spec = ENV_VAR_SPECS.get(name)
+        kind = spec.get("kind") if spec else "text"
+        if kind == "percent":
+            return self._percent_widget(spec, value)
+        if kind == "int":
+            return self._int_widget(spec, value)
+        if kind in ("toggle", "choice"):
+            return self._combo_widget(spec, value)
+        return self._text_widget(spec, value)
+
+    def _percent_widget(self, spec: dict, value: str) -> QWidget:
+        lo, hi = spec.get("min", 0), spec.get("max", 100)
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(lo, hi)
+        spin = QSpinBox()
+        spin.setRange(lo, hi)
+        spin.setSuffix("%")
+        initial = max(lo, min(hi, env_int(value, spec.get("default", lo))))
+        slider.setValue(initial)
+        spin.setValue(initial)
+        slider.valueChanged.connect(spin.setValue)
+        spin.valueChanged.connect(slider.setValue)
+        row.addWidget(slider, 1)
+        row.addWidget(spin)
+        container.env_value = lambda: str(spin.value())
+        return container
+
+    def _int_widget(self, spec: dict, value: str) -> QWidget:
+        spin = QSpinBox()
+        spin.setRange(spec.get("min", 0), spec.get("max", 2_000_000_000))
+        spin.setSingleStep(spec.get("step", 1))
+        if spec.get("suffix"):
+            spin.setSuffix(spec["suffix"])
+        spin.setValue(
+            max(
+                spec.get("min", 0),
+                min(
+                    spec.get("max", 2_000_000_000),
+                    env_int(value, spec.get("default", spec.get("min", 0))),
+                ),
+            )
+        )
+        spin.env_value = lambda: str(spin.value())
+        return spin
+
+    def _combo_widget(self, spec: dict, value: str) -> QWidget:
+        combo = QComboBox()
+        if spec.get("kind") == "toggle":
+            choices = [("Off (not set)", ""), ("On (1)", "1")]
+        else:
+            choices = spec.get("choices", [])
+        for label, data in choices:
+            combo.addItem(label, data)
+        value = str(value)
+        index = combo.findData(value)
+        if index < 0 and value:
+            combo.addItem(f"{value} (custom)", value)
+            index = combo.count() - 1
+        combo.setCurrentIndex(max(0, index))
+        combo.env_value = lambda: str(combo.currentData() or "")
+        return combo
+
+    def _text_widget(self, spec: dict | None, value: str) -> QWidget:
+        placeholder = spec.get("placeholder", "") if spec else ""
+        suggestions = spec.get("suggestions") if spec else None
+        if suggestions:
+            combo = QComboBox()
+            combo.setEditable(True)
+            combo.addItems(suggestions)
+            combo.setCurrentText(str(value))
+            if placeholder:
+                combo.lineEdit().setPlaceholderText(placeholder)
+            combo.env_value = lambda: combo.currentText().strip()
+            return combo
+        edit = QLineEdit(str(value))
+        if placeholder:
+            edit.setPlaceholderText(placeholder)
+        edit.env_value = lambda: edit.text().strip()
+        return edit
+
+    # -- rows --------------------------------------------------------------
+    def add_known_row(self, name: str, value: str = "") -> None:
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.text().strip() == name:
+                self.table.setCurrentCell(row, 1)
+                return
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        name_item = QTableWidgetItem(name)
+        name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        spec = ENV_VAR_SPECS.get(name)
+        if spec:
+            name_item.setToolTip(spec["description"])
+        self.table.setItem(row, 0, name_item)
+        self.table.setCellWidget(row, 1, self.value_widget(name, value))
+        self.table.setCurrentCell(row, 1)
+
+    def add_custom_row(self, name: str = "", value: str = "") -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(str(name)))
+        self.table.setItem(row, 1, QTableWidgetItem(str(value)))
+        self.table.setCurrentCell(row, 0)
+
+    def insert_suggested(self, index: int) -> None:
+        name = self.suggestions.itemData(index)
+        self.suggestions.setCurrentIndex(0)
+        if name:
+            self.add_known_row(name)
+
+    def remove_selected(self) -> None:
+        rows = sorted(
+            {index.row() for index in self.table.selectedIndexes()}, reverse=True
+        )
+        for row in rows:
+            self.table.removeRow(row)
+
+    def update_description(self, row: int, *args) -> None:
+        if row < 0:
+            return
+        item = self.table.item(row, 0)
+        name = item.text().strip() if item else ""
+        spec = ENV_VAR_SPECS.get(name)
+        if not name:
+            self.description.setText("Add a variable to see what it does.")
+        elif spec:
+            self.description.setText(f"{name} — {spec['description']}")
+        else:
+            self.description.setText(f"{name} — {CUSTOM_ENV_DESCRIPTION}")
+
+    def set_env(self, env: dict) -> None:
+        self.table.setRowCount(0)
+        for name, value in env.items():
+            if str(name) in ENV_VAR_SPECS:
+                self.add_known_row(str(name), str(value))
+            else:
+                self.add_custom_row(str(name), str(value))
+
+    def env(self) -> dict:
+        result: dict[str, str] = {}
+        for row in range(self.table.rowCount()):
+            name_item = self.table.item(row, 0)
+            name = (name_item.text() if name_item else "").strip()
+            if not name:
+                continue
+            widget = self.table.cellWidget(row, 1)
+            if widget is not None and hasattr(widget, "env_value"):
+                value = widget.env_value()
+            else:
+                value_item = self.table.item(row, 1)
+                value = (value_item.text() if value_item else "").strip()
+            if value == "":
+                continue
+            result[name] = value
+        return result
+
+
+class SessionEnvDialog(QDialog):
+    """Edit the per-session environment overrides for one session."""
+
+    def __init__(
+        self, session_title: str, global_env: dict, overrides: dict, parent=None
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Session environment variables")
+        self.setMinimumWidth(520)
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            f"Variables for “{session_title}”. These override the global "
+            "settings for this session only."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        if global_env:
+            summary = ", ".join(
+                f"{name}={value}" for name, value in sorted(global_env.items())
+            )
+            inherited = QLabel(f"Inherited from global settings: {summary}")
+            inherited.setWordWrap(True)
+            inherited.setStyleSheet("color: #888;")
+            layout.addWidget(inherited)
+        self.editor = EnvEditor(overrides)
+        layout.addWidget(self.editor)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def env(self) -> dict:
+        return self.editor.env()
 
 
 @dataclass
@@ -192,16 +564,21 @@ def format_claude_reset(value: str, now: datetime | None = None) -> str:
 
 def parse_claude_usage(text: str) -> list[UsageWindow]:
     pattern = re.compile(
-        r"^(Current session|Current week \(all models\)):\s*"
+        r"^(Current session|Current week \(all models\)|Current week \(Fable\)):\s*"
         r"(\d+)% used\s*[·•]\s*resets (.+)$",
         re.MULTILINE,
     )
+    names = {
+        "Current session": "5-hour",
+        "Current week (all models)": "Weekly",
+        "Current week (Fable)": "Weekly (Fable)",
+    }
     windows = []
     for label, percent, reset in pattern.findall(text):
         reset_dt = parse_claude_reset_datetime(reset)
         windows.append(
             UsageWindow(
-                "5-hour" if label == "Current session" else "Weekly",
+                names[label],
                 max(0, min(100, int(percent))),
                 format_claude_reset(reset),
                 window_minutes=300 if label == "Current session" else 10080,
@@ -586,6 +963,16 @@ def inspect_claude_file(path: Path) -> dict:
                     continue
                 if row.get("type") == "ai-title" and row.get("aiTitle"):
                     result["title"] = row["aiTitle"]
+                # Session Hub polls Claude usage via `claude -p "/usage"`, which
+                # runs under the SDK entrypoint. Flag those probe sessions so the
+                # UI never lists our own background usage checks as real sessions.
+                if row.get("entrypoint") == "sdk-cli":
+                    result["sdk_cli"] = True
+                if (
+                    row.get("type") == "queue-operation"
+                    and str(row.get("content") or "").strip() == "/usage"
+                ):
+                    result["usage_command"] = True
                 cwd = row.get("cwd")
                 if cwd:
                     cwd_counts[cwd] = cwd_counts.get(cwd, 0) + 1
@@ -615,6 +1002,9 @@ def claude_sessions() -> list[Session]:
         info = dict(history.get(session_id, {}))
         file_info = inspect_claude_file(path)
         info.update({key: value for key, value in file_info.items() if value})
+        if file_info.get("sdk_cli") and file_info.get("usage_command"):
+            # Skip Session Hub's own `/usage` polling sessions.
+            continue
         cwd = (
             info.get("project_cwd")
             or info.get("cwd")
@@ -1179,6 +1569,19 @@ class SettingsDialog(QDialog):
             trash_layout.addRow(manage_trash)
         layout.addWidget(trash_group)
 
+        env_group = QGroupBox("Environment variables (all sessions)")
+        env_layout = QVBoxLayout(env_group)
+        env_note = QLabel(
+            "Injected into every session Session Hub launches. Per-session "
+            "overrides (right-click a session → Environment variables…) take "
+            "precedence over these."
+        )
+        env_note.setWordWrap(True)
+        env_layout.addWidget(env_note)
+        self.env_editor = EnvEditor(settings.get("global_env") or {})
+        env_layout.addWidget(self.env_editor)
+        layout.addWidget(env_group)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Cancel
@@ -1223,6 +1626,7 @@ class SettingsDialog(QDialog):
                 "trash_retention_days": int(
                     self.trash_retention.currentData() or 0
                 ),
+                "global_env": self.env_editor.env(),
             }
         )
         return values
@@ -1736,11 +2140,9 @@ class SessionHub(QMainWindow):
         self.restore_window_geometry()
         self.purge_expired_trash()
         self.refresh()
+        # Usage bars refresh only on demand (startup, the Refresh button, or F5);
+        # there is no automatic periodic polling.
         QTimer.singleShot(0, self.refresh_usage)
-        self.usage_timer = QTimer(self)
-        self.usage_timer.setInterval(5 * 60 * 1000)
-        self.usage_timer.timeout.connect(self.refresh_usage)
-        self.usage_timer.start()
 
     def build_ui(self) -> None:
         root = QWidget()
@@ -1791,6 +2193,8 @@ class SessionHub(QMainWindow):
                     "Claude/GPT 5-hour",
                 )
                 if provider == "Antigravity"
+                else ("5-hour", "Weekly", "Weekly (Fable)")
+                if provider == "Claude"
                 else ("5-hour", "Weekly")
             )
             for index, window_name in enumerate(default_names):
@@ -2120,17 +2524,30 @@ class SessionHub(QMainWindow):
     ) -> None:
         self.usage_workers.pop(provider, None)
         rows = self.usage_widgets[provider]
+        # The Claude "Weekly (Fable)" row (index 2) is optional: it only shows
+        # while `/usage` still reports a Fable window. Once Fable becomes
+        # credit-only and drops out of the output, the row hides itself instead
+        # of showing "Unavailable" forever.
+        optional_index = 2 if provider == "Claude" else None
         if error:
             for index, (_, bar, detail) in enumerate(rows):
+                if index == optional_index:
+                    self.set_usage_row_visible(rows[index], False)
+                    continue
                 bar.setFormat("Unavailable")
                 detail.setText(error if index == 0 else "")
         else:
             for index, (label, bar, detail) in enumerate(rows):
                 window = windows[index] if index < len(windows) else None
                 if not window:
+                    if index == optional_index:
+                        self.set_usage_row_visible(rows[index], False)
+                        continue
                     bar.setFormat("Unavailable")
                     detail.setText("")
                     continue
+                if index == optional_index:
+                    self.set_usage_row_visible(rows[index], True)
                 label.setText(window.name)
                 remaining = 100 - window.used_percent
                 bar.setValue(remaining)
@@ -2146,8 +2563,14 @@ class SessionHub(QMainWindow):
                     "QProgressBar { text-align: center; } "
                     f"QProgressBar::chunk {{ background-color: {color}; }}"
                 )
+    @staticmethod
+    def set_usage_row_visible(
+        row: tuple[QLabel, QProgressBar, QLabel], visible: bool
+    ) -> None:
+        for widget in row:
+            widget.setVisible(visible)
+
     def refresh_all(self) -> None:
-        self.usage_timer.start()
         self.refresh()
         self.refresh_usage()
 
@@ -2210,6 +2633,60 @@ class SessionHub(QMainWindow):
         entry[field] = value
         write_metadata(self.metadata)
         self.refresh()
+
+    def launch_env(self, session_key: str | None = None) -> dict[str, str] | None:
+        """Merge global + per-session env overrides onto the current process env.
+
+        Returns None when nothing is configured so the launched process simply
+        inherits Session Hub's environment. Per-session values win over global.
+        """
+        global_env = self.settings().get("global_env") or {}
+        overrides: dict = {}
+        if session_key:
+            overrides = (
+                (self.metadata.get("sessions") or {}).get(session_key) or {}
+            ).get("env") or {}
+        combined: dict[str, str] = {}
+        for source in (global_env, overrides):
+            for name, value in source.items():
+                if str(name).strip():
+                    combined[str(name)] = str(value)
+        if not combined:
+            return None
+        return {**os.environ, **combined}
+
+    def spawn(self, command: list[str], session_key: str | None = None) -> None:
+        subprocess.Popen(
+            command,
+            start_new_session=True,
+            env=self.launch_env(session_key),
+        )
+
+    def edit_session_env(self) -> None:
+        session = self.selected()
+        if not session:
+            return
+        overrides = (
+            self.metadata.setdefault("sessions", {}).get(session.key, {}).get("env")
+            or {}
+        )
+        dialog = SessionEnvDialog(
+            session.title,
+            self.settings().get("global_env") or {},
+            overrides,
+            self,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            entry = self.metadata.setdefault("sessions", {}).setdefault(
+                session.key, {}
+            )
+            env = dialog.env()
+            if env:
+                entry["env"] = env
+            else:
+                entry.pop("env", None)
+            write_metadata(self.metadata)
+            self.refresh()
 
     def rename_selected(self) -> None:
         session = self.selected()
@@ -2291,6 +2768,7 @@ class SessionHub(QMainWindow):
         cwd: str,
         source_cwd: str | None = None,
         model: str | None = None,
+        session_key: str | None = None,
     ) -> None:
         if not Path(cwd).is_dir():
             QMessageBox.warning(self, "Missing directory", f"This directory does not exist:\n{cwd}")
@@ -2303,9 +2781,9 @@ class SessionHub(QMainWindow):
             )
             return
         try:
-            subprocess.Popen(
+            self.spawn(
                 self.terminal_command(provider, session_id, cwd, source_cwd, model),
-                start_new_session=True,
+                session_key,
             )
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(self, "Could not launch session", str(error))
@@ -2318,6 +2796,7 @@ class SessionHub(QMainWindow):
                 session.session_id,
                 session.cwd,
                 session.source_cwd,
+                session_key=session.key,
             )
 
     def linked_conversations(self, session: Session) -> list[Session]:
@@ -2367,6 +2846,7 @@ class SessionHub(QMainWindow):
             conversation.session_id,
             conversation.cwd,
             conversation.source_cwd,
+            session_key=conversation.key,
         )
 
     def handoff_terminal_command(
@@ -2492,10 +2972,7 @@ class SessionHub(QMainWindow):
         if existing:
             path.unlink(missing_ok=True)
         try:
-            subprocess.Popen(
-                self.summary_terminal_command(session),
-                start_new_session=True,
-            )
+            self.spawn(self.summary_terminal_command(session), session.key)
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(
                 self, "Could not prepare handoff summary", str(error)
@@ -2602,7 +3079,7 @@ class SessionHub(QMainWindow):
                     target, session.cwd, handoff, session.title
                 )
             write_metadata(self.metadata)
-            subprocess.Popen(command, start_new_session=True)
+            self.spawn(command, session.key)
             QTimer.singleShot(2500, self.poll_handoffs)
         except OSError as error:
             QMessageBox.critical(self, "Could not create handoff", str(error))
@@ -2732,6 +3209,7 @@ class SessionHub(QMainWindow):
             ("Continue with other agent", self.continue_with_other_agent),
             ("Rename", self.rename_selected),
             ("Change directory", self.change_directory),
+            ("Environment variables…", self.edit_session_env),
             ("Delete", self.delete_selected),
         ]
         if not multiple_agents:
