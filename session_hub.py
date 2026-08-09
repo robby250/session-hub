@@ -55,6 +55,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
     QInputDialog,
@@ -71,6 +72,35 @@ ANTIGRAVITY_CONVERSATIONS = ANTIGRAVITY_HOME / "conversations"
 ANTIGRAVITY_BRAIN = ANTIGRAVITY_HOME / "brain"
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "session-hub"
 METADATA_PATH = DATA_DIR / "metadata.json"
+
+# Session transcripts can grow to hundreds of MB over long-running sessions.
+# Re-scanning every file on every refresh (startup, after any metadata save,
+# manual refresh, ...) is the dominant cost in this file, so scan results are
+# cached per path and invalidated by (mtime, size). Unchanged files - the
+# overwhelming majority on any given refresh - cost a single stat() call.
+_FILE_SCAN_CACHE: dict[str, tuple[tuple[float, int], dict]] = {}
+
+
+def _file_signature(path: Path) -> tuple[float, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime, stat.st_size)
+
+
+def _cached_file_scan(path: Path, scan) -> dict:
+    """Return scan(path) result, cached until the file's mtime/size change."""
+    signature = _file_signature(path)
+    if signature is None:
+        return {}
+    key = str(path)
+    cached = _FILE_SCAN_CACHE.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    result = scan(path)
+    _FILE_SCAN_CACHE[key] = (signature, result)
+    return result
 TRASH_DIR = DATA_DIR / "trash"
 HANDOFF_DIR = DATA_DIR / "handoffs"
 SUMMARY_DIR = HANDOFF_DIR / "summaries"
@@ -202,6 +232,139 @@ ENV_VAR_SPECS: dict[str, dict] = {
 
 CUSTOM_ENV_DESCRIPTION = "Custom variable — its value is passed through to the agent unchanged."
 
+# Catalog of well-known Claude CLI launch flags, structured identically to
+# ENV_VAR_SPECS (same "kind" system) so EnvEditor renders both catalogs with
+# the same widgets. Unlike env vars, these are appended to the launch command
+# line rather than passed through the process environment, and only apply to
+# the Claude provider.
+# --- Caveman mode -----------------------------------------------------------
+# Compressed-prose mode, injected with `claude --append-system-prompt`. Doing it
+# that way means it needs nothing installed and cannot drift out of sync with a
+# skill on disk -- the text below IS the instruction the session gets.
+#
+# When the upstream skill (github.com/JuliusBrussee/caveman) is also installed
+# the two agree on intensity and DISAGREE ON SCOPE, on purpose. Upstream lists
+# "code, comments, commit messages, file contents, memory files" as things it
+# must never compress; the "+files" levels here exist because that exclusion is
+# exactly what the user asked to remove. The artifact block says so in the
+# prompt itself, so a session holding both instructions is told which one wins
+# instead of being left to arbitrate.
+CAVEMAN_INTENSITY = {
+    "lite": "Cut filler, hedging and preamble. Keep articles and sentence shape.",
+    "full": "Cut articles, copulas, pronouns, filler. Short declarative fragments.",
+    "ultra": "Telegraphic. Content words only. Fragments always, never sentences.",
+}
+
+CAVEMAN_BASE = """\
+CAVEMAN MODE ({level}) is active for this session. {intensity}
+
+Never compress, at any level: code, identifiers, API and function names, CLI
+commands, file paths, error strings, numbers, and quoted third-party text.
+Reproduce all of those byte-for-byte.
+
+Return to ordinary prose on your own, without being asked, for: security
+warnings, confirming any irreversible or outward-facing action, and any step
+sequence where dropping connective words would make the order ambiguous. Resume
+caveman immediately after. Terseness must never be the reason a warning is
+misread.
+
+Exit on "stop caveman" or "normal mode"."""
+
+CAVEMAN_ARTIFACTS = """\
+SCOPE -- this covers prose you WRITE TO FILES, not just chat: code comments and
+docstrings, task-tracker entries, memory-file bodies, design and handoff docs,
+PR and issue text, and GIT COMMIT MESSAGES. This deliberately overrides any
+installed caveman skill's rule that persisted text is exempt -- including its
+commit-message exemption, which the user removed on purpose after being told
+commits are published to a remote.
+
+Two carve-outs, because each one is machine-read and breaks otherwise:
+  1. Memory frontmatter `description:` stays ordinary prose. It is matched
+     against to decide relevance during recall, so a telegraphic one retrieves
+     worse -- the cost lands later, on a session that never sees this note.
+  2. Structural syntax is untouched: checkbox and task-id prefixes, `| EXIT:`
+     and status segments, frontmatter keys, conventional-commit type prefixes
+     (`feat:`, `fix:`, `docs:`), table headers, markdown scaffolding. Compress
+     the prose INSIDE a field, never the field around it."""
+
+
+def caveman_system_prompt(value: str) -> str | None:
+    """Expand a `--caveman` picker value into --append-system-prompt text.
+
+    Returns None for off/unset/unrecognised, so a stale or hand-typed value
+    degrades to "no caveman" rather than to a broken command line.
+    """
+    token = str(value or "").strip().lower()
+    if not token or token == "off":
+        return None
+    level, _, scope = token.partition("+")
+    intensity = CAVEMAN_INTENSITY.get(level)
+    if intensity is None or scope not in ("", "files"):
+        # An unknown SCOPE is rejected outright rather than falling back to the
+        # bare level: "full+flies" would otherwise turn on caveman while quietly
+        # dropping the artifact coverage that was the reason for typing it.
+        return None
+    prompt = CAVEMAN_BASE.format(level=level, intensity=intensity)
+    if scope == "files":
+        prompt += "\n\n" + CAVEMAN_ARTIFACTS
+    return prompt
+
+
+CLI_FLAG_SPECS: dict[str, dict] = {
+    "--caveman": {
+        "kind": "choice",
+        "choices": [
+            ("Off", ""),
+            ("Lite — chat only", "lite"),
+            ("Full — chat only", "full"),
+            ("Ultra — chat only", "ultra"),
+            ("Full + written artifacts", "full+files"),
+            ("Ultra + written artifacts", "ultra+files"),
+        ],
+        "description": (
+            "Compress this session's prose. Expands to --append-system-prompt, "
+            "so no skill install is needed. The '+ written artifacts' levels "
+            "extend it to code comments, task entries, memory bodies and docs; "
+            "commit messages, memory `description:` lines and machine-parsed "
+            "structure stay plain either way."
+        ),
+    },
+    "--effort": {
+        "kind": "choice",
+        "choices": [
+            ("Not set", ""),
+            ("Low", "low"),
+            ("Medium", "medium"),
+            ("High (default)", "high"),
+            ("Xhigh", "xhigh"),
+            ("Max", "max"),
+        ],
+        "description": (
+            "Reasoning/response effort for this session. Higher levels spend "
+            "more tokens on thinking and tool calls for better results; lower "
+            "levels trade some capability for speed and cost. Overrides the "
+            "session's default and does not persist beyond it."
+        ),
+    },
+    "--fallback-model": {
+        "kind": "text",
+        "suggestions": ["opus", "sonnet", "haiku", "fable"],
+        "placeholder": "sonnet / full model id",
+        "description": "Model to fall back to automatically if the primary model is overloaded.",
+    },
+    "--max-turns": {
+        "kind": "int", "min": 1, "max": 100000, "step": 1,
+        "default": 100,
+        "description": "Maximum number of agentic turns before the session stops itself.",
+    },
+    "--chrome": {
+        "kind": "flag",
+        "description": "Enable the Claude in Chrome browser integration for this session.",
+    },
+}
+
+CUSTOM_FLAG_DESCRIPTION = "Custom flag — passed through to the agent's CLI unchanged."
+
 
 def env_int(value, fallback: int) -> int:
     try:
@@ -211,14 +374,31 @@ def env_int(value, fallback: int) -> int:
 
 
 class EnvEditor(QWidget):
-    """Variable/Value table with typed value editors for known variables."""
+    """Name/value table with typed value editors, driven by a catalog of specs.
 
-    def __init__(self, env: dict | None = None, parent=None) -> None:
+    Renders either environment variables (the default catalog) or CLI launch
+    flags (pass specs=CLI_FLAG_SPECS) — same widgets and editing behavior,
+    just a different catalog, column label, and item noun.
+    """
+
+    def __init__(
+        self,
+        env: dict | None = None,
+        parent=None,
+        *,
+        specs: dict | None = None,
+        name_label: str = "Variable",
+        item_noun: str = "variable",
+        custom_description: str | None = None,
+    ) -> None:
         super().__init__(parent)
+        self.specs = specs if specs is not None else ENV_VAR_SPECS
+        self.custom_description = custom_description or CUSTOM_ENV_DESCRIPTION
+        self.item_noun = item_noun
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["Variable", "Value"])
+        self.table.setHorizontalHeaderLabels([name_label, "Value"])
         self.table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents
         )
@@ -230,7 +410,7 @@ class EnvEditor(QWidget):
         self.table.currentCellChanged.connect(self.update_description)
         layout.addWidget(self.table)
 
-        self.description = QLabel("Add a variable to see what it does.")
+        self.description = QLabel(f"Add a {item_noun} to see what it does.")
         self.description.setWordWrap(True)
         self.description.setStyleSheet("color: #888;")
         self.description.setMinimumHeight(
@@ -240,8 +420,8 @@ class EnvEditor(QWidget):
 
         controls = QHBoxLayout()
         self.suggestions = QComboBox()
-        self.suggestions.addItem("Add a known variable…", None)
-        for name, spec in ENV_VAR_SPECS.items():
+        self.suggestions.addItem(f"Add a known {item_noun}…", None)
+        for name, spec in self.specs.items():
             self.suggestions.addItem(name, name)
             self.suggestions.setItemData(
                 self.suggestions.count() - 1,
@@ -262,13 +442,13 @@ class EnvEditor(QWidget):
 
     # -- value editors -----------------------------------------------------
     def value_widget(self, name: str, value: str) -> QWidget:
-        spec = ENV_VAR_SPECS.get(name)
+        spec = self.specs.get(name)
         kind = spec.get("kind") if spec else "text"
         if kind == "percent":
             return self._percent_widget(spec, value)
         if kind == "int":
             return self._int_widget(spec, value)
-        if kind in ("toggle", "choice"):
+        if kind in ("toggle", "flag", "choice"):
             return self._combo_widget(spec, value)
         return self._text_widget(spec, value)
 
@@ -314,6 +494,8 @@ class EnvEditor(QWidget):
         combo = QComboBox()
         if spec.get("kind") == "toggle":
             choices = [("Off (not set)", ""), ("On (1)", "1")]
+        elif spec.get("kind") == "flag":
+            choices = [("Not set", ""), ("On (no value)", "1")]
         else:
             choices = spec.get("choices", [])
         for label, data in choices:
@@ -356,7 +538,7 @@ class EnvEditor(QWidget):
         self.table.insertRow(row)
         name_item = QTableWidgetItem(name)
         name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-        spec = ENV_VAR_SPECS.get(name)
+        spec = self.specs.get(name)
         if spec:
             name_item.setToolTip(spec["description"])
         self.table.setItem(row, 0, name_item)
@@ -388,18 +570,18 @@ class EnvEditor(QWidget):
             return
         item = self.table.item(row, 0)
         name = item.text().strip() if item else ""
-        spec = ENV_VAR_SPECS.get(name)
+        spec = self.specs.get(name)
         if not name:
-            self.description.setText("Add a variable to see what it does.")
+            self.description.setText(f"Add a {self.item_noun} to see what it does.")
         elif spec:
             self.description.setText(f"{name} — {spec['description']}")
         else:
-            self.description.setText(f"{name} — {CUSTOM_ENV_DESCRIPTION}")
+            self.description.setText(f"{name} — {self.custom_description}")
 
     def set_env(self, env: dict) -> None:
         self.table.setRowCount(0)
         for name, value in env.items():
-            if str(name) in ENV_VAR_SPECS:
+            if str(name) in self.specs:
                 self.add_known_row(str(name), str(value))
             else:
                 self.add_custom_row(str(name), str(value))
@@ -423,31 +605,78 @@ class EnvEditor(QWidget):
         return result
 
 
-class SessionEnvDialog(QDialog):
-    """Edit the per-session environment overrides for one session."""
+class LaunchOptionsEditor(QWidget):
+    """Tabbed pairing of an environment-variable editor and a CLI-flag editor.
+
+    Env vars are injected into the launched process's environment; flags are
+    appended to the launch command line. Both are per-session-overridable the
+    same way, so they share one editor (this class) wherever either is edited.
+    """
 
     def __init__(
-        self, session_title: str, global_env: dict, overrides: dict, parent=None
+        self, env: dict | None = None, flags: dict | None = None, parent=None
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Session environment variables")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        tabs = QTabWidget()
+        self.env_editor = EnvEditor(env or {})
+        self.flags_editor = EnvEditor(
+            flags or {},
+            specs=CLI_FLAG_SPECS,
+            name_label="Flag",
+            item_noun="flag",
+            custom_description=CUSTOM_FLAG_DESCRIPTION,
+        )
+        tabs.addTab(self.env_editor, "Environment variables")
+        tabs.addTab(self.flags_editor, "CLI flags")
+        layout.addWidget(tabs)
+
+    def env(self) -> dict:
+        return self.env_editor.env()
+
+    def flags(self) -> dict:
+        return self.flags_editor.env()
+
+
+class SessionLaunchOptionsDialog(QDialog):
+    """Edit the per-session environment variable and CLI flag overrides."""
+
+    def __init__(
+        self,
+        session_title: str,
+        global_env: dict,
+        env_overrides: dict,
+        global_flags: dict,
+        flag_overrides: dict,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Session launch options")
         self.setMinimumWidth(520)
         layout = QVBoxLayout(self)
         intro = QLabel(
-            f"Variables for “{session_title}”. These override the global "
+            f"Launch options for “{session_title}”. These override the global "
             "settings for this session only."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
-        if global_env:
-            summary = ", ".join(
-                f"{name}={value}" for name, value in sorted(global_env.items())
+        inherited_parts = [
+            f"{name}={value}" for name, value in sorted(global_env.items())
+        ] + [
+            name
+            if CLI_FLAG_SPECS.get(name, {}).get("kind") == "flag"
+            else f"{name} {value}"
+            for name, value in sorted(global_flags.items())
+        ]
+        if inherited_parts:
+            inherited = QLabel(
+                "Inherited from global settings: " + ", ".join(inherited_parts)
             )
-            inherited = QLabel(f"Inherited from global settings: {summary}")
             inherited.setWordWrap(True)
             inherited.setStyleSheet("color: #888;")
             layout.addWidget(inherited)
-        self.editor = EnvEditor(overrides)
+        self.editor = LaunchOptionsEditor(env_overrides, flag_overrides)
         layout.addWidget(self.editor)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
@@ -459,6 +688,9 @@ class SessionEnvDialog(QDialog):
 
     def env(self) -> dict:
         return self.editor.env()
+
+    def flags(self) -> dict:
+        return self.editor.flags()
 
 
 @dataclass
@@ -489,6 +721,17 @@ class UsageWindow:
     resets: str
     window_minutes: int | None = None
     reset_epoch: float | None = None
+
+
+@dataclass
+class UsageActivity:
+    """Fallback stats used when `/usage` omits the percentage bars (Anthropic
+    has, at times, returned only the "contributing to usage" breakdown from
+    headless invocations, with no `N% used · resets ...` lines to parse)."""
+
+    label: str
+    requests: int
+    sessions: int
 
 
 def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | None:
@@ -586,6 +829,21 @@ def parse_claude_usage(text: str) -> list[UsageWindow]:
             )
         )
     return windows
+
+
+def parse_claude_usage_activity(text: str) -> list[UsageActivity]:
+    pattern = re.compile(r"Last (24h|7d) · ([\d,]+) requests · (\d+) sessions?")
+    labels = {"24h": "Last 24h", "7d": "Last 7d"}
+    activity = []
+    for period, requests, sessions in pattern.findall(text):
+        activity.append(
+            UsageActivity(
+                labels.get(period, f"Last {period}"),
+                int(requests.replace(",", "")),
+                int(sessions),
+            )
+        )
+    return activity
 
 
 def strip_terminal_codes(text: str) -> str:
@@ -795,7 +1053,7 @@ def read_codex_usage(timeout: float = 12.0) -> list[UsageWindow]:
             process.kill()
 
 
-def read_claude_usage(timeout: float = 15.0) -> list[UsageWindow]:
+def read_claude_usage(timeout: float = 15.0) -> list[UsageWindow] | list[UsageActivity]:
     result = subprocess.run(
         [
             executable("claude"),
@@ -816,10 +1074,14 @@ def read_claude_usage(timeout: float = 15.0) -> list[UsageWindow]:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise RuntimeError("Claude returned invalid usage data.") from error
-    windows = parse_claude_usage(str(payload.get("result") or ""))
-    if not windows:
-        raise RuntimeError("Claude returned no recognizable usage windows.")
-    return windows
+    text = str(payload.get("result") or "")
+    windows = parse_claude_usage(text)
+    if windows:
+        return windows
+    activity = parse_claude_usage_activity(text)
+    if activity:
+        return activity
+    raise RuntimeError("Claude returned no recognizable usage windows.")
 
 
 class UsageWorkerSignals(QObject):
@@ -918,10 +1180,10 @@ def codex_sessions() -> list[Session]:
     return sessions
 
 
-def claude_history_index() -> dict[str, dict]:
+def _scan_claude_history(path: Path) -> dict[str, dict]:
     index: dict[str, dict] = {}
     try:
-        with CLAUDE_HISTORY.open(encoding="utf-8", errors="replace") as handle:
+        with path.open(encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 try:
                     row = json.loads(line)
@@ -943,18 +1205,35 @@ def claude_history_index() -> dict[str, dict]:
     return index
 
 
+def claude_history_index() -> dict[str, dict]:
+    # history.jsonl is append-only and only grows while actively using Claude
+    # interactively, so it's safe (and much cheaper) to cache and only
+    # re-parse it when it actually changes between refreshes.
+    return _cached_file_scan(CLAUDE_HISTORY, _scan_claude_history)
+
+
 def claude_project_key(path: str) -> str:
     """Return the directory key Claude uses below ~/.claude/projects."""
     return path.replace("/", "-").replace(".", "-")
 
 
-def inspect_claude_file(path: Path) -> dict:
+def _scan_claude_file(path: Path, max_lines: int = 500, max_bytes: int = 5_000_000) -> dict:
+    # Title, entrypoint, and cwd are all established in the first few turns of
+    # a session, so a bounded prefix scan finds them just as reliably as a
+    # full scan would on multi-hundred-MB transcripts from long-running
+    # sessions - it just doesn't pay to read the other 99% of the file.
+    # `updated_ms` is intentionally not tracked here: the file's own mtime
+    # (used by callers as a fallback) already is the last-write time.
     result: dict = {}
     project_key = path.parent.name
     cwd_counts: dict[str, int] = {}
+    bytes_read = 0
     try:
         with path.open(encoding="utf-8", errors="replace") as handle:
-            for line in handle:
+            for line_number, line in enumerate(handle):
+                bytes_read += len(line)
+                if line_number >= max_lines or bytes_read >= max_bytes:
+                    break
                 if len(line) > 2_000_000:
                     continue
                 try:
@@ -978,20 +1257,17 @@ def inspect_claude_file(path: Path) -> dict:
                     cwd_counts[cwd] = cwd_counts.get(cwd, 0) + 1
                     if claude_project_key(cwd) == project_key:
                         result["project_cwd"] = cwd
-                if row.get("timestamp"):
-                    try:
-                        stamp = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00"))
-                        result["updated_ms"] = max(
-                            int(stamp.timestamp() * 1000),
-                            int(result.get("updated_ms") or 0),
-                        )
-                    except (TypeError, ValueError):
-                        pass
+                if result.get("title") and result.get("project_cwd"):
+                    break
     except OSError:
         pass
     if not result.get("project_cwd") and cwd_counts:
         result["observed_cwd"] = max(cwd_counts, key=cwd_counts.get)
     return result
+
+
+def inspect_claude_file(path: Path) -> dict:
+    return _cached_file_scan(path, _scan_claude_file)
 
 
 def claude_sessions() -> list[Session]:
@@ -1036,6 +1312,10 @@ def antigravity_transcript_path(session_id: str) -> Path:
 
 
 def antigravity_database_info(path: Path) -> dict:
+    return _cached_file_scan(path, _scan_antigravity_database)
+
+
+def _scan_antigravity_database(path: Path) -> dict:
     info: dict = {}
     try:
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
@@ -1062,6 +1342,10 @@ def antigravity_database_info(path: Path) -> dict:
 
 
 def antigravity_transcript_info(path: Path) -> dict:
+    return _cached_file_scan(path, _scan_antigravity_transcript)
+
+
+def _scan_antigravity_transcript(path: Path) -> dict:
     info: dict = {}
     try:
         with path.open(encoding="utf-8", errors="replace") as handle:
@@ -1569,18 +1853,22 @@ class SettingsDialog(QDialog):
             trash_layout.addRow(manage_trash)
         layout.addWidget(trash_group)
 
-        env_group = QGroupBox("Environment variables (all sessions)")
-        env_layout = QVBoxLayout(env_group)
-        env_note = QLabel(
-            "Injected into every session Session Hub launches. Per-session "
-            "overrides (right-click a session → Environment variables…) take "
-            "precedence over these."
+        launch_group = QGroupBox("Launch options (all sessions)")
+        launch_layout = QVBoxLayout(launch_group)
+        launch_note = QLabel(
+            "Environment variables and CLI flags applied to every session "
+            "Session Hub launches. Per-session overrides (right-click a "
+            "session → Launch options…) take precedence over these."
         )
-        env_note.setWordWrap(True)
-        env_layout.addWidget(env_note)
-        self.env_editor = EnvEditor(settings.get("global_env") or {})
-        env_layout.addWidget(self.env_editor)
-        layout.addWidget(env_group)
+        launch_note.setWordWrap(True)
+        launch_layout.addWidget(launch_note)
+        self.launch_options = LaunchOptionsEditor(
+            settings.get("global_env") or {}, settings.get("global_flags") or {}
+        )
+        self.env_editor = self.launch_options.env_editor
+        self.flags_editor = self.launch_options.flags_editor
+        launch_layout.addWidget(self.launch_options)
+        layout.addWidget(launch_group)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
@@ -1627,6 +1915,7 @@ class SettingsDialog(QDialog):
                     self.trash_retention.currentData() or 0
                 ),
                 "global_env": self.env_editor.env(),
+                "global_flags": self.flags_editor.env(),
             }
         )
         return values
@@ -1671,6 +1960,7 @@ class NewSessionDialog(QDialog):
         }
         self.directory: Path | None = None
         self.model: str | None = None
+        self.caveman: str = ""
         self.setWindowTitle(f"New {provider} Session")
         self.setMinimumWidth(600)
         layout = QVBoxLayout(self)
@@ -1697,11 +1987,24 @@ class NewSessionDialog(QDialog):
         form.addRow("Location:", self.location)
 
         self.model_combo: QComboBox | None = None
+        self.caveman_combo: QComboBox | None = None
         if provider == "Claude":
             self.model_combo = QComboBox()
             for label, alias in CLAUDE_MODELS:
                 self.model_combo.addItem(label, alias)
             form.addRow("Model:", self.model_combo)
+
+            # Pre-selected from the global flag so this row shows the standing
+            # default rather than silently disagreeing with it; changing it here
+            # affects only the session being started.
+            self.caveman_combo = QComboBox()
+            for label, value in CLI_FLAG_SPECS["--caveman"]["choices"]:
+                self.caveman_combo.addItem(label, value)
+            current = str((settings.get("global_flags") or {}).get("--caveman", ""))
+            index = self.caveman_combo.findData(current)
+            if index >= 0:
+                self.caveman_combo.setCurrentIndex(index)
+            form.addRow("Caveman:", self.caveman_combo)
 
         self.project_name = QLineEdit()
         self.project_name.setPlaceholderText("project-name")
@@ -1808,7 +2111,13 @@ class NewSessionDialog(QDialog):
         self.directory = directory
         if self.model_combo is not None:
             self.model = self.model_combo.currentData()
+        if self.caveman_combo is not None:
+            self.caveman = str(self.caveman_combo.currentData() or "")
         super().accept()
+
+    def flag_overrides(self) -> dict[str, str]:
+        """One-off flag choices from this dialog, highest precedence at launch."""
+        return {"--caveman": self.caveman} if self.caveman else {}
 
 
 class MoveProjectDialog(QDialog):
@@ -2520,7 +2829,10 @@ class SessionHub(QMainWindow):
             self.thread_pool.start(worker)
 
     def usage_loaded(
-        self, provider: str, windows: list[UsageWindow], error: str
+        self,
+        provider: str,
+        windows: list[UsageWindow] | list[UsageActivity],
+        error: str,
     ) -> None:
         self.usage_workers.pop(provider, None)
         rows = self.usage_widgets[provider]
@@ -2536,6 +2848,22 @@ class SessionHub(QMainWindow):
                     continue
                 bar.setFormat("Unavailable")
                 detail.setText(error if index == 0 else "")
+        elif windows and isinstance(windows[0], UsageActivity):
+            # `/usage` omitted the percentage bars and returned only the
+            # "contributing to usage" breakdown. Show that as a stand-in
+            # until real UsageWindow data comes back, at which point the
+            # branch below takes over automatically.
+            for index, (label, bar, detail) in enumerate(rows):
+                activity = windows[index] if index < len(windows) else None
+                if not activity or index == optional_index:
+                    self.set_usage_row_visible(rows[index], False)
+                    continue
+                self.set_usage_row_visible(rows[index], True)
+                label.setText(activity.label)
+                bar.setValue(0)
+                bar.setFormat(f"{activity.requests} requests (no % data)")
+                bar.setStyleSheet("")
+                detail.setText(f"{activity.sessions} sessions")
         else:
             for index, (label, bar, detail) in enumerate(rows):
                 window = windows[index] if index < len(windows) else None
@@ -2655,6 +2983,41 @@ class SessionHub(QMainWindow):
             return None
         return {**os.environ, **combined}
 
+    def launch_flags(
+        self, session_key: str | None = None, extra: dict | None = None
+    ) -> list[str]:
+        """Merge global + per-session CLI flag overrides into argv fragments.
+
+        Per-session values win over global, matching launch_env's precedence.
+        `extra` wins over both -- it carries a one-off choice made in the launch
+        dialog, which has no session key yet because the session does not exist.
+        """
+        global_flags = self.settings().get("global_flags") or {}
+        overrides: dict = {}
+        if session_key:
+            overrides = (
+                (self.metadata.get("sessions") or {}).get(session_key) or {}
+            ).get("flags") or {}
+        combined: dict[str, str] = {}
+        for source in (global_flags, overrides, extra or {}):
+            for name, value in source.items():
+                if str(name).strip():
+                    combined[str(name)] = str(value)
+        argv: list[str] = []
+        for name, value in combined.items():
+            if name == "--caveman":
+                # A Session Hub pseudo-flag: no agent CLI has this option, so it
+                # expands here rather than being passed through. An off/unknown
+                # value expands to nothing at all, never to a bare flag.
+                prompt = caveman_system_prompt(value)
+                if prompt:
+                    argv += ["--append-system-prompt", prompt]
+            elif CLI_FLAG_SPECS.get(name, {}).get("kind") == "flag":
+                argv += [name]
+            else:
+                argv += [name, value]
+        return argv
+
     def spawn(self, command: list[str], session_key: str | None = None) -> None:
         subprocess.Popen(
             command,
@@ -2662,18 +3025,19 @@ class SessionHub(QMainWindow):
             env=self.launch_env(session_key),
         )
 
-    def edit_session_env(self) -> None:
+    def edit_session_launch_options(self) -> None:
         session = self.selected()
         if not session:
             return
-        overrides = (
-            self.metadata.setdefault("sessions", {}).get(session.key, {}).get("env")
-            or {}
-        )
-        dialog = SessionEnvDialog(
+        existing = (self.metadata.get("sessions") or {}).get(session.key, {})
+        env_overrides = existing.get("env") or {}
+        flag_overrides = existing.get("flags") or {}
+        dialog = SessionLaunchOptionsDialog(
             session.title,
             self.settings().get("global_env") or {},
-            overrides,
+            env_overrides,
+            self.settings().get("global_flags") or {},
+            flag_overrides,
             self,
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -2685,6 +3049,11 @@ class SessionHub(QMainWindow):
                 entry["env"] = env
             else:
                 entry.pop("env", None)
+            flags = dialog.flags()
+            if flags:
+                entry["flags"] = flags
+            else:
+                entry.pop("flags", None)
             write_metadata(self.metadata)
             self.refresh()
 
@@ -2714,6 +3083,7 @@ class SessionHub(QMainWindow):
         cwd: str,
         source_cwd: str | None = None,
         model: str | None = None,
+        flags: list[str] | None = None,
     ) -> list[str]:
         title = f"{provider} — {Path(cwd).name or cwd}"
         launch_cwd = source_cwd if provider == "Claude" and session_id else cwd
@@ -2749,6 +3119,7 @@ class SessionHub(QMainWindow):
                 command += ["--dangerously-skip-permissions"]
             if model:
                 command += ["--model", model]
+            command += flags or []
             if session_id:
                 command += ["--resume", session_id]
                 if Path(launch_cwd) != Path(cwd):
@@ -2769,6 +3140,7 @@ class SessionHub(QMainWindow):
         source_cwd: str | None = None,
         model: str | None = None,
         session_key: str | None = None,
+        flag_overrides: dict | None = None,
     ) -> None:
         if not Path(cwd).is_dir():
             QMessageBox.warning(self, "Missing directory", f"This directory does not exist:\n{cwd}")
@@ -2781,8 +3153,15 @@ class SessionHub(QMainWindow):
             )
             return
         try:
+            flags = (
+                self.launch_flags(session_key, flag_overrides)
+                if provider == "Claude"
+                else []
+            )
             self.spawn(
-                self.terminal_command(provider, session_id, cwd, source_cwd, model),
+                self.terminal_command(
+                    provider, session_id, cwd, source_cwd, model, flags
+                ),
                 session_key,
             )
         except (OSError, RuntimeError) as error:
@@ -2858,6 +3237,7 @@ class SessionHub(QMainWindow):
         target_session_id: str | None = None,
         resume_existing: bool = False,
         source_cwd: str | None = None,
+        flags: list[str] | None = None,
     ) -> list[str]:
         terminal = shutil.which("gnome-terminal") or shutil.which(
             "x-terminal-emulator"
@@ -2886,6 +3266,7 @@ class SessionHub(QMainWindow):
             command += [executable("claude")]
             if self.settings().get("claude_danger_mode", False):
                 command += ["--dangerously-skip-permissions"]
+            command += flags or []
             if target_session_id:
                 command += [
                     "--resume" if resume_existing else "--session-id",
@@ -2939,6 +3320,7 @@ class SessionHub(QMainWindow):
             command += [executable("claude")]
             if self.settings().get("claude_danger_mode", False):
                 command += ["--dangerously-skip-permissions"]
+            command += self.launch_flags(session.key)
             command += ["--resume", session.session_id, prompt]
         else:
             command += [executable("agy")]
@@ -3049,6 +3431,9 @@ class SessionHub(QMainWindow):
                     existing_target.session_id,
                     resume_existing=True,
                     source_cwd=existing_target.source_cwd,
+                    flags=self.launch_flags(existing_target.key)
+                    if target == "Claude"
+                    else None,
                 )
             elif target == "Claude":
                 target_id = str(uuid.uuid4())
@@ -3056,7 +3441,12 @@ class SessionHub(QMainWindow):
                 link["members"].append(target_key)
                 link["active"] = target_key
                 command = self.handoff_terminal_command(
-                    target, session.cwd, handoff, session.title, target_id
+                    target,
+                    session.cwd,
+                    handoff,
+                    session.title,
+                    target_id,
+                    flags=self.launch_flags(target_key),
                 )
             else:
                 provider_sessions = (
@@ -3092,7 +3482,13 @@ class SessionHub(QMainWindow):
     def launch_new(self, provider: str) -> None:
         dialog = NewSessionDialog(provider, self.settings(), self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.directory:
-            self.launch(provider, None, str(dialog.directory), model=dialog.model)
+            self.launch(
+                provider,
+                None,
+                str(dialog.directory),
+                model=dialog.model,
+                flag_overrides=dialog.flag_overrides(),
+            )
 
     def launch_selected_provider(self) -> None:
         self.launch_new(self.new_provider.currentText())
@@ -3209,7 +3605,7 @@ class SessionHub(QMainWindow):
             ("Continue with other agent", self.continue_with_other_agent),
             ("Rename", self.rename_selected),
             ("Change directory", self.change_directory),
-            ("Environment variables…", self.edit_session_env),
+            ("Launch options…", self.edit_session_launch_options),
             ("Delete", self.delete_selected),
         ]
         if not multiple_agents:

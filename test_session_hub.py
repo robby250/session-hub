@@ -53,6 +53,68 @@ class SessionHubTests(unittest.TestCase):
                 info["project_cwd"], "/home/user/projects/example-project"
             )
 
+    def test_cached_file_scan_reuses_result_until_file_changes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "data.txt"
+            path.write_text("v1", encoding="utf-8")
+            calls = []
+
+            def scan(p):
+                calls.append(p)
+                return {"content": p.read_text(encoding="utf-8")}
+
+            first = session_hub._cached_file_scan(path, scan)
+            second = session_hub._cached_file_scan(path, scan)
+            self.assertEqual(first, {"content": "v1"})
+            self.assertEqual(second, {"content": "v1"})
+            self.assertEqual(len(calls), 1)
+
+            # mtime must actually advance on some filesystems with coarse
+            # timestamp resolution, so also change the size to be safe.
+            os.utime(path, (os.path.getmtime(path) + 5, os.path.getmtime(path) + 5))
+            path.write_text("v2-longer", encoding="utf-8")
+            third = session_hub._cached_file_scan(path, scan)
+            self.assertEqual(third, {"content": "v2-longer"})
+            self.assertEqual(len(calls), 2)
+
+    def test_scan_claude_file_stops_after_max_lines(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "-home-user-projects-example-project"
+            project.mkdir()
+            path = project / "session.jsonl"
+            rows = [{"type": "user", "cwd": "/irrelevant"} for _ in range(5)]
+            rows.append({"type": "ai-title", "aiTitle": "Found late"})
+            path.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+            )
+            capped = session_hub._scan_claude_file(path, max_lines=3)
+            self.assertNotIn("title", capped)
+            uncapped = session_hub._scan_claude_file(path, max_lines=100)
+            self.assertEqual(uncapped["title"], "Found late")
+
+    def test_scan_claude_file_exits_early_once_title_and_cwd_found(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "-home-user-projects-example-project"
+            project.mkdir()
+            path = project / "session.jsonl"
+            rows = [
+                {"type": "user", "cwd": "/home/user/projects/example-project"},
+                {"type": "ai-title", "aiTitle": "Early title"},
+                # If the scan kept going past the point where both title and
+                # cwd are resolved, this later row would overwrite the title
+                # (later ai-title rows always win) - so seeing "Early title"
+                # survive proves the scan actually stopped.
+                {"type": "ai-title", "aiTitle": "Late title that should be ignored"},
+            ]
+            path.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+            )
+            info = session_hub._scan_claude_file(path, max_lines=500)
+            self.assertEqual(info["title"], "Early title")
+            self.assertEqual(
+                info["project_cwd"], "/home/user/projects/example-project"
+            )
+
     def test_usage_probe_sessions_are_hidden(self):
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp) / "-home-user"
@@ -106,6 +168,72 @@ class SessionHubTests(unittest.TestCase):
         self.assertEqual(windows[1].window_minutes, 10080)
         self.assertIsNotNone(windows[0].reset_epoch)
         self.assertIsNotNone(windows[1].reset_epoch)
+
+    def test_parses_claude_usage_activity_fallback(self):
+        text = (
+            "You are currently using your subscription to power your Claude "
+            "Code usage\n\nWhat's contributing to your limits usage?\n"
+            "Approximate, based on local sessions on this machine\n\n"
+            "Last 24h · 2,520 requests · 6 sessions\n"
+            "  99% of your usage came from sessions active for 8+ hours\n\n"
+            "Last 7d · 18,091 requests · 12 sessions\n"
+            "  95% of your usage was at >150k context"
+        )
+        activity = session_hub.parse_claude_usage_activity(text)
+        self.assertEqual(
+            [(a.label, a.requests, a.sessions) for a in activity],
+            [("Last 24h", 2520, 6), ("Last 7d", 18091, 12)],
+        )
+
+    def test_read_claude_usage_falls_back_to_activity_when_bars_missing(self):
+        payload = {
+            "result": (
+                "What's contributing to your limits usage?\n"
+                "Last 24h · 2,520 requests · 6 sessions\n"
+                "Last 7d · 18,091 requests · 12 sessions"
+            )
+        }
+        completed = session_hub.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+        with patch("session_hub.subprocess.run", return_value=completed):
+            result = session_hub.read_claude_usage()
+        self.assertEqual(
+            [(a.label, a.requests, a.sessions) for a in result],
+            [("Last 24h", 2520, 6), ("Last 7d", 18091, 12)],
+        )
+
+    def test_usage_loaded_shows_activity_fallback_and_reverts_when_bars_return(self):
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            rows = window.usage_widgets["Claude"]
+            activity = [
+                session_hub.UsageActivity("Last 24h", 2520, 6),
+                session_hub.UsageActivity("Last 7d", 18091, 12),
+            ]
+            window.usage_loaded("Claude", activity, "")
+            self.assertFalse(rows[0][1].isHidden())
+            self.assertEqual(rows[0][0].text(), "Last 24h")
+            self.assertIn("2520 requests", rows[0][1].format())
+            self.assertEqual(rows[0][2].text(), "6 sessions")
+            self.assertTrue(rows[2][1].isHidden())
+
+            # Once real percentage windows come back, the normal bar
+            # rendering takes over automatically.
+            real_windows = [
+                session_hub.UsageWindow("5-hour", 10, "Resets later"),
+                session_hub.UsageWindow("Weekly", 20, "Resets later"),
+            ]
+            window.usage_loaded("Claude", real_windows, "")
+            self.assertIn("% used", rows[0][1].format())
+        finally:
+            window.close()
 
     def test_fable_usage_row_hides_when_no_fable_window(self):
         metadata = {
@@ -1118,6 +1246,206 @@ class SessionHubTests(unittest.TestCase):
                 window.close()
         env = popen.call_args.kwargs["env"]
         self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "70")
+
+    def test_flags_editor_uses_typed_widget_for_effort(self):
+        editor = session_hub.EnvEditor(
+            {"--effort": "xhigh"}, specs=session_hub.CLI_FLAG_SPECS
+        )
+        self.assertIsNotNone(editor.table.cellWidget(0, 1))
+        self.assertEqual(editor.env(), {"--effort": "xhigh"})
+
+    def test_launch_options_editor_exposes_env_and_flags_separately(self):
+        editor = session_hub.LaunchOptionsEditor(
+            {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "70"}, {"--effort": "max"}
+        )
+        self.assertEqual(editor.env(), {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "70"})
+        self.assertEqual(editor.flags(), {"--effort": "max"})
+
+    def test_settings_dialog_saves_global_flags(self):
+        dialog = session_hub.SettingsDialog({"global_flags": {"--effort": "xhigh"}})
+        self.assertEqual(dialog.flags_editor.env(), {"--effort": "xhigh"})
+        dialog.flags_editor.add_known_row("--max-turns", "50")
+        self.assertEqual(
+            dialog.values()["global_flags"],
+            {"--effort": "xhigh", "--max-turns": "50"},
+        )
+        dialog.close()
+
+    def test_launch_flags_merges_global_and_session_overrides(self):
+        metadata = {
+            "sessions": {"Claude:s1": {"flags": {"--effort": "max"}}},
+            "settings": {"global_flags": {"--effort": "xhigh", "--max-turns": "50"}},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertEqual(
+                window.launch_flags("Claude:s1"),
+                ["--effort", "max", "--max-turns", "50"],
+            )
+            self.assertEqual(
+                window.launch_flags("Claude:other"),
+                ["--effort", "xhigh", "--max-turns", "50"],
+            )
+            self.assertEqual(
+                window.launch_flags(None),
+                ["--effort", "xhigh", "--max-turns", "50"],
+            )
+        finally:
+            window.close()
+
+    def test_launch_flags_returns_empty_list_when_unset(self):
+        metadata = {"sessions": {}, "settings": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertEqual(window.launch_flags(None), [])
+            self.assertEqual(window.launch_flags("Claude:s1"), [])
+        finally:
+            window.close()
+
+    def test_caveman_prompt_levels_and_artifact_scope(self):
+        chat_only = session_hub.caveman_system_prompt("full")
+        self.assertIn("CAVEMAN MODE (full)", chat_only)
+        self.assertNotIn("WRITE TO FILES", chat_only)
+
+        with_files = session_hub.caveman_system_prompt("ultra+files")
+        self.assertIn("CAVEMAN MODE (ultra)", with_files)
+        self.assertIn("WRITE TO FILES", with_files)
+        # The carve-outs are the whole reason the artifact scope is safe to ship.
+        self.assertIn("description:", with_files)
+        self.assertIn("Structural syntax is untouched", with_files)
+        # Commit messages are IN scope by explicit user override, so the old
+        # exemption wording must not creep back in with a prompt reword.
+        self.assertIn("GIT COMMIT MESSAGES", with_files)
+        self.assertNotIn("commit messages stay ordinary prose", with_files)
+
+    def test_caveman_prompt_is_none_for_off_and_garbage(self):
+        for value in ("", "off", "Off", None, "banana", "full+banana"):
+            self.assertIsNone(session_hub.caveman_system_prompt(value), value)
+
+    def test_launch_flags_expands_caveman_to_append_system_prompt(self):
+        metadata = {
+            "sessions": {},
+            "settings": {"global_flags": {"--caveman": "full", "--max-turns": "50"}},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            argv = window.launch_flags(None)
+            # Never passed through literally -- no agent CLI knows --caveman.
+            self.assertNotIn("--caveman", argv)
+            self.assertEqual(argv[0], "--append-system-prompt")
+            self.assertIn("CAVEMAN MODE (full)", argv[1])
+            self.assertEqual(argv[2:], ["--max-turns", "50"])
+        finally:
+            window.close()
+
+    def test_launch_flags_omits_caveman_entirely_when_off(self):
+        metadata = {"sessions": {}, "settings": {"global_flags": {"--caveman": ""}}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertEqual(window.launch_flags(None), [])
+        finally:
+            window.close()
+
+    def test_launch_flags_extra_overrides_global_and_session(self):
+        metadata = {
+            "sessions": {"Claude:s1": {"flags": {"--caveman": "lite"}}},
+            "settings": {"global_flags": {"--caveman": "full"}},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertIn("(lite)", window.launch_flags("Claude:s1")[1])
+            argv = window.launch_flags("Claude:s1", {"--caveman": "ultra+files"})
+            self.assertEqual(argv.count("--append-system-prompt"), 1)
+            self.assertIn("(ultra)", argv[1])
+            # The dialog choice replaces the stored one; it must not stack.
+            self.assertNotIn("(lite)", argv[1])
+        finally:
+            window.close()
+
+    def test_new_session_dialog_defaults_caveman_to_global_flag(self):
+        settings = {"global_flags": {"--caveman": "full+files"}}
+        dialog = session_hub.NewSessionDialog("Claude", settings)
+        try:
+            self.assertEqual(dialog.caveman_combo.currentData(), "full+files")
+            dialog.caveman = str(dialog.caveman_combo.currentData())
+            self.assertEqual(dialog.flag_overrides(), {"--caveman": "full+files"})
+        finally:
+            dialog.close()
+
+    def test_new_session_dialog_has_no_caveman_row_for_codex(self):
+        dialog = session_hub.NewSessionDialog("Codex", {})
+        try:
+            self.assertIsNone(dialog.caveman_combo)
+            self.assertEqual(dialog.flag_overrides(), {})
+        finally:
+            dialog.close()
+
+    def test_flags_editor_renders_bare_flag_as_on_off_with_no_free_value(self):
+        editor = session_hub.EnvEditor(
+            {"--chrome": "1"}, specs=session_hub.CLI_FLAG_SPECS
+        )
+        widget = editor.table.cellWidget(0, 1)
+        self.assertIsInstance(widget, session_hub.QComboBox)
+        self.assertEqual(editor.env(), {"--chrome": "1"})
+
+    def test_launch_flags_emits_bare_flag_without_value(self):
+        metadata = {
+            "sessions": {},
+            "settings": {"global_flags": {"--chrome": "1", "--max-turns": "50"}},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertEqual(
+                window.launch_flags(None),
+                ["--chrome", "--max-turns", "50"],
+            )
+        finally:
+            window.close()
+
+    @patch("session_hub.shutil.which")
+    def test_terminal_command_appends_claude_flags(self, which):
+        which.side_effect = lambda name: {
+            "gnome-terminal": "/usr/bin/gnome-terminal",
+            "claude": "/home/user/.local/bin/claude",
+        }.get(name)
+        window = session_hub.SessionHub()
+        command = window.terminal_command(
+            "Claude", "def-456", "/home/user", flags=["--effort", "xhigh"]
+        )
+        self.assertIn("--effort", command)
+        self.assertEqual(
+            command[command.index("--effort") : command.index("--effort") + 2],
+            ["--effort", "xhigh"],
+        )
+        window.close()
+
+    def test_launch_passes_global_effort_flag_to_claude_command(self):
+        metadata = {
+            "sessions": {},
+            "settings": {"global_flags": {"--effort": "xhigh"}},
+        }
+        with (
+            patch("session_hub.read_metadata", return_value=metadata),
+            patch("session_hub.Path.is_dir", return_value=True),
+            patch("session_hub.subprocess.Popen"),
+            patch.object(
+                session_hub.SessionHub, "terminal_command", return_value=["cmd"]
+            ) as terminal_command,
+        ):
+            window = session_hub.SessionHub()
+            try:
+                window.launch("Claude", "s1", "/tmp", session_key="Claude:s1")
+            finally:
+                window.close()
+        self.assertEqual(
+            terminal_command.call_args.args[-1], ["--effort", "xhigh"]
+        )
 
     def test_settings_toggles_hide_providers(self):
         with tempfile.TemporaryDirectory() as temp:
