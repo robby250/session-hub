@@ -1944,6 +1944,68 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_row_context_menu_session_has_linked_keys_populated(self):
+        # Regression: row_context_menu used to re-derive its own `match` via
+        # a direct find_group_member_session() call instead of going
+        # through matched_sessions() - the one place that fills in
+        # linked_keys from metadata["links"]. That meant "Open linked
+        # conversation..." always came back empty for a group row's
+        # session even when metadata["links"] genuinely had an entry for
+        # it, because the session object the menu action actually received
+        # never had linked_keys set in the first place.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "links": {
+                    "manual:abc": {
+                        "members": ["Claude:abc123", "Claude:id-old"],
+                        "active": "Claude:abc123",
+                    }
+                },
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}
+                        ],
+                    }
+                },
+            }
+            live = session_hub.Session(
+                "Claude", "abc123", "raw title", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/x.jsonl"), agent_name="vamp-s1",
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.claude_sessions", return_value=[live]),
+                    patch("session_hub.session_is_tracked_alive", return_value=False),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    with (
+                        patch.object(
+                            window, "context_menu_actions", return_value=[]
+                        ) as actions,
+                        patch("session_hub.QMenu") as menu_cls,
+                        patch("session_hub.claude_sessions", return_value=[live]),
+                    ):
+                        menu_cls.return_value = MagicMock()
+                        item = dialog.table.item(0, 0)
+                        point = dialog.table.visualItemRect(item).center()
+                        dialog.row_context_menu(point)
+                    session_arg = actions.call_args[0][0]
+                    self.assertEqual(
+                        set(session_arg.linked_keys), {"Claude:abc123", "Claude:id-old"}
+                    )
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
+
     def test_matched_sessions_prefers_override_key_name_over_native_key(self):
         # Rename (routed through row_session, see row_context_menu) writes
         # the display name under the row's override_key. A stale native-key

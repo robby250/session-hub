@@ -3193,11 +3193,10 @@ class ManageGroupDialog(QDialog):
         there's no separate "launch" vs "resume" button here anymore, just
         the one gesture the rest of Session Hub already uses everywhere.
         """
-        group = self.group()
-        if not group or index.row() >= len(group["rows"]):
+        pairs = self.matched_sessions()
+        if index.row() >= len(pairs):
             return
-        row = group["rows"][index.row()]
-        match = find_group_member_session(row, self.cwd, claude_sessions())
+        row, match = pairs[index.row()]
         if match:
             self.hub.resume_session(self.row_session(row, match))
         else:
@@ -3230,12 +3229,16 @@ class ManageGroupDialog(QDialog):
         item = self.table.itemAt(point)
         if item is None:
             return
-        group = self.group()
-        if not group or item.row() >= len(group["rows"]):
+        # matched_sessions(), not a fresh find_group_member_session() call:
+        # it's the one place that resolves title/cwd overrides *and*
+        # linked_keys (from metadata["links"]) onto the matched session -
+        # recomputing the match independently here skipped that, which is
+        # why "Open linked conversation..." always came back empty for a
+        # group row even when the row really was linked to an older one.
+        pairs = self.matched_sessions()
+        if item.row() >= len(pairs):
             return
-        row = group["rows"][item.row()]
-        live = claude_sessions()
-        match = find_group_member_session(row, self.cwd, live)
+        row, match = pairs[item.row()]
         menu = QMenu(self)
         if match:
             # row_session(), not the raw match: its .key is the row's own
