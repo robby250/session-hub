@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -1246,6 +1246,37 @@ class SessionHubTests(unittest.TestCase):
                 window.close()
         env = popen.call_args.kwargs["env"]
         self.assertEqual(env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "70")
+
+    @patch("session_hub.shutil.which", return_value="/usr/bin/wmctrl")
+    @patch("session_hub.subprocess.run")
+    def test_focus_window_by_title_activates_matching_window(self, run, which):
+        run.return_value = MagicMock(stdout="0x01 0 host Claude — session-hub\n")
+        session_hub.focus_window_by_title("Claude — session-hub")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/usr/bin/wmctrl", "-a", "Claude — session-hub"],
+        )
+
+    @patch("session_hub.shutil.which", return_value=None)
+    @patch("session_hub.subprocess.run")
+    def test_focus_window_by_title_noop_when_wmctrl_missing(self, run, which):
+        session_hub.focus_window_by_title("Claude — session-hub")
+        run.assert_not_called()
+
+    @patch("session_hub.threading.Thread")
+    @patch("session_hub.subprocess.Popen")
+    def test_spawn_starts_focus_thread_for_titled_command(self, popen, thread):
+        window = session_hub.SessionHub()
+        try:
+            window.spawn(
+                ["gnome-terminal", "--title=Claude — session-hub", "--"],
+            )
+        finally:
+            window.close()
+        self.assertEqual(
+            thread.call_args.kwargs["args"], ("Claude — session-hub",)
+        )
+        thread.return_value.start.assert_called_once()
 
     def test_flags_editor_uses_typed_widget_for_effort(self):
         editor = session_hub.EnvEditor(

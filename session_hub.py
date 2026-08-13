@@ -16,6 +16,7 @@ import struct
 import subprocess
 import sys
 import termios
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -1513,6 +1514,34 @@ def native_session_index() -> dict[str, Session]:
         session.native_key: session
         for session in codex_sessions() + claude_sessions() + antigravity_sessions()
     }
+
+
+def focus_window_by_title(title: str, timeout: float = 3.0) -> None:
+    """Raise and focus the terminal window we just launched.
+
+    GNOME's focus-stealing prevention keeps windows opened by a background
+    process (like Session Hub's launch button) from taking focus on their
+    own, so the newly spawned terminal sits behind Session Hub until the
+    user clicks it. wmctrl activation from a short-lived poll loop sidesteps
+    that. Runs on a daemon thread since the window can take a moment to
+    appear and this must not block the Qt event loop.
+    """
+    wmctrl = shutil.which("wmctrl")
+    if not wmctrl:
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                [wmctrl, "-l"], capture_output=True, text=True, timeout=1
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return
+        for line in result.stdout.splitlines():
+            if title in line:
+                subprocess.run([wmctrl, "-a", title], timeout=1)
+                return
+        time.sleep(0.15)
 
 
 def executable(name: str) -> str:
@@ -3038,6 +3067,14 @@ class SessionHub(QMainWindow):
             start_new_session=True,
             env=self.launch_env(session_key),
         )
+        title = next(
+            (arg[len("--title="):] for arg in command if arg.startswith("--title=")),
+            None,
+        )
+        if title:
+            threading.Thread(
+                target=focus_window_by_title, args=(title,), daemon=True
+            ).start()
 
     def edit_session_launch_options(self) -> None:
         session = self.selected()
