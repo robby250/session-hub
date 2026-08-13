@@ -19,7 +19,7 @@ import termios
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +33,7 @@ from PyQt6.QtGui import (
     QShortcut,
 )
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -110,6 +111,7 @@ SUMMARY_DIR = HANDOFF_DIR / "summaries"
 # and linked to the session it continues - see pid_capture_command and
 # resolve_clear_continuations.
 PID_DIR = DATA_DIR / "pids"
+PROC_ROOT = Path("/proc")
 APP_ICON = Path(__file__).resolve().parent / "assets" / "session-hub.svg"
 # One-off sessions launch here instead of literally $HOME, so they don't
 # scatter loose files/clones directly in the home directory.
@@ -125,6 +127,10 @@ CLAUDE_MODELS = (
     ("Haiku", "haiku"),
     ("Fable", "fable"),
 )
+# Shared session-table column set: SessionHub's main listview and
+# ManageGroupDialog both render from this (see SessionHub.populate_session_table)
+# so their common columns are defined once, in one order.
+SESSION_TABLE_COLUMNS = ("Agent", "Model", "Name", "Working directory", "Last updated", "Session ID")
 # Catalog of well-known agent environment variables. Each spec drives the
 # value editor (a slider, spin box, dropdown, or text field, per "kind") and
 # the description shown when the row is selected. The editor still accepts any
@@ -358,6 +364,15 @@ CLI_FLAG_SPECS: dict[str, dict] = {
         "placeholder": "sonnet / full model id",
         "description": "Model to fall back to automatically if the primary model is overloaded.",
     },
+    "--name": {
+        "kind": "text",
+        "placeholder": "session-name",
+        "description": (
+            "Display name for this session - shown in /resume and the "
+            "terminal title, and how other Claude Code sessions on this "
+            "machine address it via cross-session messaging."
+        ),
+    },
     "--max-turns": {
         "kind": "int", "min": 1, "max": 100000, "step": 1,
         "default": 100,
@@ -377,6 +392,24 @@ def env_int(value, fallback: int) -> int:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return int(fallback)
+
+
+def suggest_session_name(
+    directory: Path | None, model_alias: str | None, existing_names: set[str]
+) -> str:
+    """`<dirname>-<model>` for a model's first row in a group, `-2`/`-3`/...
+    for further rows of the same model - a starting point only, since the
+    name field stays freely editable in the dialogs that call this.
+    """
+    base = (directory.name if directory else "") or "session"
+    if model_alias:
+        base = f"{base}-{model_alias}"
+    if base not in existing_names:
+        return base
+    suffix = 2
+    while f"{base}-{suffix}" in existing_names:
+        suffix += 1
+    return f"{base}-{suffix}"
 
 
 class EnvEditor(QWidget):
@@ -710,6 +743,7 @@ class Session:
     path: Path
     logical_key: str | None = None
     linked_keys: tuple[str, ...] = ()
+    agent_name: str | None = None
 
     @property
     def key(self) -> str:
@@ -1261,6 +1295,13 @@ def _scan_claude_file(
                     continue
                 if row.get("type") == "ai-title" and row.get("aiTitle"):
                     result["title"] = row["aiTitle"]
+                # Written once, in the first couple of lines, only for a
+                # session launched with -n/--name (or later /rename) - the
+                # same name Claude Code's own cross-session messaging
+                # addresses this session by, so it's what group membership
+                # is matched on (see find_group_member_session).
+                if row.get("type") == "agent-name" and row.get("agentName"):
+                    result["agent_name"] = row["agentName"]
                 # Session Hub polls Claude usage via `claude -p "/usage"`, which
                 # runs under the SDK entrypoint. Flag those probe sessions so the
                 # UI never lists our own background usage checks as real sessions.
@@ -1315,6 +1356,7 @@ def claude_sessions() -> list[Session]:
                 cwd,
                 int(info.get("updated_ms") or path.stat().st_mtime * 1000),
                 path,
+                agent_name=info.get("agent_name"),
             )
         )
     return sessions
@@ -1470,6 +1512,49 @@ def resolve_pending_handoffs(metadata: dict, sessions: list[Session]) -> bool:
     return changed
 
 
+def find_group_member_session(
+    row: dict, cwd: str, sessions: list[Session]
+) -> Session | None:
+    """The live Claude session a saved group row refers to, if launched.
+
+    Checked two ways, in order:
+    1. `row["session_key"]` - the native key discover_sessions last saw this row
+       matched to, kept alive across a /clear or manual relink because the active
+       session's `linked_keys` (from metadata["links"]) still contains it. This is
+       what lets a row survive a restart that has no agent-name record at all.
+    2. `--name` (Session.agent_name, parsed from the transcript's own agent-name
+       record - see _scan_claude_file) plus cwd - the bootstrap match, used before
+       any session_key has been recorded (a row's first launch).
+    """
+    session_key = row.get("session_key")
+    if session_key:
+        match = next(
+            (
+                session
+                for session in sessions
+                if session.provider == "Claude"
+                and session.cwd == cwd
+                and (
+                    session.native_key == session_key
+                    or session_key in session.linked_keys
+                )
+            ),
+            None,
+        )
+        if match:
+            return match
+    return next(
+        (
+            session
+            for session in sessions
+            if session.provider == "Claude"
+            and session.cwd == cwd
+            and session.agent_name == row.get("name")
+        ),
+        None,
+    )
+
+
 def discover_sessions(metadata: dict) -> list[Session]:
     settings = metadata.get("settings", {})
     sessions = []
@@ -1480,6 +1565,7 @@ def discover_sessions(metadata: dict) -> list[Session]:
     if settings.get("enable_antigravity", True):
         sessions += antigravity_sessions()
     changed = resolve_pending_handoffs(metadata, sessions)
+    adopt_untracked_sessions(sessions)
     if resolve_clear_continuations(metadata, sessions):
         changed = True
     if changed:
@@ -1514,6 +1600,34 @@ def discover_sessions(metadata: dict) -> list[Session]:
         custom = overrides.get(session.key, {})
         session.title = custom.get("name") or session.title
         session.cwd = custom.get("cwd") or session.cwd
+
+    # A saved session group (see NewSessionGroupDialog/ManageGroupDialog)
+    # collapses its launched member sessions into one representative row,
+    # the same way a cross-agent link does above - members stay fully
+    # intact and reappear on their own once removed from the group.
+    group_hidden = set()
+    group_pseudo_sessions = []
+    groups_changed = False
+    for cwd, group in metadata.setdefault("groups", {}).items():
+        max_updated = 0
+        for row in group.get("rows", []):
+            match = find_group_member_session(row, cwd, visible)
+            if match:
+                group_hidden.add(match.native_key)
+                max_updated = max(max_updated, match.updated_ms)
+                if row.get("session_key") != match.native_key:
+                    row["session_key"] = match.native_key
+                    groups_changed = True
+        display_name = group.get("display_name") or Path(cwd).name or cwd
+        group_pseudo_sessions.append(
+            Session("Claude", f"group:{cwd}", display_name, cwd, cwd, max_updated, Path(cwd))
+        )
+    if groups_changed:
+        write_metadata(metadata)
+    visible = [
+        session for session in visible if session.native_key not in group_hidden
+    ] + group_pseudo_sessions
+
     return sorted(visible, key=lambda item: item.updated_ms, reverse=True)
 
 
@@ -1612,6 +1726,99 @@ def record_hub_launch(pid: int, cwd: str, session_id: str | None) -> None:
 
 def process_alive(pid: int) -> bool:
     return Path(f"/proc/{pid}").exists()
+
+
+def session_is_tracked_alive(session: Session) -> bool:
+    """Best-effort: is a process Session Hub itself launched still running this?
+
+    Reuses the same PID_DIR tracking files /clear-detection relies on
+    (record_hub_launch/resolve_clear_continuations) - accurate only for
+    sessions Session Hub launched. A session started some other way (a plain
+    `claude` typed into a terminal, for instance) always reads as not-tracked
+    here even while it's genuinely running - there's no general way to know.
+    """
+    if not PID_DIR.is_dir():
+        return False
+    keys = {session.native_key, *session.linked_keys}
+    for tracking_file in PID_DIR.glob("*.json"):
+        try:
+            pid = int(tracking_file.stem)
+            entry = json.loads(tracking_file.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not process_alive(pid):
+            continue
+        session_id = entry.get("session_id")
+        if session_id and f"Claude:{session_id}" in keys:
+            return True
+    return False
+
+
+def find_untracked_claude_pids() -> list[tuple[int, str]]:
+    """(pid, cwd) for live processes that look like a `claude` CLI, not yet tracked.
+
+    Best-effort /proc scan: matches any process whose cmdline mentions "claude"
+    (covers both a direct binary and a node-shebang-wrapped script) and whose
+    cwd we can resolve, excluding PIDs PID_DIR already has a tracking file for.
+    Existing tracking (record_hub_launch, written at Session Hub's own launch
+    time) already survives Session Hub being closed and reopened - it's a plain
+    file under PID_DIR, not in-memory state - so this only needs to cover
+    sessions that were never launched *through* Session Hub in the first place
+    (a `claude` typed directly into a terminal, one running from before this
+    tracking feature existed, ...). See adopt_untracked_sessions.
+    """
+    if not PROC_ROOT.is_dir():
+        return []
+    tracked = (
+        {int(f.stem) for f in PID_DIR.glob("*.json") if f.stem.isdigit()}
+        if PID_DIR.is_dir()
+        else set()
+    )
+    found = []
+    for entry in PROC_ROOT.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid in tracked:
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "claude" not in cmdline.lower():
+            continue
+        try:
+            cwd = os.readlink(entry / "cwd")
+        except OSError:
+            continue
+        found.append((pid, cwd))
+    return found
+
+
+def adopt_untracked_sessions(sessions: list[Session]) -> None:
+    """Backfill PID tracking for live `claude` processes Session Hub didn't launch.
+
+    Lets /clear-detection (resolve_clear_continuations) start working on a
+    session going forward, even though Session Hub missed its actual launch.
+    Only adopts an unambiguous match: exactly the most-recently-updated Claude
+    session for that process's cwd. A wrong or ambiguous guess just means that
+    one process stays untracked (same as today), not a corrupted link - there's
+    no metadata write here, only a new PID_DIR tracking file.
+    """
+    candidates = find_untracked_claude_pids()
+    if not candidates:
+        return
+    latest_by_cwd: dict[str, Session] = {}
+    for session in sessions:
+        if session.provider != "Claude":
+            continue
+        current = latest_by_cwd.get(session.cwd)
+        if not current or session.updated_ms > current.updated_ms:
+            latest_by_cwd[session.cwd] = session
+    for pid, cwd in candidates:
+        session = latest_by_cwd.get(cwd)
+        if session:
+            record_hub_launch(pid, cwd, session.session_id)
 
 
 def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool:
@@ -2303,6 +2510,669 @@ class NewSessionDialog(QDialog):
         return {"--caveman": self.caveman} if self.caveman else {}
 
 
+class NewSessionGroupDialog(QDialog):
+    """Define a batch of named Claude sessions to launch into one directory.
+
+    For cross-session messaging (e.g. an orchestrator + workers): each row
+    picks a model and a session name (`--name`), auto-suggested but always
+    editable. The whole batch is saved as a group keyed by directory so more
+    sessions can be added to it later via "Add session to group…".
+    """
+
+    def __init__(self, settings: dict, parent=None) -> None:
+        super().__init__(parent)
+        self.project_roots = {
+            "primary": Path(
+                settings.get("primary_projects_dir") or HOME / "projects"
+            ).expanduser(),
+            "secondary": (
+                Path(settings["secondary_projects_dir"]).expanduser()
+                if settings.get("secondary_projects_dir")
+                else None
+            ),
+        }
+        self.directory: Path | None = None
+        self.setWindowTitle("New Claude Session Group")
+        self.setMinimumWidth(640)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.location = QComboBox()
+        self.location.addItem("Home — questions and one-off work", "home")
+        self.location.addItem(
+            f"Primary project — {self.project_roots['primary']}", "primary"
+        )
+        secondary = self.project_roots["secondary"]
+        self.location.addItem(
+            f"Secondary project — {secondary}"
+            if secondary
+            else "Secondary project — configure in Settings",
+            "secondary",
+        )
+        if not secondary:
+            item = self.location.model().item(2)
+            if item is not None:
+                item.setEnabled(False)
+        self.location.addItem("Existing folder…", "existing")
+        self.location.currentIndexChanged.connect(self.update_fields)
+        form.addRow("Location:", self.location)
+
+        self.project_name = QLineEdit()
+        self.project_name.setPlaceholderText("project-name")
+        self.project_name.textChanged.connect(self.update_preview)
+        form.addRow("Project name:", self.project_name)
+
+        existing_row = QHBoxLayout()
+        self.existing_path = QLineEdit()
+        self.existing_path.setReadOnly(True)
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self.browse_existing)
+        existing_row.addWidget(self.existing_path, 1)
+        existing_row.addWidget(browse)
+        self.existing_widget = QWidget()
+        self.existing_widget.setLayout(existing_row)
+        form.addRow("Existing folder:", self.existing_widget)
+        layout.addLayout(form)
+
+        self.preview = QLabel()
+        self.preview.setWordWrap(True)
+        layout.addWidget(self.preview)
+
+        layout.addWidget(QLabel("Sessions to launch:"))
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Model", "Name"])
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self.table.verticalHeader().setVisible(False)
+        self.table.setMinimumHeight(160)
+        layout.addWidget(self.table)
+
+        row_controls = QHBoxLayout()
+        add_row_button = QPushButton("Add row")
+        add_row_button.clicked.connect(lambda: self.add_row())
+        remove_row_button = QPushButton("Remove selected")
+        remove_row_button.clicked.connect(self.remove_selected_rows)
+        row_controls.addWidget(add_row_button)
+        row_controls.addWidget(remove_row_button)
+        row_controls.addStretch(1)
+        layout.addLayout(row_controls)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Launch all")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.add_row()
+        self.update_fields()
+
+    def location_type(self) -> str:
+        return str(self.location.currentData())
+
+    def update_fields(self) -> None:
+        project = self.location_type() in {"primary", "secondary"}
+        self.project_name.setEnabled(project)
+        self.existing_widget.setEnabled(self.location_type() == "existing")
+        self.update_preview()
+
+    def current_directory(self) -> Path | None:
+        location = self.location_type()
+        if location == "home":
+            return DEFAULT_SESSION_DIR
+        if location in {"primary", "secondary"}:
+            root = self.project_roots[location]
+            name = self.project_name.text().strip()
+            return root / name if root and name else None
+        text = self.existing_path.text()
+        return Path(text) if text else None
+
+    def update_preview(self) -> None:
+        directory = self.current_directory()
+        self.preview.setText(
+            f"Working directory: {directory}" if directory else "Choose a folder."
+        )
+        for row in range(self.table.rowCount()):
+            self.suggest_name(row)
+
+    def browse_existing(self) -> None:
+        directory = QFileDialog.getExistingDirectory(
+            self, "Choose working directory", str(HOME)
+        )
+        if directory:
+            self.existing_path.setText(directory)
+            self.update_preview()
+
+    # -- rows ----------------------------------------------------------
+    def add_row(self) -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        model_combo = QComboBox()
+        for label, alias in CLAUDE_MODELS:
+            model_combo.addItem(label, alias)
+        model_combo.setCurrentIndex(1)
+        name_edit = QLineEdit()
+        name_edit.auto_suggested = True
+        name_edit.textEdited.connect(
+            lambda _text, edit=name_edit: setattr(edit, "auto_suggested", False)
+        )
+        model_combo.currentIndexChanged.connect(lambda _i, r=row: self.suggest_name(r))
+        self.table.setCellWidget(row, 0, model_combo)
+        self.table.setCellWidget(row, 1, name_edit)
+        self.suggest_name(row)
+
+    def remove_selected_rows(self) -> None:
+        rows = sorted(
+            {index.row() for index in self.table.selectedIndexes()}, reverse=True
+        )
+        for row in rows:
+            self.table.removeRow(row)
+
+    def existing_row_names(self, exclude_row: int | None = None) -> set[str]:
+        names = set()
+        for row in range(self.table.rowCount()):
+            if row == exclude_row:
+                continue
+            edit = self.table.cellWidget(row, 1)
+            if edit is not None and edit.text().strip():
+                names.add(edit.text().strip())
+        return names
+
+    def suggest_name(self, row: int) -> None:
+        if row < 0 or row >= self.table.rowCount():
+            return
+        name_edit = self.table.cellWidget(row, 1)
+        if name_edit is None or not getattr(name_edit, "auto_suggested", True):
+            return
+        model_combo = self.table.cellWidget(row, 0)
+        alias = model_combo.currentData() if model_combo else None
+        suggested = suggest_session_name(
+            self.current_directory(), alias, self.existing_row_names(exclude_row=row)
+        )
+        name_edit.blockSignals(True)
+        name_edit.setText(suggested)
+        name_edit.blockSignals(False)
+        name_edit.auto_suggested = True
+
+    def rows(self) -> list[dict]:
+        result = []
+        for row in range(self.table.rowCount()):
+            model_combo = self.table.cellWidget(row, 0)
+            name_edit = self.table.cellWidget(row, 1)
+            name = name_edit.text().strip() if name_edit else ""
+            if not name:
+                continue
+            result.append(
+                {"name": name, "model": model_combo.currentData() if model_combo else None}
+            )
+        return result
+
+    def accept(self) -> None:
+        location = self.location_type()
+        if location == "home":
+            directory = DEFAULT_SESSION_DIR
+            directory.mkdir(parents=True, exist_ok=True)
+        elif location in {"primary", "secondary"}:
+            name = self.project_name.text().strip()
+            if (
+                not name
+                or name in {".", ".."}
+                or Path(name).name != name
+                or "/" in name
+            ):
+                QMessageBox.warning(
+                    self,
+                    "Invalid project name",
+                    "Enter one folder name without slashes.",
+                )
+                return
+            base = self.project_roots[location]
+            if base is None:
+                QMessageBox.warning(
+                    self,
+                    "Project location not configured",
+                    "Configure the secondary projects folder in Settings first.",
+                )
+                return
+            directory = base / name
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                QMessageBox.critical(self, "Could not create project", str(error))
+                return
+        else:
+            if not self.existing_path.text():
+                QMessageBox.warning(self, "Choose a folder", "Select an existing folder.")
+                return
+            directory = Path(self.existing_path.text())
+        if not directory.is_dir():
+            QMessageBox.warning(self, "Missing folder", f"Folder not found:\n{directory}")
+            return
+
+        rows = self.rows()
+        if not rows:
+            QMessageBox.warning(
+                self, "No sessions", "Add at least one row with a name."
+            )
+            return
+        seen: set[str] = set()
+        for row in rows:
+            if row["name"] in seen:
+                QMessageBox.warning(
+                    self,
+                    "Duplicate name",
+                    f"The name “{row['name']}” is used more than once.",
+                )
+                return
+            seen.add(row["name"])
+
+        self.directory = directory
+        self.group_rows = rows
+        super().accept()
+
+
+class AddGroupSessionDialog(QDialog):
+    """Add one more named Claude session to an existing saved group."""
+
+    def __init__(self, group: dict, parent=None) -> None:
+        super().__init__(parent)
+        self.group = group
+        self.row: dict | None = None
+        self.setWindowTitle("Add session to group")
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+        intro = QLabel(f"Directory: {group.get('cwd', '')}")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        self.model_combo = QComboBox()
+        for label, alias in CLAUDE_MODELS:
+            self.model_combo.addItem(label, alias)
+        self.model_combo.setCurrentIndex(1)
+        self.model_combo.currentIndexChanged.connect(lambda _i: self.suggest_name())
+        form.addRow("Model:", self.model_combo)
+
+        self.name_edit = QLineEdit()
+        self.name_edit.auto_suggested = True
+        self.name_edit.textEdited.connect(
+            lambda _text: setattr(self.name_edit, "auto_suggested", False)
+        )
+        form.addRow("Name:", self.name_edit)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Launch")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.suggest_name()
+
+    def suggest_name(self) -> None:
+        if not getattr(self.name_edit, "auto_suggested", True):
+            return
+        cwd = self.group.get("cwd")
+        directory = Path(cwd) if cwd else None
+        alias = self.model_combo.currentData()
+        existing = {row["name"] for row in self.group.get("rows", [])}
+        suggested = suggest_session_name(directory, alias, existing)
+        self.name_edit.blockSignals(True)
+        self.name_edit.setText(suggested)
+        self.name_edit.blockSignals(False)
+        self.name_edit.auto_suggested = True
+
+    def accept(self) -> None:
+        name = self.name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Missing name", "Enter a session name.")
+            return
+        if name in {row["name"] for row in self.group.get("rows", [])}:
+            QMessageBox.warning(
+                self, "Duplicate name", f"“{name}” is already used in this group."
+            )
+            return
+        self.row = {"name": name, "model": self.model_combo.currentData()}
+        super().accept()
+
+
+class _GroupSessionTable(QTableWidget):
+    """QTableWidget with drag-to-reorder that also relocates cell widgets.
+
+    Plain QTableWidget drag-and-drop only reorders QTableWidgetItems - it
+    silently leaves cell widgets (the Transcripts checkbox, Launch button)
+    behind in their original row, corrupting the display. Reordering the
+    dialog's own row list and doing a full reload() instead sidesteps that
+    entirely: `event.ignore()` stops Qt's own item move from happening at all.
+    """
+
+    def __init__(self, dialog: "ManageGroupDialog", *args) -> None:
+        super().__init__(*args)
+        self._dialog = dialog
+
+    def dropEvent(self, event) -> None:
+        source_row = self.currentRow()
+        target_row = self.indexAt(event.position().toPoint()).row()
+        event.ignore()
+        if source_row < 0 or target_row < 0 or source_row == target_row:
+            return
+        self._dialog.reorder_row(source_row, target_row)
+
+
+class ManageGroupDialog(QDialog):
+    """Live view of a saved session group.
+
+    Each row is its own action (launch it, rename it, remove it, delete
+    it), so actions here take effect immediately rather than through a
+    single accept/cancel - there's no one batch to commit. Shares its
+    Agent/Model/Name/Last updated/Session ID rendering with the main listview
+    via SessionHub.populate_session_table - this class only adds what's
+    actually different (Transcripts, live launch status, drag reorder, and
+    group-row management on top of the main listview's own context menu).
+    """
+
+    SHARED_COLUMNS = tuple(
+        column for column in SESSION_TABLE_COLUMNS if column != "Working directory"
+    )
+    TRANSCRIPTS_COLUMN = len(SHARED_COLUMNS)
+    STATUS_COLUMN = len(SHARED_COLUMNS) + 1
+
+    def __init__(self, hub, cwd: str, parent=None) -> None:
+        super().__init__(parent)
+        self.hub = hub
+        self.cwd = cwd
+        self.setWindowTitle("Manage session group")
+        self.setMinimumWidth(720)
+        layout = QVBoxLayout(self)
+
+        self.intro = QLabel()
+        self.intro.setWordWrap(True)
+        layout.addWidget(self.intro)
+
+        self.table = _GroupSessionTable(self, 0, len(self.SHARED_COLUMNS) + 2)
+        self.table.setHorizontalHeaderLabels(list(self.SHARED_COLUMNS) + ["Transcripts", ""])
+        header = self.table.horizontalHeader()
+        for column in range(len(self.SHARED_COLUMNS)):
+            header.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.Stretch
+                if self.SHARED_COLUMNS[column] == "Name"
+                else QHeaderView.ResizeMode.ResizeToContents,
+            )
+        header.setSectionResizeMode(
+            self.TRANSCRIPTS_COLUMN, QHeaderView.ResizeMode.ResizeToContents
+        )
+        header.setSectionResizeMode(self.STATUS_COLUMN, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setMinimumHeight(200)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setDragEnabled(True)
+        self.table.setAcceptDrops(True)
+        self.table.setDropIndicatorShown(True)
+        self.table.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.row_context_menu)
+        layout.addWidget(self.table)
+
+        controls = QHBoxLayout()
+        launch_all = QPushButton("Launch all")
+        launch_all.clicked.connect(self.launch_all)
+        controls.addWidget(launch_all)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.accept)
+        layout.addWidget(buttons)
+
+        self.reload()
+
+    def group(self) -> dict | None:
+        group = self.hub.metadata.get("groups", {}).get(self.cwd)
+        if group:
+            self._migrate_rows(group)
+        return group
+
+    def _migrate_rows(self, group: dict) -> None:
+        """Upgrade rows saved before override_key/live-status existed.
+
+        Drops the old sticky `launched` flag (status is now always derived
+        live) and mints an `override_key` for any row that predates it,
+        carrying its old `model` choice into the same env-override mechanism
+        a fresh row uses (see SessionHub.register_group_row).
+        """
+        changed = False
+        for row in group.get("rows", []):
+            if row.pop("launched", None) is not None:
+                changed = True
+            if "override_key" not in row:
+                registered = self.hub.register_group_row(
+                    self.cwd, row["name"], row.pop("model", None)
+                )
+                row["override_key"] = registered["override_key"]
+                changed = True
+        if changed:
+            write_metadata(self.hub.metadata)
+
+    def matched_sessions(self) -> list[tuple[dict, Session | None]]:
+        """Each saved row paired with its live session, if currently matched.
+
+        Applies the same per-session title/cwd overrides discover_sessions
+        applies - group members are hidden from self.hub.sessions (that's
+        the point of the group-collapsing pass), so this re-derives from raw
+        claude_sessions() rather than reusing that already-filtered list.
+        """
+        group = self.group()
+        if not group:
+            return []
+        live = claude_sessions()
+        overrides = self.hub.metadata.get("sessions", {})
+        pairs = []
+        for row in group.get("rows", []):
+            match = find_group_member_session(row, self.cwd, live)
+            if match:
+                custom = overrides.get(match.key, {})
+                match.title = custom.get("name") or match.title
+                match.cwd = custom.get("cwd") or match.cwd
+            pairs.append((row, match))
+        return pairs
+
+    def row_session(self, row: dict, match: Session | None) -> Session:
+        base = match or Session(
+            "Claude", f"pending:{row['override_key']}", row["name"], self.cwd, self.cwd, 0,
+            Path(self.cwd),
+        )
+        return replace(base, logical_key=row["override_key"])
+
+    def reload(self) -> None:
+        group = self.group()
+        if not group:
+            self.intro.setText("This group no longer exists.")
+            self.table.setRowCount(0)
+            return
+        name = group.get("display_name") or Path(self.cwd).name or self.cwd
+        self.intro.setText(f"{name} — {self.cwd}")
+        pairs = self.matched_sessions()
+        self.hub.populate_session_table(
+            self.table, [self.row_session(row, match) for row, match in pairs], self.SHARED_COLUMNS
+        )
+        for index, (row, match) in enumerate(pairs):
+            checkbox = QCheckBox()
+            checkbox.setChecked(row.get("transcripts", True))
+            checkbox.toggled.connect(
+                lambda checked, n=row["name"]: self.set_transcripts(n, checked)
+            )
+            self.table.setCellWidget(index, self.TRANSCRIPTS_COLUMN, checkbox)
+
+            if match and session_is_tracked_alive(match):
+                self.table.setCellWidget(index, self.STATUS_COLUMN, QLabel("Running"))
+                continue
+            container = QWidget()
+            status_layout = QHBoxLayout(container)
+            status_layout.setContentsMargins(4, 0, 4, 0)
+            status_layout.addWidget(QLabel("Idle" if match else "Not started"))
+            launch_button = QPushButton("Relaunch" if match else "Launch")
+            launch_button.clicked.connect(
+                lambda _checked, n=row["name"]: self.launch_row(n)
+            )
+            status_layout.addWidget(launch_button)
+            self.table.setCellWidget(index, self.STATUS_COLUMN, container)
+
+    def set_transcripts(self, name: str, enabled: bool) -> None:
+        group = self.group()
+        if not group:
+            return
+        row = next((r for r in group["rows"] if r["name"] == name), None)
+        if not row:
+            return
+        row["transcripts"] = enabled
+        write_metadata(self.hub.metadata)
+
+    def launch_row(self, name: str) -> None:
+        group = self.group()
+        if not group:
+            return
+        row = next((r for r in group["rows"] if r["name"] == name), None)
+        if not row:
+            return
+        strip_env = (
+            ["CLAUDE_CODE_CHILD_SESSION"]
+            if row.get("transcripts", True)
+            else None
+        )
+        self.hub.launch(
+            "Claude",
+            None,
+            self.cwd,
+            session_key=row["override_key"],
+            flag_overrides={"--name": row["name"]},
+            strip_env=strip_env,
+        )
+        self.hub.refresh()
+        self.reload()
+
+    def launch_all(self) -> None:
+        group = self.group()
+        if not group:
+            return
+        for row, match in self.matched_sessions():
+            if match and session_is_tracked_alive(match):
+                continue
+            self.launch_row(row["name"])
+
+    def reorder_row(self, source_row: int, target_row: int) -> None:
+        group = self.group()
+        if not group:
+            return
+        rows = group["rows"]
+        if source_row >= len(rows) or target_row >= len(rows):
+            return
+        row = rows.pop(source_row)
+        rows.insert(target_row, row)
+        write_metadata(self.hub.metadata)
+        self.reload()
+
+    def row_context_menu(self, point) -> None:
+        item = self.table.itemAt(point)
+        if item is None:
+            return
+        group = self.group()
+        if not group or item.row() >= len(group["rows"]):
+            return
+        row = group["rows"][item.row()]
+        live = claude_sessions()
+        match = find_group_member_session(row, self.cwd, live)
+        menu = QMenu(self)
+        if match:
+            for label, slot in self.hub.context_menu_actions(match):
+                if label == "Add session to group…":
+                    continue
+                action = QAction(label, self)
+                action.triggered.connect(slot)
+                menu.addAction(action)
+            menu.addSeparator()
+        rename_action = QAction("Rename row", self)
+        rename_action.triggered.connect(lambda: self.rename_row(row["name"]))
+        menu.addAction(rename_action)
+        remove_action = QAction("Remove from group", self)
+        remove_action.triggered.connect(lambda: self.remove_row(row["name"]))
+        menu.addAction(remove_action)
+        delete_action = QAction("Delete row", self)
+        delete_action.triggered.connect(lambda: self.delete_row(row["name"]))
+        menu.addAction(delete_action)
+        menu.exec(self.table.viewport().mapToGlobal(point))
+        self.reload()
+
+    def rename_row(self, name: str) -> None:
+        group = self.group()
+        if not group:
+            return
+        row = next((r for r in group["rows"] if r["name"] == name), None)
+        if not row:
+            return
+        new_name, accepted = QInputDialog.getText(
+            self, "Rename row", "Session name (used as --name on next launch):", text=name
+        )
+        new_name = new_name.strip()
+        if not accepted or not new_name or new_name == name:
+            return
+        if any(r["name"] == new_name for r in group["rows"]):
+            QMessageBox.warning(
+                self, "Duplicate name", f"“{new_name}” is already used in this group."
+            )
+            return
+        row["name"] = new_name
+        write_metadata(self.hub.metadata)
+        self.reload()
+
+    def remove_row(self, name: str) -> None:
+        group = self.group()
+        if not group:
+            return
+        group["rows"] = [row for row in group["rows"] if row["name"] != name]
+        write_metadata(self.hub.metadata)
+        self.hub.refresh()
+        self.reload()
+
+    def delete_row(self, name: str) -> None:
+        group = self.group()
+        if not group:
+            return
+        row = next((r for r in group["rows"] if r["name"] == name), None)
+        if not row:
+            return
+        live = find_group_member_session(row, self.cwd, claude_sessions())
+        if live:
+            answer = QMessageBox.warning(
+                self,
+                "Delete session?",
+                f"Move “{name}” to Session Hub's trash?",
+                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                self.hub.move_session_to_trash(live)
+            except OSError as error:
+                QMessageBox.critical(self, "Could not delete", str(error))
+                return
+        group["rows"] = [r for r in group["rows"] if r["name"] != name]
+        write_metadata(self.hub.metadata)
+        self.hub.refresh()
+        self.reload()
+
+
 class MoveProjectDialog(QDialog):
     def __init__(self, settings: dict, project_labels: dict[str, str], parent=None) -> None:
         super().__init__(parent)
@@ -2612,6 +3482,8 @@ class DeletedSessionsDialog(QDialog):
 
 
 class SessionHub(QMainWindow):
+    SESSION_TABLE_COLUMNS = SESSION_TABLE_COLUMNS
+
     def __init__(self) -> None:
         super().__init__()
         self.metadata = read_metadata()
@@ -2655,6 +3527,15 @@ class SessionHub(QMainWindow):
         new_button = QPushButton("New")
         new_button.clicked.connect(self.launch_selected_provider)
         toolbar.addWidget(new_button)
+
+        new_group_button = QPushButton("New session group…")
+        new_group_button.setToolTip(
+            "Launch several named Claude sessions into one directory at "
+            "once, for cross-session messaging (e.g. an orchestrator + "
+            "workers)."
+        )
+        new_group_button.clicked.connect(self.launch_new_group)
+        toolbar.addWidget(new_group_button)
 
         for label, slot in (
             ("Refresh", self.refresh_all),
@@ -2720,10 +3601,8 @@ class SessionHub(QMainWindow):
             self.usage_widgets[provider] = rows
         layout.addWidget(usage_frame)
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(
-            ["Agent", "Name", "Working directory", "Last updated", "Session ID"]
-        )
+        self.table = QTableWidget(0, len(SessionHub.SESSION_TABLE_COLUMNS))
+        self.table.setHorizontalHeaderLabels(list(SessionHub.SESSION_TABLE_COLUMNS))
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -2732,10 +3611,11 @@ class SessionHub(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         self.table.doubleClicked.connect(self.resume_selected)
         for key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             shortcut = QShortcut(QKeySequence(key), self.table)
@@ -3085,31 +3965,67 @@ class SessionHub(QMainWindow):
         self.refresh()
         self.refresh_usage()
 
+    def effective_model(self, session_key: str | None) -> str | None:
+        """The ANTHROPIC_MODEL a session would (re)launch with, if any is set.
+
+        Same global-then-session-override precedence as launch_env, just
+        surfacing the one value rather than merging a whole environment -
+        this is what the Model column (main listview and group dialog alike)
+        displays.
+        """
+        global_env = self.settings().get("global_env") or {}
+        overrides: dict = {}
+        if session_key:
+            overrides = (
+                (self.metadata.get("sessions") or {}).get(session_key) or {}
+            ).get("env") or {}
+        return overrides.get("ANTHROPIC_MODEL") or global_env.get("ANTHROPIC_MODEL") or None
+
+    def populate_session_table(
+        self, table: QTableWidget, sessions: list[Session], columns: tuple[str, ...]
+    ) -> None:
+        """Fill a QTableWidget's shared columns from `columns`.
+
+        The common rendering both the main listview and ManageGroupDialog build
+        on, so only their differences (extra columns, extra rows) need writing
+        out separately.
+        """
+        colors = {"Codex": "#5aa9ff", "Claude": "#d977ff", "Antigravity": "#42d6c5"}
+        table.setSortingEnabled(False)
+        table.setRowCount(len(sessions))
+        for row, session in enumerate(sessions):
+            for col, column in enumerate(columns):
+                if column == "Agent":
+                    item = QTableWidgetItem(session.provider)
+                    item.setForeground(QColor(colors.get(session.provider, "#ffffff")))
+                elif column == "Model":
+                    item = QTableWidgetItem(self.effective_model(session.key) or "Default")
+                elif column == "Name":
+                    item = QTableWidgetItem(session.title)
+                elif column == "Working directory":
+                    item = QTableWidgetItem(session.cwd)
+                elif column == "Last updated":
+                    item = QTableWidgetItem(
+                        datetime.fromtimestamp(session.updated_ms / 1000).strftime(
+                            "%Y-%m-%d %H:%M"
+                        )
+                        if session.updated_ms
+                        else ""
+                    )
+                    item.setData(Qt.ItemDataRole.UserRole, session.updated_ms)
+                else:
+                    item = QTableWidgetItem(session.session_id)
+                item.setData(Qt.ItemDataRole.UserRole + 1, session.key)
+                table.setItem(row, col, item)
+        table.setSortingEnabled(True)
+
     def refresh(self) -> None:
         self.metadata = read_metadata()
         self.sessions = discover_sessions(self.metadata)
-        self.table.setSortingEnabled(False)
-        self.table.setRowCount(len(self.sessions))
-        for row, session in enumerate(self.sessions):
-            agent = QTableWidgetItem(session.provider)
-            colors = {
-                "Codex": "#5aa9ff",
-                "Claude": "#d977ff",
-                "Antigravity": "#42d6c5",
-            }
-            agent.setForeground(QColor(colors.get(session.provider, "#ffffff")))
-            name = QTableWidgetItem(session.title)
-            cwd = QTableWidgetItem(session.cwd)
-            updated = QTableWidgetItem(
-                datetime.fromtimestamp(session.updated_ms / 1000).strftime("%Y-%m-%d %H:%M")
-            )
-            updated.setData(Qt.ItemDataRole.UserRole, session.updated_ms)
-            session_id = QTableWidgetItem(session.session_id)
-            for item in (agent, name, cwd, updated, session_id):
-                item.setData(Qt.ItemDataRole.UserRole + 1, session.key)
-                self.table.setItem(row, (agent, name, cwd, updated, session_id).index(item), item)
-        self.table.setSortingEnabled(True)
-        self.table.sortItems(3, Qt.SortOrder.DescendingOrder)
+        self.populate_session_table(self.table, self.sessions, self.SESSION_TABLE_COLUMNS)
+        self.table.sortItems(
+            self.SESSION_TABLE_COLUMNS.index("Last updated"), Qt.SortOrder.DescendingOrder
+        )
         self.apply_filter()
 
     def apply_filter(self) -> None:
@@ -3145,11 +4061,17 @@ class SessionHub(QMainWindow):
         write_metadata(self.metadata)
         self.refresh()
 
-    def launch_env(self, session_key: str | None = None) -> dict[str, str] | None:
+    def launch_env(
+        self, session_key: str | None = None, strip: list[str] | None = None
+    ) -> dict[str, str] | None:
         """Merge global + per-session env overrides onto the current process env.
 
-        Returns None when nothing is configured so the launched process simply
-        inherits Session Hub's environment. Per-session values win over global.
+        Returns None when nothing is configured or stripped so the launched
+        process simply inherits Session Hub's environment as-is. Per-session
+        values win over global. `strip` removes inherited keys outright (e.g.
+        CLAUDE_CODE_CHILD_SESSION, which Session Hub itself may have inherited
+        if it was launched from inside another Claude session, and which
+        disables transcript saving in whatever it's launched into).
         """
         global_env = self.settings().get("global_env") or {}
         overrides: dict = {}
@@ -3162,9 +4084,12 @@ class SessionHub(QMainWindow):
             for name, value in source.items():
                 if str(name).strip():
                     combined[str(name)] = str(value)
-        if not combined:
+        if not combined and not strip:
             return None
-        return {**os.environ, **combined}
+        result = {**os.environ, **combined}
+        for key in strip or []:
+            result.pop(key, None)
+        return result
 
     def launch_flags(
         self, session_key: str | None = None, extra: dict | None = None
@@ -3209,17 +4134,19 @@ class SessionHub(QMainWindow):
         pidfile: Path | None = None,
         cwd: str | None = None,
         session_id: str | None = None,
+        focus: bool = True,
+        strip_env: list[str] | None = None,
     ) -> None:
         subprocess.Popen(
             command,
             start_new_session=True,
-            env=self.launch_env(session_key),
+            env=self.launch_env(session_key, strip=strip_env),
         )
         title = next(
             (arg[len("--title="):] for arg in command if arg.startswith("--title=")),
             None,
         )
-        if title:
+        if title and focus:
             threading.Thread(
                 target=focus_window_by_title, args=(title,), daemon=True
             ).start()
@@ -3234,6 +4161,9 @@ class SessionHub(QMainWindow):
         session = self.selected()
         if not session:
             return
+        self.edit_session_launch_options_for(session)
+
+    def edit_session_launch_options_for(self, session: Session) -> None:
         existing = (self.metadata.get("sessions") or {}).get(session.key, {})
         env_overrides = existing.get("env") or {}
         flag_overrides = existing.get("flags") or {}
@@ -3266,6 +4196,9 @@ class SessionHub(QMainWindow):
         session = self.selected()
         if not session:
             return
+        self.rename_session(session)
+
+    def rename_session(self, session: Session) -> None:
         name, accepted = QInputDialog.getText(
             self, "Rename session", "Display name:", text=session.title
         )
@@ -3276,6 +4209,9 @@ class SessionHub(QMainWindow):
         session = self.selected()
         if not session:
             return
+        self.change_directory_for(session)
+
+    def change_directory_for(self, session: Session) -> None:
         start = session.cwd if Path(session.cwd).is_dir() else str(HOME)
         directory = QFileDialog.getExistingDirectory(self, "Working directory", start)
         if directory:
@@ -3351,6 +4287,8 @@ class SessionHub(QMainWindow):
         model: str | None = None,
         session_key: str | None = None,
         flag_overrides: dict | None = None,
+        focus: bool = True,
+        strip_env: list[str] | None = None,
     ) -> None:
         if not Path(cwd).is_dir():
             QMessageBox.warning(self, "Missing directory", f"This directory does not exist:\n{cwd}")
@@ -3377,19 +4315,94 @@ class SessionHub(QMainWindow):
                 pidfile=pidfile,
                 cwd=cwd,
                 session_id=session_id,
+                focus=focus,
+                strip_env=strip_env,
             )
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(self, "Could not launch session", str(error))
 
     def resume_selected(self) -> None:
         session = self.selected()
-        if session:
-            self.launch(
-                session.provider,
-                session.session_id,
-                session.cwd,
-                session.source_cwd,
-                session_key=session.key,
+        if not session:
+            return
+        self.resume_session(session)
+
+    def resume_session(self, session: Session) -> None:
+        if self.is_group_session(session):
+            self.manage_group()
+            return
+        self.launch(
+            session.provider,
+            session.session_id,
+            session.cwd,
+            session.source_cwd,
+            session_key=session.key,
+        )
+
+    def is_group_session(self, session: Session) -> bool:
+        return session.session_id.startswith("group:")
+
+    def manage_group(self) -> None:
+        session = self.selected()
+        if not session or not self.is_group_session(session):
+            return
+        if session.cwd not in self.metadata.get("groups", {}):
+            return
+        dialog = ManageGroupDialog(self, session.cwd, self)
+        dialog.exec()
+
+    def rename_group(self) -> None:
+        session = self.selected()
+        if not session or not self.is_group_session(session):
+            return
+        group = self.metadata.get("groups", {}).get(session.cwd)
+        if not group:
+            return
+        current = group.get("display_name") or Path(session.cwd).name or session.cwd
+        new_name, accepted = QInputDialog.getText(
+            self, "Rename group", "Display name:", text=current
+        )
+        new_name = new_name.strip()
+        if not accepted or not new_name:
+            return
+        group["display_name"] = new_name
+        write_metadata(self.metadata)
+        self.refresh()
+
+    def delete_group(self) -> None:
+        session = self.selected()
+        if not session or not self.is_group_session(session):
+            return
+        cwd = session.cwd
+        group = self.metadata.get("groups", {}).get(cwd)
+        if not group:
+            return
+        name = group.get("display_name") or Path(cwd).name or cwd
+        answer = QMessageBox.warning(
+            self,
+            "Delete group?",
+            f"Move every session in “{name}” to Session Hub's trash and "
+            "delete the group?",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        live_sessions = claude_sessions()
+        failures = []
+        for row in group.get("rows", []):
+            live = find_group_member_session(row, cwd, live_sessions)
+            if live:
+                try:
+                    self.move_session_to_trash(live)
+                except OSError as error:
+                    failures.append(f"{row['name']}: {error}")
+        self.metadata.get("groups", {}).pop(cwd, None)
+        write_metadata(self.metadata)
+        self.refresh()
+        if failures:
+            QMessageBox.critical(
+                self, "Some sessions could not be deleted", "\n".join(failures)
             )
 
     def linked_conversations(self, session: Session) -> list[Session]:
@@ -3407,6 +4420,9 @@ class SessionHub(QMainWindow):
         session = self.selected()
         if not session:
             return
+        self.open_linked_conversation_for(session)
+
+    def open_linked_conversation_for(self, session: Session) -> None:
         conversations = self.linked_conversations(session)
         if not conversations:
             QMessageBox.information(
@@ -3441,6 +4457,81 @@ class SessionHub(QMainWindow):
             conversation.source_cwd,
             session_key=conversation.key,
         )
+
+    def link_to_existing_conversation(self) -> None:
+        session = self.selected()
+        if not session:
+            return
+        self.link_to_existing_conversation_for(session)
+
+    def link_to_existing_conversation_for(self, session: Session) -> None:
+        """Manually mark `session` as the continuation of an older one.
+
+        Covers restarts Session Hub has no automatic way to notice - a
+        `/clear` (or crash-and-restart) in a process it didn't itself launch,
+        so resolve_clear_continuations' PID tracking never saw it happen.
+        Writes into the same metadata["links"] structure that mechanism uses,
+        so "Open linked conversation…" and (for a session that happens to be
+        a saved group's row) group re-matching both pick it up for free - see
+        find_group_member_session's session_key check.
+        """
+        candidates = sorted(
+            (
+                other
+                for other in native_session_index().values()
+                if other.native_key != session.native_key and other.cwd == session.cwd
+            ),
+            key=lambda item: item.updated_ms,
+            reverse=True,
+        )
+        if not candidates:
+            QMessageBox.information(
+                self,
+                "Link to existing conversation",
+                "No other conversations were found in this session's working directory.",
+            )
+            return
+        labels = []
+        for item in candidates:
+            title = item.title or item.session_id[:8]
+            if len(title) > 60:
+                title = title[:57] + "…"
+            labels.append(f"{item.provider} — {title}  [{item.session_id[:8]}]")
+
+        selected_label, accepted = QInputDialog.getItem(
+            self,
+            "Link to existing conversation",
+            "This session continues:",
+            labels,
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        target = candidates[labels.index(selected_label)]
+        links = self.metadata.setdefault("links", {})
+        old_key, new_key = target.native_key, session.native_key
+        link_id = next(
+            (
+                lid
+                for lid, link in links.items()
+                if old_key in link.get("members", []) or new_key in link.get("members", [])
+            ),
+            None,
+        )
+        if link_id:
+            link = links[link_id]
+            for key in (old_key, new_key):
+                if key not in link["members"]:
+                    link["members"].append(key)
+            link["active"] = new_key
+        else:
+            links[f"manual:{uuid.uuid4().hex}"] = {
+                "members": [old_key, new_key],
+                "active": new_key,
+            }
+        write_metadata(self.metadata)
+        self.refresh()
 
     def handoff_terminal_command(
         self,
@@ -3552,6 +4643,9 @@ class SessionHub(QMainWindow):
         session = self.selected()
         if not session:
             return
+        self.prepare_handoff_summary_for(session)
+
+    def prepare_handoff_summary_for(self, session: Session) -> None:
         path = summary_path(session.key)
         existing = path.is_file()
         answer = QMessageBox.question(
@@ -3578,6 +4672,9 @@ class SessionHub(QMainWindow):
         session = self.selected()
         if not session:
             return
+        self.continue_with_other_agent_for(session)
+
+    def continue_with_other_agent_for(self, session: Session) -> None:
         settings = self.settings()
         targets = [
             provider for provider in PROVIDERS
@@ -3707,6 +4804,99 @@ class SessionHub(QMainWindow):
     def launch_selected_provider(self) -> None:
         self.launch_new(self.new_provider.currentText())
 
+    def launch_new_group(self) -> None:
+        dialog = NewSessionGroupDialog(self.settings(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.directory:
+            return
+        directory = str(dialog.directory)
+        group = self.metadata.setdefault("groups", {}).setdefault(
+            directory, {"cwd": directory, "rows": []}
+        )
+        existing_names = {row["name"] for row in group["rows"]}
+        for row in dialog.group_rows:
+            if row["name"] in existing_names:
+                continue
+            registered = self.register_group_row(directory, row["name"], row.get("model"))
+            self.launch(
+                "Claude",
+                None,
+                directory,
+                session_key=registered["override_key"],
+                flag_overrides={"--name": registered["name"]},
+                focus=False,
+            )
+            group["rows"].append(registered)
+            existing_names.add(registered["name"])
+        write_metadata(self.metadata)
+        self.refresh()
+
+    def register_group_row(self, cwd: str, name: str, model_alias: str | None) -> dict:
+        """Build a saved group row, minting its durable override key.
+
+        `override_key` is a synthetic session key that exists purely so a
+        not-yet-launched row still has somewhere to store a model/env/flag
+        override, the same way a real session's own `session.key` does - it
+        never changes for the life of the row, whether or not it's currently
+        matched to a live session (see find_group_member_session, ManageGroupDialog).
+        """
+        override_key = f"group:{cwd}#{name}"
+        if model_alias:
+            entry = self.metadata.setdefault("sessions", {}).setdefault(override_key, {})
+            entry.setdefault("env", {})["ANTHROPIC_MODEL"] = model_alias
+        return {"name": name, "override_key": override_key}
+
+    def add_session_to_group(self) -> None:
+        session = self.selected()
+        if not session:
+            return
+        self.add_session_to_group_for(session)
+
+    def add_session_to_group_for(self, session: Session) -> None:
+        group = self.metadata.get("groups", {}).get(session.cwd)
+        if not group:
+            QMessageBox.information(
+                self,
+                "No group for this session",
+                "This session isn't part of a saved group. Use "
+                "“New session group…” first to create one.",
+            )
+            return
+        dialog = AddGroupSessionDialog(group, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.row:
+            return
+        row = self.register_group_row(
+            group["cwd"], dialog.row["name"], dialog.row.get("model")
+        )
+        self.launch(
+            "Claude",
+            None,
+            group["cwd"],
+            session_key=row["override_key"],
+            flag_overrides={"--name": row["name"]},
+        )
+        group["rows"].append(row)
+        write_metadata(self.metadata)
+        self.refresh()
+
+    def delete_session(self, session: Session) -> None:
+        answer = QMessageBox.warning(
+            self,
+            "Move session to Session Hub trash?",
+            f"{session.title}\n\nThe history file will be moved to Session Hub's "
+            "recoverable trash. Close agents currently using this session first.",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.move_session_to_trash(session)
+        except OSError as error:
+            QMessageBox.critical(self, "Could not delete", str(error))
+            return
+        write_metadata(self.metadata)
+        self.refresh()
+
     def delete_selected(self) -> None:
         sessions = self.selected_sessions()
         if not sessions:
@@ -3806,21 +4996,70 @@ class SessionHub(QMainWindow):
         self.metadata.setdefault("sessions", {}).pop(session.key, None)
         self.metadata.setdefault("links", {}).pop(session.key, None)
 
-    def context_menu_actions(self) -> list[tuple[str, object]]:
+    def context_menu_actions(
+        self, session: Session | None = None
+    ) -> list[tuple[str, object]]:
+        """The (label, slot) pairs for a session's right-click menu.
+
+        `session=None` (the main listview's own context menu) binds slots to
+        the `*_selected` methods, which read `self.selected()` off the main
+        table at click time - unchanged behavior. Passing an explicit
+        `session` (ManageGroupDialog, building a menu for one of its own
+        rows) binds slots to the `*_for`/`*_session` variants instead, so the
+        action runs against that exact session regardless of what (if
+        anything) is selected in the main table.
+        """
+        target = session if session is not None else self.selected()
+        if target and self.is_group_session(target):
+            return [
+                ("Manage group…", self.manage_group),
+                ("Rename group", self.rename_group),
+                ("Delete group", self.delete_group),
+            ]
         settings = self.settings()
         multiple_agents = sum(
             bool(settings.get(f"enable_{provider.lower()}", True))
             for provider in PROVIDERS
         ) > 1
+
+        def bound(no_arg_slot, for_session_slot):
+            return (lambda: for_session_slot(session)) if session is not None else no_arg_slot
+
         actions = [
-            ("Resume in new terminal", self.resume_selected),
-            ("Open linked conversation…", self.open_linked_conversation),
-            ("Prepare handoff summary", self.prepare_handoff_summary),
-            ("Continue with other agent", self.continue_with_other_agent),
-            ("Rename", self.rename_selected),
-            ("Change directory", self.change_directory),
-            ("Launch options…", self.edit_session_launch_options),
-            ("Delete", self.delete_selected),
+            ("Resume in new terminal", bound(self.resume_selected, self.resume_session)),
+            (
+                "Open linked conversation…",
+                bound(self.open_linked_conversation, self.open_linked_conversation_for),
+            ),
+            (
+                "Link to existing conversation…",
+                bound(
+                    self.link_to_existing_conversation,
+                    self.link_to_existing_conversation_for,
+                ),
+            ),
+            (
+                "Prepare handoff summary",
+                bound(self.prepare_handoff_summary, self.prepare_handoff_summary_for),
+            ),
+            (
+                "Continue with other agent",
+                bound(self.continue_with_other_agent, self.continue_with_other_agent_for),
+            ),
+            ("Rename", bound(self.rename_selected, self.rename_session)),
+            ("Change directory", bound(self.change_directory, self.change_directory_for)),
+            (
+                "Launch options…",
+                bound(
+                    self.edit_session_launch_options,
+                    self.edit_session_launch_options_for,
+                ),
+            ),
+            (
+                "Add session to group…",
+                bound(self.add_session_to_group, self.add_session_to_group_for),
+            ),
+            ("Delete", bound(self.delete_selected, self.delete_session)),
         ]
         if not multiple_agents:
             actions = [

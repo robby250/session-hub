@@ -591,6 +591,44 @@ class SessionHubTests(unittest.TestCase):
         self.assertEqual(window.metadata.get("links", {}), original_links)
         window.close()
 
+    def test_link_to_existing_conversation_creates_link_between_same_cwd_sessions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {"sessions": {}, "settings": {}, "groups": {}}
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                new_session = session_hub.Session(
+                    "Claude", "id-new", "Claude 3e410ca0", "/tmp/vamp", "/tmp/vamp",
+                    200, Path("/tmp/new.jsonl"),
+                )
+                old_session = session_hub.Session(
+                    "Claude", "id-old", "vamp-s1", "/tmp/vamp", "/tmp/vamp",
+                    100, Path("/tmp/old.jsonl"),
+                )
+                other_cwd_session = session_hub.Session(
+                    "Claude", "id-other", "unrelated", "/tmp/other", "/tmp/other",
+                    150, Path("/tmp/other.jsonl"),
+                )
+                index = {
+                    s.native_key: s for s in (new_session, old_session, other_cwd_session)
+                }
+                with (
+                    patch("session_hub.native_session_index", return_value=index),
+                    patch(
+                        "session_hub.QInputDialog.getItem",
+                        return_value=("Claude — vamp-s1  [id-old]", True),
+                    ),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.link_to_existing_conversation_for(new_session)
+                links = window.metadata["links"]
+                self.assertEqual(len(links), 1)
+                link = next(iter(links.values()))
+                self.assertEqual(set(link["members"]), {"Claude:id-old", "Claude:id-new"})
+                self.assertEqual(link["active"], "Claude:id-new")
+            finally:
+                window.close()
+
     def test_handoff_export_keeps_conversation_without_tool_payloads(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1367,6 +1405,85 @@ class SessionHubTests(unittest.TestCase):
         )
         self.assertEqual(link["active"], "Claude:newest-id")
 
+    def test_adopt_untracked_sessions_backfills_tracking_for_live_claude_process(self):
+        with tempfile.TemporaryDirectory() as temp:
+            proc_root = Path(temp) / "proc"
+            pid_dir = Path(temp) / "pids"
+            target_cwd = Path(temp) / "vamp"
+            target_cwd.mkdir()
+            pid = os.getpid()
+            proc_pid_dir = proc_root / str(pid)
+            proc_pid_dir.mkdir(parents=True)
+            (proc_pid_dir / "cmdline").write_bytes(b"claude\x00--resume\x00")
+            (proc_pid_dir / "cwd").symlink_to(target_cwd)
+            sessions = [
+                session_hub.Session(
+                    "Claude", "live-id", "title", str(target_cwd), str(target_cwd),
+                    500_000, Path("/tmp/live.jsonl"),
+                )
+            ]
+            with (
+                patch("session_hub.PROC_ROOT", proc_root),
+                patch("session_hub.PID_DIR", pid_dir),
+            ):
+                session_hub.adopt_untracked_sessions(sessions)
+            tracking = json.loads((pid_dir / f"{pid}.json").read_text())
+        self.assertEqual(tracking["session_id"], "live-id")
+        self.assertEqual(tracking["cwd"], str(target_cwd))
+
+    def test_adopt_untracked_sessions_skips_already_tracked_pid(self):
+        with tempfile.TemporaryDirectory() as temp:
+            proc_root = Path(temp) / "proc"
+            pid_dir = Path(temp) / "pids"
+            target_cwd = Path(temp) / "vamp"
+            target_cwd.mkdir()
+            pid = os.getpid()
+            proc_pid_dir = proc_root / str(pid)
+            proc_pid_dir.mkdir(parents=True)
+            (proc_pid_dir / "cmdline").write_bytes(b"claude\x00--resume\x00")
+            (proc_pid_dir / "cwd").symlink_to(target_cwd)
+            pid_dir.mkdir()
+            (pid_dir / f"{pid}.json").write_text(
+                json.dumps({"cwd": str(target_cwd), "session_id": "already-tracked"})
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "live-id", "title", str(target_cwd), str(target_cwd),
+                    500_000, Path("/tmp/live.jsonl"),
+                )
+            ]
+            with (
+                patch("session_hub.PROC_ROOT", proc_root),
+                patch("session_hub.PID_DIR", pid_dir),
+            ):
+                session_hub.adopt_untracked_sessions(sessions)
+            tracking = json.loads((pid_dir / f"{pid}.json").read_text())
+        self.assertEqual(tracking["session_id"], "already-tracked")
+
+    def test_adopt_untracked_sessions_ignores_non_claude_processes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            proc_root = Path(temp) / "proc"
+            pid_dir = Path(temp) / "pids"
+            target_cwd = Path(temp) / "vamp"
+            target_cwd.mkdir()
+            pid = os.getpid()
+            proc_pid_dir = proc_root / str(pid)
+            proc_pid_dir.mkdir(parents=True)
+            (proc_pid_dir / "cmdline").write_bytes(b"bash\x00")
+            (proc_pid_dir / "cwd").symlink_to(target_cwd)
+            sessions = [
+                session_hub.Session(
+                    "Claude", "live-id", "title", str(target_cwd), str(target_cwd),
+                    500_000, Path("/tmp/live.jsonl"),
+                )
+            ]
+            with (
+                patch("session_hub.PROC_ROOT", proc_root),
+                patch("session_hub.PID_DIR", pid_dir),
+            ):
+                session_hub.adopt_untracked_sessions(sessions)
+            self.assertFalse((pid_dir / f"{pid}.json").exists())
+
     def test_resolve_clear_continuations_first_sighting_records_without_link(self):
         with tempfile.TemporaryDirectory() as temp:
             pid_dir = Path(temp)
@@ -1398,6 +1515,526 @@ class SessionHubTests(unittest.TestCase):
                 changed = session_hub.resolve_clear_continuations({}, [])
             self.assertFalse(tracking_file.exists())
         self.assertFalse(changed)
+
+    def test_name_flag_present_in_cli_flag_specs(self):
+        self.assertEqual(session_hub.CLI_FLAG_SPECS["--name"]["kind"], "text")
+
+    def test_scan_claude_file_captures_agent_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "-home-user-proj"
+            project.mkdir()
+            transcript = project / "abc.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in [
+                        {"type": "custom-title", "customTitle": "vamp-s1"},
+                        {"type": "agent-name", "agentName": "vamp-s1"},
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = session_hub._scan_claude_file(transcript)
+            self.assertEqual(result.get("agent_name"), "vamp-s1")
+
+    def test_find_group_member_session_matches_by_agent_name_and_cwd(self):
+        sessions = [
+            session_hub.Session(
+                "Claude", "id-1", "t", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/a.jsonl"), agent_name="vamp-s1",
+            ),
+            session_hub.Session(
+                "Claude", "id-2", "t", "/tmp/other", "/tmp/other", 100,
+                Path("/tmp/b.jsonl"), agent_name="vamp-s1",
+            ),
+        ]
+        match = session_hub.find_group_member_session(
+            {"name": "vamp-s1"}, "/tmp/vamp", sessions
+        )
+        self.assertEqual(match.session_id, "id-1")
+        self.assertIsNone(
+            session_hub.find_group_member_session({"name": "nope"}, "/tmp/vamp", sessions)
+        )
+
+    def test_find_group_member_session_matches_by_session_key_after_restart(self):
+        # No agent_name at all (a manual restart never carries --name), but the
+        # active session's linked_keys chains back to the row's old session_key -
+        # see link_to_existing_conversation_for / resolve_clear_continuations.
+        restarted = session_hub.Session(
+            "Claude", "id-new", "t", "/tmp/vamp", "/tmp/vamp", 200, Path("/tmp/c.jsonl"),
+        )
+        restarted.linked_keys = ("Claude:id-old", "Claude:id-new")
+        match = session_hub.find_group_member_session(
+            {"name": "vamp-s1", "session_key": "Claude:id-old"}, "/tmp/vamp", [restarted]
+        )
+        self.assertEqual(match.session_id, "id-new")
+        self.assertIsNone(
+            session_hub.find_group_member_session(
+                {"name": "vamp-s1", "session_key": "Claude:unrelated"}, "/tmp/vamp", [restarted]
+            )
+        )
+
+    def test_discover_sessions_collapses_group_members_into_one_row(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp) / "-tmp-vamp"
+            project.mkdir()
+            for name, session_id in (("vamp-opus", "id-1"), ("vamp-s1", "id-2")):
+                (project / f"{session_id}.jsonl").write_text(
+                    "\n".join(
+                        json.dumps(row)
+                        for row in [
+                            {"type": "custom-title", "customTitle": name},
+                            {"type": "agent-name", "agentName": name},
+                            {"type": "user", "cwd": "/tmp/vamp"},
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            metadata = {
+                "settings": {"enable_codex": False, "enable_antigravity": False},
+                "sessions": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {"name": "vamp-opus", "override_key": "group:/tmp/vamp#vamp-opus"},
+                            {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"},
+                        ],
+                    }
+                },
+            }
+            with (
+                patch.object(session_hub, "CLAUDE_PROJECTS", Path(temp)),
+                patch.object(session_hub, "CODEX_SESSIONS", Path(temp) / "none"),
+                patch.object(
+                    session_hub, "ANTIGRAVITY_CONVERSATIONS", Path(temp) / "none"
+                ),
+                patch("session_hub.claude_history_index", return_value={}),
+                patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+            ):
+                sessions = session_hub.discover_sessions(metadata)
+            self.assertEqual(len(sessions), 1)
+            self.assertTrue(sessions[0].session_id.startswith("group:"))
+            self.assertEqual(sessions[0].cwd, "/tmp/vamp")
+            self.assertEqual(
+                metadata["groups"]["/tmp/vamp"]["rows"][0]["session_key"], "Claude:id-1"
+            )
+            self.assertEqual(
+                metadata["groups"]["/tmp/vamp"]["rows"][1]["session_key"], "Claude:id-2"
+            )
+
+    def test_is_group_session(self):
+        metadata = {"sessions": {}, "settings": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            group_session = session_hub.Session(
+                "Claude", "group:/tmp/vamp", "vamp", "/tmp/vamp", "/tmp/vamp",
+                100, Path("/tmp/vamp"),
+            )
+            real_session = session_hub.Session(
+                "Claude", "abc-123", "t", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/a.jsonl"),
+            )
+            self.assertTrue(window.is_group_session(group_session))
+            self.assertFalse(window.is_group_session(real_session))
+        finally:
+            window.close()
+
+    def test_resume_selected_opens_manage_group_for_group_session(self):
+        metadata = {
+            "sessions": {},
+            "settings": {},
+            "groups": {"/tmp/vamp": {"cwd": "/tmp/vamp", "rows": []}},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            group_session = session_hub.Session(
+                "Claude", "group:/tmp/vamp", "vamp", "/tmp/vamp", "/tmp/vamp",
+                100, Path("/tmp/vamp"),
+            )
+            with (
+                patch.object(window, "selected", return_value=group_session),
+                patch.object(session_hub.SessionHub, "manage_group") as manage,
+                patch.object(session_hub.SessionHub, "launch") as launch,
+            ):
+                window.resume_selected()
+            manage.assert_called_once()
+            launch.assert_not_called()
+        finally:
+            window.close()
+
+    def test_context_menu_actions_are_group_specific_for_group_session(self):
+        metadata = {"sessions": {}, "settings": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            group_session = session_hub.Session(
+                "Claude", "group:/tmp/vamp", "vamp", "/tmp/vamp", "/tmp/vamp",
+                100, Path("/tmp/vamp"),
+            )
+            with patch.object(window, "selected", return_value=group_session):
+                labels = [label for label, _ in window.context_menu_actions()]
+            self.assertEqual(
+                labels, ["Manage group…", "Rename group", "Delete group"]
+            )
+        finally:
+            window.close()
+
+    def test_rename_group_updates_display_name(self):
+        metadata = {
+            "sessions": {},
+            "settings": {},
+            "groups": {"/tmp/vamp": {"cwd": "/tmp/vamp", "rows": []}},
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                group_session = session_hub.Session(
+                    "Claude", "group:/tmp/vamp", "vamp", "/tmp/vamp", "/tmp/vamp",
+                    100, Path("/tmp/vamp"),
+                )
+                with (
+                    patch.object(window, "selected", return_value=group_session),
+                    patch(
+                        "session_hub.QInputDialog.getText",
+                        return_value=("VAMPULSE team", True),
+                    ),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.rename_group()
+                self.assertEqual(
+                    window.metadata["groups"]["/tmp/vamp"]["display_name"],
+                    "VAMPULSE team",
+                )
+            finally:
+                window.close()
+
+    def test_delete_group_trashes_members_and_removes_group(self):
+        metadata = {
+            "sessions": {},
+            "settings": {},
+            "groups": {
+                "/tmp/vamp": {
+                    "cwd": "/tmp/vamp",
+                    "rows": [{"name": "vamp-opus", "model": "opus", "launched": True}],
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                group_session = session_hub.Session(
+                    "Claude", "group:/tmp/vamp", "vamp", "/tmp/vamp", "/tmp/vamp",
+                    100, Path("/tmp/vamp"),
+                )
+                live = session_hub.Session(
+                    "Claude", "abc-123", "t", "/tmp/vamp", "/tmp/vamp", 100,
+                    Path("/tmp/a.jsonl"), agent_name="vamp-opus",
+                )
+                with (
+                    patch.object(window, "selected", return_value=group_session),
+                    patch("session_hub.claude_sessions", return_value=[live]),
+                    patch.object(session_hub.SessionHub, "move_session_to_trash") as trash,
+                    patch(
+                        "session_hub.QMessageBox.warning",
+                        return_value=session_hub.QMessageBox.StandardButton.Yes,
+                    ),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.delete_group()
+                trash.assert_called_once_with(live)
+                self.assertNotIn("/tmp/vamp", window.metadata["groups"])
+            finally:
+                window.close()
+
+    @patch("session_hub.threading.Thread")
+    @patch("session_hub.subprocess.Popen")
+    def test_spawn_skips_focus_thread_when_focus_false(self, popen, thread):
+        window = session_hub.SessionHub()
+        try:
+            window.spawn(
+                ["gnome-terminal", "--title=Claude — session-hub", "--"],
+                focus=False,
+            )
+        finally:
+            window.close()
+        thread.assert_not_called()
+
+    def test_launch_env_strips_requested_keys(self):
+        metadata = {"sessions": {}, "settings": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            with patch.dict(
+                session_hub.os.environ, {"CLAUDE_CODE_CHILD_SESSION": "1"}
+            ):
+                env = window.launch_env(strip=["CLAUDE_CODE_CHILD_SESSION"])
+                self.assertNotIn("CLAUDE_CODE_CHILD_SESSION", env)
+                self.assertIsNone(window.launch_env())
+        finally:
+            window.close()
+
+    def test_manage_group_dialog_launch_row_strips_env_when_transcripts_checked(self):
+        group = {
+            "cwd": "/tmp/vamp",
+            "rows": [
+                {
+                    "name": "vamp-s1",
+                    "override_key": "group:/tmp/vamp#vamp-s1",
+                    "transcripts": True,
+                }
+            ],
+        }
+        hub = MagicMock()
+        hub.metadata = {"groups": {"/tmp/vamp": group}}
+        dialog = session_hub.ManageGroupDialog.__new__(session_hub.ManageGroupDialog)
+        dialog.hub = hub
+        dialog.cwd = "/tmp/vamp"
+        dialog.reload = MagicMock()
+        with patch("session_hub.write_metadata"):
+            dialog.launch_row("vamp-s1")
+        hub.launch.assert_called_once_with(
+            "Claude",
+            None,
+            "/tmp/vamp",
+            session_key="group:/tmp/vamp#vamp-s1",
+            flag_overrides={"--name": "vamp-s1"},
+            strip_env=["CLAUDE_CODE_CHILD_SESSION"],
+        )
+
+    def test_manage_group_dialog_launch_row_keeps_env_when_transcripts_unchecked(self):
+        group = {
+            "cwd": "/tmp/vamp",
+            "rows": [
+                {
+                    "name": "vamp-s1",
+                    "override_key": "group:/tmp/vamp#vamp-s1",
+                    "transcripts": False,
+                }
+            ],
+        }
+        hub = MagicMock()
+        hub.metadata = {"groups": {"/tmp/vamp": group}}
+        dialog = session_hub.ManageGroupDialog.__new__(session_hub.ManageGroupDialog)
+        dialog.hub = hub
+        dialog.cwd = "/tmp/vamp"
+        dialog.reload = MagicMock()
+        with patch("session_hub.write_metadata"):
+            dialog.launch_row("vamp-s1")
+        hub.launch.assert_called_once_with(
+            "Claude",
+            None,
+            "/tmp/vamp",
+            session_key="group:/tmp/vamp#vamp-s1",
+            flag_overrides={"--name": "vamp-s1"},
+            strip_env=None,
+        )
+
+    def test_suggest_session_name_first_then_numbered(self):
+        directory = Path("/home/user/Dropbox/Backups/projects/VAMPULSE-game")
+        first = session_hub.suggest_session_name(directory, "sonnet", set())
+        self.assertEqual(first, "VAMPULSE-game-sonnet")
+        second = session_hub.suggest_session_name(directory, "sonnet", {first})
+        self.assertEqual(second, "VAMPULSE-game-sonnet-2")
+        third = session_hub.suggest_session_name(directory, "sonnet", {first, second})
+        self.assertEqual(third, "VAMPULSE-game-sonnet-3")
+
+    def test_new_session_group_dialog_add_remove_rows_and_suggests_names(self):
+        with tempfile.TemporaryDirectory() as temp:
+            dialog = session_hub.NewSessionGroupDialog({})
+            dialog.location.setCurrentIndex(dialog.location.findData("existing"))
+            dialog.existing_path.setText(temp)
+            dialog.update_preview()
+            self.assertEqual(dialog.table.rowCount(), 1)
+            dialog.add_row()
+            self.assertEqual(dialog.table.rowCount(), 2)
+            rows = dialog.rows()
+            self.assertEqual(len(rows), 2)
+            self.assertNotEqual(rows[0]["name"], rows[1]["name"])
+            dialog.table.selectRow(1)
+            dialog.remove_selected_rows()
+            self.assertEqual(dialog.table.rowCount(), 1)
+            dialog.close()
+
+    def test_new_session_group_dialog_rejects_duplicate_names(self):
+        with tempfile.TemporaryDirectory() as temp:
+            dialog = session_hub.NewSessionGroupDialog({})
+            dialog.location.setCurrentIndex(dialog.location.findData("existing"))
+            dialog.existing_path.setText(temp)
+            dialog.update_preview()
+            dialog.add_row()
+            name_edit_0 = dialog.table.cellWidget(0, 1)
+            name_edit_1 = dialog.table.cellWidget(1, 1)
+            name_edit_0.setText("same-name")
+            name_edit_0.auto_suggested = False
+            name_edit_1.setText("same-name")
+            name_edit_1.auto_suggested = False
+            with patch("session_hub.QMessageBox.warning") as warning:
+                dialog.accept()
+            warning.assert_called_once()
+            self.assertIsNone(dialog.directory)
+            dialog.close()
+
+    def test_new_session_group_dialog_launches_all_rows_and_saves_group(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {"sessions": {}, "settings": {}}
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                dialog_instance = session_hub.NewSessionGroupDialog.__new__(
+                    session_hub.NewSessionGroupDialog
+                )
+                dialog_instance.directory = Path(temp)
+                dialog_instance.group_rows = [
+                    {"name": "vampulse-fable", "model": "fable"},
+                    {"name": "vampulse-sonnet", "model": "sonnet"},
+                ]
+                dialog_instance.exec = MagicMock(
+                    return_value=session_hub.QDialog.DialogCode.Accepted
+                )
+                with (
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch(
+                        "session_hub.NewSessionGroupDialog", return_value=dialog_instance
+                    ),
+                    patch(
+                        "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
+                    ),
+                ):
+                    window.launch_new_group()
+                self.assertEqual(launch.call_count, 2)
+                for call in launch.call_args_list:
+                    self.assertFalse(call.kwargs["focus"])
+                saved = window.metadata["groups"][temp]
+                self.assertEqual(
+                    {row["name"] for row in saved["rows"]},
+                    {"vampulse-fable", "vampulse-sonnet"},
+                )
+            finally:
+                window.close()
+
+    def test_launch_new_group_merges_without_duplicating_existing_rows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    temp: {
+                        "cwd": temp,
+                        "rows": [{"name": "vampulse-fable", "model": "fable"}],
+                    }
+                },
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                dialog_instance = session_hub.NewSessionGroupDialog.__new__(
+                    session_hub.NewSessionGroupDialog
+                )
+                dialog_instance.directory = Path(temp)
+                dialog_instance.group_rows = [
+                    {"name": "vampulse-fable", "model": "fable"},
+                    {"name": "vampulse-sonnet", "model": "sonnet"},
+                ]
+                dialog_instance.exec = MagicMock(
+                    return_value=session_hub.QDialog.DialogCode.Accepted
+                )
+                with (
+                    patch.object(session_hub.SessionHub, "launch"),
+                    patch(
+                        "session_hub.NewSessionGroupDialog", return_value=dialog_instance
+                    ),
+                    patch(
+                        "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
+                    ),
+                ):
+                    window.launch_new_group()
+                saved = window.metadata["groups"][temp]
+                self.assertEqual(len(saved["rows"]), 2)
+            finally:
+                window.close()
+
+    def test_add_session_to_group_shows_message_when_no_group(self):
+        metadata = {"sessions": {}, "settings": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            session = session_hub.Session(
+                "Claude", "id-1", "title", "/home/user/proj",
+                "/home/user/proj", 100, Path("/tmp/x.jsonl"),
+            )
+            with (
+                patch.object(window, "selected", return_value=session),
+                patch("session_hub.QMessageBox.information") as info,
+            ):
+                window.add_session_to_group()
+            info.assert_called_once()
+        finally:
+            window.close()
+
+    def test_add_session_to_group_launches_and_appends_row(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/home/user/proj": {
+                        "cwd": "/home/user/proj",
+                        "rows": [{"name": "proj-fable", "model": "fable"}],
+                    }
+                },
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                session = session_hub.Session(
+                    "Claude", "id-1", "title", "/home/user/proj",
+                    "/home/user/proj", 100, Path("/tmp/x.jsonl"),
+                )
+                dialog_instance = session_hub.AddGroupSessionDialog.__new__(
+                    session_hub.AddGroupSessionDialog
+                )
+                dialog_instance.row = {"name": "proj-sonnet", "model": "sonnet"}
+                dialog_instance.exec = MagicMock(
+                    return_value=session_hub.QDialog.DialogCode.Accepted
+                )
+                with (
+                    patch.object(window, "selected", return_value=session),
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch(
+                        "session_hub.AddGroupSessionDialog", return_value=dialog_instance
+                    ),
+                    patch(
+                        "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
+                    ),
+                ):
+                    window.add_session_to_group()
+                launch.assert_called_once()
+                self.assertEqual(
+                    launch.call_args.kwargs["flag_overrides"], {"--name": "proj-sonnet"}
+                )
+                self.assertEqual(
+                    len(window.metadata["groups"]["/home/user/proj"]["rows"]), 2
+                )
+            finally:
+                window.close()
+
+    def test_context_menu_includes_add_session_to_group(self):
+        metadata = {"sessions": {}, "settings": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            with patch.object(window, "selected", return_value=None):
+                labels = [label for label, _ in window.context_menu_actions()]
+                self.assertIn("Add session to group…", labels)
+        finally:
+            window.close()
 
     def test_flags_editor_uses_typed_widget_for_effort(self):
         editor = session_hub.EnvEditor(
