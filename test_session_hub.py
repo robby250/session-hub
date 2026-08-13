@@ -1474,6 +1474,69 @@ class SessionHubTests(unittest.TestCase):
         self.assertEqual(set(link["members"]), {"Claude:old-id", "Claude:new-id"})
         self.assertEqual(link["active"], "Claude:new-id")
 
+    def test_resolve_clear_continuations_copies_old_name_and_launch_overrides(self):
+        # Mirrors test_link_to_existing_conversation_copies_old_name_and_launch_overrides:
+        # an automatically-detected /clear should inherit the old session's
+        # display name and launch env/flag overrides exactly like a manual
+        # link does - both paths go through link_continuation now.
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / f"{os.getpid()}.json").write_text(
+                json.dumps({"cwd": "/home/user/proj", "session_id": "old-id"})
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "new-id", "title", "/home/user/proj",
+                    "/home/user/proj", 500_000, Path("/tmp/new.jsonl"),
+                )
+            ]
+            metadata = {
+                "sessions": {
+                    "Claude:old-id": {
+                        "name": "vamp-s1",
+                        "env": {"ANTHROPIC_MODEL": "opus"},
+                        "flags": {"--dangerously-skip-permissions": True},
+                    }
+                }
+            }
+            with patch("session_hub.PID_DIR", pid_dir):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+        self.assertTrue(changed)
+        new_overrides = metadata["sessions"]["Claude:new-id"]
+        self.assertEqual(new_overrides["name"], "vamp-s1")
+        link_id = next(iter(metadata["links"]))
+        link_overrides = metadata["sessions"][link_id]
+        self.assertEqual(link_overrides["env"], {"ANTHROPIC_MODEL": "opus"})
+        self.assertEqual(link_overrides["flags"], {"--dangerously-skip-permissions": True})
+
+    def test_resolve_clear_continuations_copies_organic_title_with_no_explicit_override(self):
+        # The old session was never explicitly renamed - its title is just
+        # whatever Claude Code auto-generated - so there's no
+        # metadata["sessions"][old_key]["name"] to copy. The new session
+        # should still inherit that organic title.
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / f"{os.getpid()}.json").write_text(
+                json.dumps({"cwd": "/home/user/proj", "session_id": "old-id"})
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "old-id", "vampulse-orchestrator", "/home/user/proj",
+                    "/home/user/proj", 100_000, Path("/tmp/old.jsonl"),
+                ),
+                session_hub.Session(
+                    "Claude", "new-id", "Claude 3e410ca0", "/home/user/proj",
+                    "/home/user/proj", 500_000, Path("/tmp/new.jsonl"),
+                ),
+            ]
+            metadata = {}
+            with patch("session_hub.PID_DIR", pid_dir):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+        self.assertTrue(changed)
+        self.assertEqual(
+            metadata["sessions"]["Claude:new-id"]["name"], "vampulse-orchestrator"
+        )
+
     def test_resolve_clear_continuations_extends_existing_chain(self):
         with tempfile.TemporaryDirectory() as temp:
             pid_dir = Path(temp)

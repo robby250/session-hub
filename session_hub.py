@@ -1830,6 +1830,49 @@ def adopt_untracked_sessions(sessions: list[Session]) -> None:
             record_hub_launch(pid, cwd, session.session_id)
 
 
+def link_continuation(
+    metadata: dict, old_key: str, new_key: str, old_title: str | None, id_prefix: str
+) -> None:
+    """Link `new_key` as the continuation of `old_key` and copy over whatever
+    made the old session identifiable - display name and launch env/flag
+    overrides - onto the new one.
+
+    Shared by resolve_clear_continuations (automatic, hub-launched /clear)
+    and link_to_existing_conversation_for (manual) so both paths behave
+    identically instead of the new session reverting to "Claude <hash>" and
+    global launch options.
+    """
+    links = metadata.setdefault("links", {})
+    link_id = next(
+        (
+            lid
+            for lid, link in links.items()
+            if old_key in link.get("members", []) or new_key in link.get("members", [])
+        ),
+        None,
+    )
+    if link_id:
+        link = links[link_id]
+        for key in (old_key, new_key):
+            if key not in link["members"]:
+                link["members"].append(key)
+        link["active"] = new_key
+    else:
+        link_id = f"{id_prefix}:{uuid.uuid4().hex}"
+        links[link_id] = {"members": [old_key, new_key], "active": new_key}
+
+    overrides = metadata.setdefault("sessions", {})
+    old_overrides = overrides.get(old_key, {})
+    new_overrides = overrides.setdefault(new_key, {})
+    if "name" not in new_overrides and old_title:
+        new_overrides["name"] = old_title
+
+    link_overrides = overrides.setdefault(link_id, {})
+    for field in ("env", "flags"):
+        if field not in link_overrides and field in old_overrides:
+            link_overrides[field] = old_overrides[field]
+
+
 def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool:
     """Detect a /clear inside a Session-Hub-launched Claude terminal.
 
@@ -1885,7 +1928,6 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
                 claimed.add(session_key[len("Claude:"):])
 
     changed = False
-    links = metadata.setdefault("links", {})
     for tracking_file, entry in tracked:
         candidates = [
             session
@@ -1907,20 +1949,19 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
 
         old_key = f"Claude:{old_session_id}"
         new_key = latest.native_key
-        link_id = next(
-            (lid for lid, link in links.items() if old_key in link.get("members", [])),
+        old_session = next(
+            (
+                s
+                for s in by_cwd.get(entry.get("cwd"), [])
+                if s.session_id == old_session_id
+            ),
             None,
         )
-        if link_id:
-            link = links[link_id]
-            if new_key not in link["members"]:
-                link["members"].append(new_key)
-            link["active"] = new_key
-        else:
-            links[f"clear:{uuid.uuid4().hex}"] = {
-                "members": [old_key, new_key],
-                "active": new_key,
-            }
+        session_overrides = metadata.get("sessions", {})
+        old_title = session_overrides.get(old_key, {}).get("name") or (
+            old_session.title if old_session else None
+        )
+        link_continuation(metadata, old_key, new_key, old_title, "clear")
         entry["session_id"] = latest.session_id
         tracking_file.write_text(json.dumps(entry))
         claimed.add(latest.session_id)
@@ -4678,49 +4719,15 @@ class SessionHub(QMainWindow):
         if not accepted:
             return
         target = candidates[labels.index(selected_label)]
-        links = self.metadata.setdefault("links", {})
         old_key, new_key = target.native_key, session.native_key
-        link_id = next(
-            (
-                lid
-                for lid, link in links.items()
-                if old_key in link.get("members", []) or new_key in link.get("members", [])
-            ),
-            None,
-        )
-        if link_id:
-            link = links[link_id]
-            for key in (old_key, new_key):
-                if key not in link["members"]:
-                    link["members"].append(key)
-            link["active"] = new_key
-        else:
-            link_id = f"manual:{uuid.uuid4().hex}"
-            links[link_id] = {"members": [old_key, new_key], "active": new_key}
-
-        # The new session is the continuation of the old one, so it inherits
-        # the old one's display name and launch overrides (env/flags)
-        # instead of showing up as "Claude <hash>" and reverting to global
-        # launch options - whatever made the old session identifiable.
-        overrides = self.metadata.setdefault("sessions", {})
-        old_overrides = overrides.get(old_key, {})
-        new_overrides = overrides.setdefault(new_key, {})
-        if "name" not in new_overrides:
-            # target.title already went through native_session_index()'s own
-            # override resolution, so this is the old session's real display
-            # name whether that came from an explicit rename or just its own
-            # auto-generated title - covers both, not only the rarer
-            # explicitly-renamed case old_overrides.get("name") would.
-            # Keyed by the new session's own native key (not the link id):
-            # ManageGroupDialog resolves a group row's title by native key
-            # too and has no idea the link even exists.
-            new_overrides["name"] = target.title
-
-        link_overrides = overrides.setdefault(link_id, {})
-        for field in ("env", "flags"):
-            if field not in link_overrides and field in old_overrides:
-                link_overrides[field] = old_overrides[field]
-
+        # target.title already went through native_session_index()'s own
+        # override resolution, so this is the old session's real display
+        # name whether that came from an explicit rename or just its own
+        # auto-generated title. link_continuation keys the copied name onto
+        # the new session's own native key (not the link id): ManageGroupDialog
+        # resolves a group row's title by native key too and has no idea the
+        # link even exists.
+        link_continuation(self.metadata, old_key, new_key, target.title, "manual")
         write_metadata(self.metadata)
         self.refresh()
 
