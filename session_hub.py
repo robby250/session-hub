@@ -3103,6 +3103,7 @@ class ManageGroupDialog(QDialog):
             return []
         live = claude_sessions()
         overrides = self.hub.metadata.get("sessions", {})
+        links = self.hub.metadata.get("links", {})
         pairs = []
         for row in group.get("rows", []):
             match = find_group_member_session(row, self.cwd, live)
@@ -3113,6 +3114,23 @@ class ManageGroupDialog(QDialog):
                     row_custom.get("name") or native_custom.get("name") or match.title
                 )
                 match.cwd = row_custom.get("cwd") or native_custom.get("cwd") or match.cwd
+                # claude_sessions() is raw - unlike discover_sessions(), it
+                # never applies metadata["links"], so linked_keys is always
+                # empty here unless filled in by hand. Without this,
+                # "Open linked conversation..." (linked_conversations(),
+                # which reads session.linked_keys) always finds nothing for
+                # a group row, even when the row's session really is linked
+                # to an older conversation.
+                link = next(
+                    (
+                        entry
+                        for entry in links.values()
+                        if match.native_key in entry.get("members", [])
+                    ),
+                    None,
+                )
+                if link:
+                    match.linked_keys = tuple(link.get("members", []))
             pairs.append((row, match))
         return pairs
 

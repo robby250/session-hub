@@ -1987,6 +1987,111 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_matched_sessions_populates_linked_keys_from_metadata_links(self):
+        # claude_sessions() is raw and never applies metadata["links"], so
+        # without this, session.linked_keys is always empty for a group row
+        # and "Open linked conversation..." can never find anything.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "links": {
+                    "manual:abc": {
+                        "members": ["Claude:abc123", "Claude:id-old"],
+                        "active": "Claude:abc123",
+                    }
+                },
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}
+                        ],
+                    }
+                },
+            }
+            live = session_hub.Session(
+                "Claude", "abc123", "raw title", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/x.jsonl"), agent_name="vamp-s1",
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.claude_sessions", return_value=[live]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    with patch("session_hub.claude_sessions", return_value=[live]):
+                        pairs = dialog.matched_sessions()
+                    self.assertEqual(
+                        set(pairs[0][1].linked_keys),
+                        {"Claude:abc123", "Claude:id-old"},
+                    )
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
+
+    def test_open_linked_conversation_for_group_row_finds_old_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "links": {
+                    "manual:abc": {
+                        "members": ["Claude:abc123", "Claude:id-old"],
+                        "active": "Claude:abc123",
+                    }
+                },
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}
+                        ],
+                    }
+                },
+            }
+            live = session_hub.Session(
+                "Claude", "abc123", "raw title", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/x.jsonl"), agent_name="vamp-s1",
+            )
+            old = session_hub.Session(
+                "Claude", "id-old", "vampulse-orchestrator", "/tmp/vamp", "/tmp/vamp",
+                50, Path("/tmp/old.jsonl"),
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.claude_sessions", return_value=[live]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    with patch("session_hub.claude_sessions", return_value=[live]):
+                        row, match = dialog.matched_sessions()[0]
+                    session = dialog.row_session(row, match)
+                    with (
+                        patch(
+                            "session_hub.native_session_index",
+                            return_value={live.native_key: live, old.native_key: old},
+                        ),
+                        patch(
+                            "session_hub.QInputDialog.getItem",
+                            return_value=("Claude — vampulse-orchestrator  [id-old]", False),
+                        ) as getitem,
+                    ):
+                        window.open_linked_conversation_for(session)
+                    labels = getitem.call_args[0][3]
+                    self.assertIn("Claude — vampulse-orchestrator  [id-old]", labels)
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
+
     def test_manage_group_dialog_default_column_order_puts_status_first_and_agent_last(self):
         with tempfile.TemporaryDirectory() as temp:
             metadata = {
