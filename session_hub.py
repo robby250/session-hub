@@ -2866,8 +2866,12 @@ def configure_resizable_columns(
     stretch column is the only one that grows or shrinks when the table
     itself is resized, so it's the one that gets truncated first on a
     narrower window instead of every column being squeezed down together.
+    Columns are also drag-reorderable (setSectionsMovable) - the resulting
+    order round-trips through the same saveState()/restoreState() blob as
+    the widths, so a dragged order is remembered too.
     """
     header = table.horizontalHeader()
+    header.setSectionsMovable(True)
     for index, column in enumerate(columns):
         header.setSectionResizeMode(
             index,
@@ -2891,6 +2895,18 @@ def restore_column_widths(table: QTableWidget, encoded: str | None) -> None:
 
 def column_widths_state(table: QTableWidget) -> str:
     return bytes(table.horizontalHeader().saveState().toBase64()).decode("ascii")
+
+
+def set_default_column_order(table: QTableWidget, logical_order: list[int]) -> None:
+    """Put columns in `logical_order` left-to-right, before any saved state is restored.
+
+    Moving one section shifts everyone else's visual index, so each target
+    column's current visual position has to be looked up fresh right before
+    it's moved - not computed once up front.
+    """
+    header = table.horizontalHeader()
+    for target_visual, logical_index in enumerate(logical_order):
+        header.moveSection(header.visualIndex(logical_index), target_visual)
 
 
 class _GroupSessionTable(QTableWidget):
@@ -2970,6 +2986,22 @@ class ManageGroupDialog(QDialog):
         )
         header.setSectionResizeMode(self.STATUS_COLUMN, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(self.SESSION_ID_COLUMN, QHeaderView.ResizeMode.Stretch)
+        # Default order: launch status up front (the thing you actually act
+        # on), Agent moved to just before Session ID since every row here is
+        # already known to be Claude. Only the default - restoring below
+        # overrides it with whatever order the user last dragged to.
+        set_default_column_order(
+            self.table,
+            [
+                self.STATUS_COLUMN,
+                self.SHARED_COLUMNS.index("Model"),
+                self.SHARED_COLUMNS.index("Name"),
+                self.SHARED_COLUMNS.index("Last updated"),
+                self.TRANSCRIPTS_COLUMN,
+                self.SHARED_COLUMNS.index("Agent"),
+                self.SESSION_ID_COLUMN,
+            ],
+        )
         restore_column_widths(self.table, self.hub.settings().get("group_table_columns"))
         self.table.verticalHeader().setVisible(False)
         self.table.setMinimumHeight(200)
@@ -3155,7 +3187,13 @@ class ManageGroupDialog(QDialog):
         match = find_group_member_session(row, self.cwd, live)
         menu = QMenu(self)
         if match:
-            for label, slot in self.hub.context_menu_actions(match):
+            # row_session(), not the raw match: its .key is the row's own
+            # override_key, so "Launch options..." reads/writes the exact
+            # bucket the Model column already reads from (effective_model)
+            # instead of a native session key that goes stale on every
+            # restart and never matches what the column shows.
+            session = self.row_session(row, match)
+            for label, slot in self.hub.context_menu_actions(session):
                 if label == "Add session to group…":
                     continue
                 action = QAction(label, self)
@@ -4609,8 +4647,20 @@ class SessionHub(QMainWindow):
         # launch options - whatever made the old session identifiable.
         overrides = self.metadata.setdefault("sessions", {})
         old_overrides = overrides.get(old_key, {})
+        new_overrides = overrides.setdefault(new_key, {})
+        if "name" not in new_overrides:
+            # target.title already went through native_session_index()'s own
+            # override resolution, so this is the old session's real display
+            # name whether that came from an explicit rename or just its own
+            # auto-generated title - covers both, not only the rarer
+            # explicitly-renamed case old_overrides.get("name") would.
+            # Keyed by the new session's own native key (not the link id):
+            # ManageGroupDialog resolves a group row's title by native key
+            # too and has no idea the link even exists.
+            new_overrides["name"] = target.title
+
         link_overrides = overrides.setdefault(link_id, {})
-        for field in ("name", "env", "flags"):
+        for field in ("env", "flags"):
             if field not in link_overrides and field in old_overrides:
                 link_overrides[field] = old_overrides[field]
 

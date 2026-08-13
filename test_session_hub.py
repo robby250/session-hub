@@ -681,11 +681,50 @@ class SessionHubTests(unittest.TestCase):
                 ):
                     window.link_to_existing_conversation_for(new_session)
                 link_id = next(iter(window.metadata["links"]))
+                new_overrides = window.metadata["sessions"]["Claude:id-new"]
+                self.assertEqual(new_overrides["name"], "vamp-s1")
                 link_overrides = window.metadata["sessions"][link_id]
-                self.assertEqual(link_overrides["name"], "vamp-s1")
                 self.assertEqual(link_overrides["env"], {"ANTHROPIC_MODEL": "opus"})
                 self.assertEqual(
                     link_overrides["flags"], {"--dangerously-skip-permissions": True}
+                )
+            finally:
+                window.close()
+
+    def test_link_to_existing_conversation_copies_organic_title_with_no_explicit_override(self):
+        # The old session was never explicitly renamed via Session Hub -
+        # its title is just whatever Claude Code auto-generated - so there's
+        # no metadata["sessions"][old_key]["name"] to copy. The new session
+        # should still inherit that organic title, not silently stay
+        # unnamed just because it was never an explicit rename.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {"sessions": {}, "settings": {}, "groups": {}}
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                new_session = session_hub.Session(
+                    "Claude", "id-new", "Claude 3e410ca0", "/tmp/vamp", "/tmp/vamp",
+                    200, Path("/tmp/new.jsonl"),
+                )
+                old_session = session_hub.Session(
+                    "Claude", "id-old", "vampulse-orchestrator", "/tmp/vamp", "/tmp/vamp",
+                    100, Path("/tmp/old.jsonl"),
+                )
+                index = {s.native_key: s for s in (new_session, old_session)}
+                with (
+                    patch("session_hub.native_session_index", return_value=index),
+                    patch(
+                        "session_hub.QInputDialog.getItem",
+                        return_value=(
+                            "Claude — vampulse-orchestrator  [id-old]", True
+                        ),
+                    ),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.link_to_existing_conversation_for(new_session)
+                self.assertEqual(
+                    window.metadata["sessions"]["Claude:id-new"]["name"],
+                    "vampulse-orchestrator",
                 )
             finally:
                 window.close()
@@ -1851,6 +1890,82 @@ class SessionHubTests(unittest.TestCase):
         hub.launch_group_row.assert_called_once_with("/tmp/vamp", "vamp-s1")
         hub.refresh.assert_called_once()
         dialog.reload.assert_called_once()
+
+    def test_row_context_menu_uses_override_key_for_shared_actions(self):
+        # "Launch options..." (and every other shared action) must resolve
+        # the SAME override bucket the Model column reads from
+        # (effective_model keyed by override_key) - otherwise the column
+        # shows a model nothing in the menu can ever edit.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}
+                        ],
+                    }
+                },
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            live = session_hub.Session(
+                "Claude", "abc123", "raw title", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/x.jsonl"), agent_name="vamp-s1",
+            )
+            try:
+                with (
+                    patch("session_hub.claude_sessions", return_value=[live]),
+                    patch("session_hub.session_is_tracked_alive", return_value=False),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    with (
+                        patch.object(
+                            window, "context_menu_actions", return_value=[]
+                        ) as actions,
+                        patch("session_hub.QMenu") as menu_cls,
+                        patch("session_hub.claude_sessions", return_value=[live]),
+                    ):
+                        menu_cls.return_value = MagicMock()
+                        item = dialog.table.item(0, 0)
+                        point = dialog.table.visualItemRect(item).center()
+                        dialog.row_context_menu(point)
+                    session_arg = actions.call_args[0][0]
+                    self.assertEqual(session_arg.key, "group:/tmp/vamp#vamp-s1")
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
+
+    def test_manage_group_dialog_default_column_order_puts_status_first_and_agent_last(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {"/tmp/vamp": {"cwd": "/tmp/vamp", "rows": []}},
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    header = dialog.table.horizontalHeader()
+                    last = dialog.table.columnCount() - 1
+                    self.assertEqual(header.logicalIndex(0), dialog.STATUS_COLUMN)
+                    self.assertEqual(
+                        header.logicalIndex(last - 1),
+                        dialog.SHARED_COLUMNS.index("Agent"),
+                    )
+                    self.assertEqual(header.logicalIndex(last), dialog.SESSION_ID_COLUMN)
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
 
     def test_launch_group_row_strips_env_when_transcripts_checked(self):
         with tempfile.TemporaryDirectory() as temp:
