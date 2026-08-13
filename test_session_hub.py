@@ -1505,6 +1505,116 @@ class SessionHubTests(unittest.TestCase):
         )
         self.assertEqual(link["active"], "Claude:newest-id")
 
+    def test_resolve_clear_continuations_does_not_merge_unrelated_sessions_sharing_cwd(self):
+        # Regression: several Session-Hub-launched processes in the SAME
+        # cwd (a session group) each track their own PID -> session_id.
+        # The old "whichever session in this cwd was updated last" check
+        # treated every OTHER tracked PID's own current session as if it
+        # were a /clear target for the first PID checked, merging entirely
+        # unrelated live sessions into one - this is what corrupted a real
+        # VAMPULSE group (fable/opus/sonnet rows all collapsing onto one
+        # session id) even though none of them had actually /clear'd.
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / "111111.json").write_text(
+                json.dumps({"cwd": "/home/user/vamp", "session_id": "orchestrator-old"})
+            )
+            (pid_dir / "222222.json").write_text(
+                json.dumps({"cwd": "/home/user/vamp", "session_id": "opus-old"})
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "orchestrator-old", "title", "/home/user/vamp",
+                    "/home/user/vamp", 100_000, Path("/tmp/orch.jsonl"),
+                ),
+                session_hub.Session(
+                    "Claude", "opus-old", "title", "/home/user/vamp",
+                    "/home/user/vamp", 999_000, Path("/tmp/opus.jsonl"),
+                ),
+            ]
+            metadata = {}
+            with (
+                patch("session_hub.PID_DIR", pid_dir),
+                patch("session_hub.process_alive", return_value=True),
+            ):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+        self.assertFalse(changed)
+        self.assertEqual(metadata.get("links", {}), {})
+
+    def test_resolve_clear_continuations_still_detects_real_clear_with_sibling_sessions_in_cwd(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / "111111.json").write_text(
+                json.dumps({"cwd": "/home/user/vamp", "session_id": "old-id"})
+            )
+            (pid_dir / "222222.json").write_text(
+                json.dumps({"cwd": "/home/user/vamp", "session_id": "sibling-id"})
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "sibling-id", "title", "/home/user/vamp",
+                    "/home/user/vamp", 100_000, Path("/tmp/sibling.jsonl"),
+                ),
+                session_hub.Session(
+                    "Claude", "new-id", "title", "/home/user/vamp",
+                    "/home/user/vamp", 999_000, Path("/tmp/new.jsonl"),
+                ),
+            ]
+            metadata = {}
+            with (
+                patch("session_hub.PID_DIR", pid_dir),
+                patch("session_hub.process_alive", return_value=True),
+            ):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+        self.assertTrue(changed)
+        (link,) = metadata["links"].values()
+        self.assertEqual(set(link["members"]), {"Claude:old-id", "Claude:new-id"})
+
+    def test_resolve_clear_continuations_excludes_idle_group_sibling_sessions(self):
+        # The bug that actually corrupted a real VAMPULSE group: opus's row
+        # had a session_key, but opus's own process had already exited (no
+        # PID tracking file at all - the ordinary "idle" state for a group
+        # member that isn't currently running). The live-PIDs-only claimed
+        # set didn't cover that, so orchestrator's still-running PID got
+        # merged into opus's session the moment opus's transcript happened
+        # to be the most recently updated one in their shared cwd - which
+        # is the normal state for an active session group.
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / "111111.json").write_text(
+                json.dumps({"cwd": "/home/user/vamp", "session_id": "orchestrator-id"})
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "orchestrator-id", "title", "/home/user/vamp",
+                    "/home/user/vamp", 100_000, Path("/tmp/orch.jsonl"),
+                ),
+                session_hub.Session(
+                    "Claude", "opus-id", "title", "/home/user/vamp",
+                    "/home/user/vamp", 999_000, Path("/tmp/opus.jsonl"),
+                ),
+            ]
+            metadata = {
+                "groups": {
+                    "/home/user/vamp": {
+                        "cwd": "/home/user/vamp",
+                        "rows": [
+                            {"name": "orchestrator", "session_key": "Claude:orchestrator-id"},
+                            {"name": "opus", "session_key": "Claude:opus-id"},
+                        ],
+                    }
+                }
+            }
+            with (
+                patch("session_hub.PID_DIR", pid_dir),
+                patch("session_hub.process_alive", return_value=True),
+            ):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+        self.assertFalse(changed)
+        self.assertEqual(metadata.get("links", {}), {})
+
     def test_adopt_untracked_sessions_backfills_tracking_for_live_claude_process(self):
         with tempfile.TemporaryDirectory() as temp:
             proc_root = Path(temp) / "proc"

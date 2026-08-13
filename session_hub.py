@@ -1838,23 +1838,20 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
     same running process) - see pid_capture_command. Each such PID's tracking
     file (written by record_hub_launch right after launch) records which cwd
     it's running in and which Claude session id it was last known to be
-    writing to. If the most-recently-updated Claude transcript for that same
-    cwd now has a different session id, the process moved on to a new
-    transcript without Session Hub launching it - i.e. a /clear - so link the
-    old and new sessions the same way a cross-agent handoff would.
+    writing to. If that PID's session id no longer matches any live session,
+    the process moved on to a new transcript without Session Hub launching
+    it - i.e. a /clear - so link the old and new sessions the same way a
+    cross-agent handoff would.
     """
     if not PID_DIR.is_dir():
         return False
-    latest_by_cwd: dict[str, Session] = {}
+    by_cwd: dict[str, list[Session]] = {}
     for session in sessions:
         if session.provider != "Claude":
             continue
-        current = latest_by_cwd.get(session.cwd)
-        if not current or session.updated_ms > current.updated_ms:
-            latest_by_cwd[session.cwd] = session
+        by_cwd.setdefault(session.cwd, []).append(session)
 
-    changed = False
-    links = metadata.setdefault("links", {})
+    tracked: list[tuple[Path, dict]] = []
     for tracking_file in PID_DIR.glob("*.json"):
         try:
             pid = int(tracking_file.stem)
@@ -1867,7 +1864,36 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
             entry = json.loads(tracking_file.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        latest = latest_by_cwd.get(entry.get("cwd"))
+        tracked.append((tracking_file, entry))
+
+    # A session id already recorded as another live PID's OWN current
+    # session, or already claimed as a saved group row's session_key,
+    # can't also be *this* PID's /clear target - each tracked PID's
+    # transcript is exclusively its own, and a group row's identity is
+    # already resolved elsewhere (find_group_member_session). Without the
+    # group-row half of this, a row whose OWN process had simply exited
+    # (idle, no tracking file - the ordinary case for an unstarted or
+    # finished group member) still counted as "unclaimed", so a sibling
+    # row's genuinely-still-running PID got merged into it anyway the
+    # moment it happened to be the most recently updated session in a
+    # shared cwd - which is the normal state for a session group.
+    claimed = {entry["session_id"] for _, entry in tracked if entry.get("session_id")}
+    for group in metadata.get("groups", {}).values():
+        for row in group.get("rows", []):
+            session_key = row.get("session_key") or ""
+            if session_key.startswith("Claude:"):
+                claimed.add(session_key[len("Claude:"):])
+
+    changed = False
+    links = metadata.setdefault("links", {})
+    for tracking_file, entry in tracked:
+        candidates = [
+            session
+            for session in by_cwd.get(entry.get("cwd"), [])
+            if session.session_id == entry.get("session_id")
+            or session.session_id not in claimed
+        ]
+        latest = max(candidates, key=lambda session: session.updated_ms, default=None)
         if not latest:
             continue
         old_session_id = entry.get("session_id")
@@ -1876,6 +1902,7 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
         if old_session_id is None:
             entry["session_id"] = latest.session_id
             tracking_file.write_text(json.dumps(entry))
+            claimed.add(latest.session_id)
             continue
 
         old_key = f"Claude:{old_session_id}"
@@ -1896,6 +1923,7 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
             }
         entry["session_id"] = latest.session_id
         tracking_file.write_text(json.dumps(entry))
+        claimed.add(latest.session_id)
         changed = True
     return changed
 
@@ -3141,6 +3169,29 @@ class ManageGroupDialog(QDialog):
         )
         return replace(base, logical_key=row["override_key"])
 
+    def pair_at_table_row(self, table_row: int) -> tuple[dict, Session | None] | None:
+        """Resolve a clicked/double-clicked table row to its (row, match) pair.
+
+        Table row index is a VISUAL position, which drifts from
+        group["rows"]'s own order once the table gets sorted (see
+        populate_session_table's setSortingEnabled(True) - clicking a
+        column header, or even just re-populating a previously-sorted
+        table, reorders rows visually) - indexing matched_sessions()
+        directly by table_row silently grabs a DIFFERENT row once that
+        happens, driving actions against the wrong session entirely.
+        Column 0 is always one of the shared columns populate_session_table
+        fills, so its UserRole+1 data (the row's stable override_key)
+        identifies the row correctly no matter how it's currently sorted.
+        """
+        item = self.table.item(table_row, 0)
+        if item is None:
+            return None
+        override_key = item.data(Qt.ItemDataRole.UserRole + 1)
+        for row, match in self.matched_sessions():
+            if row["override_key"] == override_key:
+                return row, match
+        return None
+
     def reload(self) -> None:
         group = self.group()
         if not group:
@@ -3193,10 +3244,10 @@ class ManageGroupDialog(QDialog):
         there's no separate "launch" vs "resume" button here anymore, just
         the one gesture the rest of Session Hub already uses everywhere.
         """
-        pairs = self.matched_sessions()
-        if index.row() >= len(pairs):
+        pair = self.pair_at_table_row(index.row())
+        if pair is None:
             return
-        row, match = pairs[index.row()]
+        row, match = pair
         if match:
             self.hub.resume_session(self.row_session(row, match))
         else:
@@ -3217,11 +3268,17 @@ class ManageGroupDialog(QDialog):
         group = self.group()
         if not group:
             return
-        rows = group["rows"]
-        if source_row >= len(rows) or target_row >= len(rows):
+        # Resolved through pair_at_table_row like the other row-lookup
+        # sites - source_row/target_row are visual drop-target positions,
+        # which don't match group["rows"]'s own order once the table is
+        # sorted.
+        source_pair = self.pair_at_table_row(source_row)
+        target_pair = self.pair_at_table_row(target_row)
+        if source_pair is None or target_pair is None:
             return
-        row = rows.pop(source_row)
-        rows.insert(target_row, row)
+        rows = group["rows"]
+        rows.pop(rows.index(source_pair[0]))
+        rows.insert(rows.index(target_pair[0]), source_pair[0])
         write_metadata(self.hub.metadata)
         self.reload()
 
@@ -3229,16 +3286,18 @@ class ManageGroupDialog(QDialog):
         item = self.table.itemAt(point)
         if item is None:
             return
-        # matched_sessions(), not a fresh find_group_member_session() call:
-        # it's the one place that resolves title/cwd overrides *and*
-        # linked_keys (from metadata["links"]) onto the matched session -
-        # recomputing the match independently here skipped that, which is
-        # why "Open linked conversation..." always came back empty for a
-        # group row even when the row really was linked to an older one.
-        pairs = self.matched_sessions()
-        if item.row() >= len(pairs):
+        # pair_at_table_row(), not pairs[item.row()]: table row index is a
+        # visual position that drifts from matched_sessions()'s own order
+        # once the table is sorted, and matched_sessions() (not a fresh
+        # find_group_member_session() call) is the one place that resolves
+        # title/cwd overrides *and* linked_keys (from metadata["links"])
+        # onto the matched session - recomputing the match independently
+        # skipped that, which is why "Open linked conversation..." always
+        # came back empty for a group row even when it really was linked.
+        pair = self.pair_at_table_row(item.row())
+        if pair is None:
             return
-        row, match = pairs[item.row()]
+        row, match = pair
         menu = QMenu(self)
         if match:
             # row_session(), not the raw match: its .key is the row's own
