@@ -2986,23 +2986,31 @@ class ManageGroupDialog(QDialog):
         )
         header.setSectionResizeMode(self.STATUS_COLUMN, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(self.SESSION_ID_COLUMN, QHeaderView.ResizeMode.Stretch)
-        # Default order: launch status up front (the thing you actually act
-        # on), Agent moved to just before Session ID since every row here is
-        # already known to be Claude. Only the default - restoring below
-        # overrides it with whatever order the user last dragged to.
-        set_default_column_order(
-            self.table,
-            [
-                self.STATUS_COLUMN,
-                self.SHARED_COLUMNS.index("Model"),
-                self.SHARED_COLUMNS.index("Name"),
-                self.SHARED_COLUMNS.index("Last updated"),
-                self.TRANSCRIPTS_COLUMN,
-                self.SHARED_COLUMNS.index("Agent"),
-                self.SESSION_ID_COLUMN,
-            ],
-        )
-        restore_column_widths(self.table, self.hub.settings().get("group_table_columns"))
+        saved_columns = self.hub.settings().get("group_table_columns_v2")
+        if saved_columns:
+            restore_column_widths(self.table, saved_columns)
+        else:
+            # Default order: launch status up front (the thing you actually
+            # act on), Agent moved to just before Session ID since every row
+            # here is already known to be Claude. Only applied when there's
+            # no saved order yet - once the user drags one, that wins.
+            set_default_column_order(
+                self.table,
+                [
+                    self.STATUS_COLUMN,
+                    self.SHARED_COLUMNS.index("Model"),
+                    self.SHARED_COLUMNS.index("Name"),
+                    self.SHARED_COLUMNS.index("Last updated"),
+                    self.TRANSCRIPTS_COLUMN,
+                    self.SHARED_COLUMNS.index("Agent"),
+                    self.SESSION_ID_COLUMN,
+                ],
+            )
+        # QHeaderView::restoreState() also restores whether sections are
+        # movable, so a state blob saved before drag-reordering existed
+        # silently turns it back off - this has to run after restoring, not
+        # just once up front in configure_resizable_columns.
+        header.setSectionsMovable(True)
         self.table.verticalHeader().setVisible(False)
         self.table.setMinimumHeight(200)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -3013,6 +3021,7 @@ class ManageGroupDialog(QDialog):
         self.table.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.row_context_menu)
+        self.table.doubleClicked.connect(self.launch_or_resume_row)
         layout.addWidget(self.table)
 
         controls = QHBoxLayout()
@@ -3042,7 +3051,7 @@ class ManageGroupDialog(QDialog):
         # place that reliably sees every way the dialog can close.
         settings = self.hub.settings()
         settings["group_dialog_geometry"] = bytes(self.saveGeometry().toBase64()).decode("ascii")
-        settings["group_table_columns"] = column_widths_state(self.table)
+        settings["group_table_columns_v2"] = column_widths_state(self.table)
         write_metadata(self.hub.metadata)
         super().done(result)
 
@@ -3126,18 +3135,12 @@ class ManageGroupDialog(QDialog):
             self.table.setCellWidget(index, self.TRANSCRIPTS_COLUMN, checkbox)
 
             if match and session_is_tracked_alive(match):
-                self.table.setCellWidget(index, self.STATUS_COLUMN, QLabel("Running"))
-                continue
-            container = QWidget()
-            status_layout = QHBoxLayout(container)
-            status_layout.setContentsMargins(4, 0, 4, 0)
-            status_layout.addWidget(QLabel("Idle" if match else "Not started"))
-            launch_button = QPushButton("Relaunch" if match else "Launch")
-            launch_button.clicked.connect(
-                lambda _checked, n=row["name"]: self.launch_row(n)
-            )
-            status_layout.addWidget(launch_button)
-            self.table.setCellWidget(index, self.STATUS_COLUMN, container)
+                status = "Running"
+            elif match:
+                status = "Idle"
+            else:
+                status = "Not started"
+            self.table.setItem(index, self.STATUS_COLUMN, QTableWidgetItem(status))
 
     def set_transcripts(self, name: str, enabled: bool) -> None:
         group = self.group()
@@ -3151,6 +3154,25 @@ class ManageGroupDialog(QDialog):
 
     def launch_row(self, name: str) -> None:
         self.hub.launch_group_row(self.cwd, name)
+        self.hub.refresh()
+        self.reload()
+
+    def launch_or_resume_row(self, index) -> None:
+        """Double-click a row: launch it if it's never run, resume it if it has.
+
+        Mirrors the main listview's own double-click (resume_selected) -
+        there's no separate "launch" vs "resume" button here anymore, just
+        the one gesture the rest of Session Hub already uses everywhere.
+        """
+        group = self.group()
+        if not group or index.row() >= len(group["rows"]):
+            return
+        row = group["rows"][index.row()]
+        match = find_group_member_session(row, self.cwd, claude_sessions())
+        if match:
+            self.hub.resume_session(self.row_session(row, match))
+        else:
+            self.hub.launch_group_row(self.cwd, row["name"])
         self.hub.refresh()
         self.reload()
 

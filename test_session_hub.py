@@ -1967,6 +1967,115 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_manage_group_dialog_columns_stay_movable_after_restoring_saved_state(self):
+        # QHeaderView.restoreState() also restores whether sections are
+        # movable, so a blob saved before drag-reordering existed would
+        # otherwise silently turn dragging back off on every open.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {"/tmp/vamp": {"cwd": "/tmp/vamp", "rows": []}},
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"):
+                    scratch = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                    scratch.table.horizontalHeader().setSectionsMovable(False)
+                    stale_state = session_hub.column_widths_state(scratch.table)
+                    scratch.close()
+                    window.metadata["settings"]["group_table_columns_v2"] = stale_state
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    self.assertTrue(dialog.table.horizontalHeader().sectionsMovable())
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
+
+    def test_manage_group_dialog_double_click_launches_unmatched_row(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}
+                        ],
+                    }
+                },
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    with (
+                        patch.object(window, "launch_group_row") as launch_group_row,
+                        patch.object(window, "resume_session") as resume_session,
+                        patch("session_hub.claude_sessions", return_value=[]),
+                    ):
+                        index = dialog.table.model().index(0, 0)
+                        dialog.launch_or_resume_row(index)
+                    launch_group_row.assert_called_once_with("/tmp/vamp", "vamp-s1")
+                    resume_session.assert_not_called()
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
+
+    def test_manage_group_dialog_double_click_resumes_matched_row(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}
+                        ],
+                    }
+                },
+            }
+            live = session_hub.Session(
+                "Claude", "abc123", "raw title", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/x.jsonl"), agent_name="vamp-s1",
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.claude_sessions", return_value=[live]),
+                    patch("session_hub.session_is_tracked_alive", return_value=False),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    with (
+                        patch.object(window, "launch_group_row") as launch_group_row,
+                        patch.object(window, "resume_session") as resume_session,
+                        patch("session_hub.claude_sessions", return_value=[live]),
+                    ):
+                        index = dialog.table.model().index(0, 0)
+                        dialog.launch_or_resume_row(index)
+                    resume_session.assert_called_once()
+                    resumed = resume_session.call_args[0][0]
+                    self.assertEqual(resumed.session_id, "abc123")
+                    self.assertEqual(resumed.key, "group:/tmp/vamp#vamp-s1")
+                    launch_group_row.assert_not_called()
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
+
     def test_launch_group_row_strips_env_when_transcripts_checked(self):
         with tempfile.TemporaryDirectory() as temp:
             metadata = {
