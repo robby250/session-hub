@@ -105,6 +105,11 @@ def _cached_file_scan(path: Path, scan) -> dict:
 TRASH_DIR = DATA_DIR / "trash"
 HANDOFF_DIR = DATA_DIR / "handoffs"
 SUMMARY_DIR = HANDOFF_DIR / "summaries"
+# Tracks Claude processes Session Hub itself launched, so a same-directory
+# /clear inside that same process (new session id, same PID) can be detected
+# and linked to the session it continues - see pid_capture_command and
+# resolve_clear_continuations.
+PID_DIR = DATA_DIR / "pids"
 APP_ICON = Path(__file__).resolve().parent / "assets" / "session-hub.svg"
 # One-off sessions launch here instead of literally $HOME, so they don't
 # scatter loose files/clones directly in the home directory.
@@ -1474,7 +1479,10 @@ def discover_sessions(metadata: dict) -> list[Session]:
         sessions += claude_sessions()
     if settings.get("enable_antigravity", True):
         sessions += antigravity_sessions()
-    if resolve_pending_handoffs(metadata, sessions):
+    changed = resolve_pending_handoffs(metadata, sessions)
+    if resolve_clear_continuations(metadata, sessions):
+        changed = True
+    if changed:
         write_metadata(metadata)
     by_key = {session.native_key: session for session in sessions}
     overrides = metadata.setdefault("sessions", {})
@@ -1542,6 +1550,138 @@ def focus_window_by_title(title: str, timeout: float = 3.0) -> None:
                 subprocess.run([wmctrl, "-a", title], timeout=1)
                 return
         time.sleep(0.15)
+
+
+def new_pid_capture_file() -> Path:
+    PID_DIR.mkdir(parents=True, exist_ok=True)
+    return PID_DIR / f"{uuid.uuid4().hex}.pid"
+
+
+def pid_capture_command(pidfile: Path, real_args: list[str]) -> list[str]:
+    """Wrap a command so the real (post-exec) PID is written to `pidfile` first.
+
+    The script takes the pidfile and command as extra `bash -c` positional
+    args rather than string-interpolating them, so nothing here needs shell
+    quoting. `exec` then replaces the wrapper shell with the real command,
+    keeping the same PID - that's what lets a later /clear inside the same
+    launched terminal be recognized as the same OS process.
+    """
+    return [
+        "bash",
+        "-c",
+        'echo $$ > "$1"; shift; exec "$@"',
+        "session-hub",
+        str(pidfile),
+        *real_args,
+    ]
+
+
+def read_pid_capture_file(pidfile: Path, timeout: float = 2.0) -> int | None:
+    deadline = time.monotonic() + timeout
+    pid: int | None = None
+    while time.monotonic() < deadline:
+        try:
+            text = pidfile.read_text().strip()
+        except OSError:
+            text = ""
+        if text:
+            try:
+                pid = int(text)
+            except ValueError:
+                pid = None
+            break
+        time.sleep(0.05)
+    pidfile.unlink(missing_ok=True)
+    return pid
+
+
+def capture_hub_launch(pidfile: Path, cwd: str, session_id: str | None) -> None:
+    pid = read_pid_capture_file(pidfile)
+    if pid is not None:
+        record_hub_launch(pid, cwd, session_id)
+
+
+def record_hub_launch(pid: int, cwd: str, session_id: str | None) -> None:
+    PID_DIR.mkdir(parents=True, exist_ok=True)
+    tracking_file = PID_DIR / f"{pid}.json"
+    try:
+        tracking_file.write_text(json.dumps({"cwd": cwd, "session_id": session_id}))
+    except OSError:
+        pass
+
+
+def process_alive(pid: int) -> bool:
+    return Path(f"/proc/{pid}").exists()
+
+
+def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool:
+    """Detect a /clear inside a Session-Hub-launched Claude terminal.
+
+    A hub-launched terminal keeps the same OS PID across any number of
+    /clear's (they only start a new session id/transcript file inside the
+    same running process) - see pid_capture_command. Each such PID's tracking
+    file (written by record_hub_launch right after launch) records which cwd
+    it's running in and which Claude session id it was last known to be
+    writing to. If the most-recently-updated Claude transcript for that same
+    cwd now has a different session id, the process moved on to a new
+    transcript without Session Hub launching it - i.e. a /clear - so link the
+    old and new sessions the same way a cross-agent handoff would.
+    """
+    if not PID_DIR.is_dir():
+        return False
+    latest_by_cwd: dict[str, Session] = {}
+    for session in sessions:
+        if session.provider != "Claude":
+            continue
+        current = latest_by_cwd.get(session.cwd)
+        if not current or session.updated_ms > current.updated_ms:
+            latest_by_cwd[session.cwd] = session
+
+    changed = False
+    links = metadata.setdefault("links", {})
+    for tracking_file in PID_DIR.glob("*.json"):
+        try:
+            pid = int(tracking_file.stem)
+        except ValueError:
+            continue
+        if not process_alive(pid):
+            tracking_file.unlink(missing_ok=True)
+            continue
+        try:
+            entry = json.loads(tracking_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        latest = latest_by_cwd.get(entry.get("cwd"))
+        if not latest:
+            continue
+        old_session_id = entry.get("session_id")
+        if old_session_id == latest.session_id:
+            continue
+        if old_session_id is None:
+            entry["session_id"] = latest.session_id
+            tracking_file.write_text(json.dumps(entry))
+            continue
+
+        old_key = f"Claude:{old_session_id}"
+        new_key = latest.native_key
+        link_id = next(
+            (lid for lid, link in links.items() if old_key in link.get("members", [])),
+            None,
+        )
+        if link_id:
+            link = links[link_id]
+            if new_key not in link["members"]:
+                link["members"].append(new_key)
+            link["active"] = new_key
+        else:
+            links[f"clear:{uuid.uuid4().hex}"] = {
+                "members": [old_key, new_key],
+                "active": new_key,
+            }
+        entry["session_id"] = latest.session_id
+        tracking_file.write_text(json.dumps(entry))
+        changed = True
+    return changed
 
 
 def executable(name: str) -> str:
@@ -3061,7 +3201,15 @@ class SessionHub(QMainWindow):
                 argv += [name, value]
         return argv
 
-    def spawn(self, command: list[str], session_key: str | None = None) -> None:
+    def spawn(
+        self,
+        command: list[str],
+        session_key: str | None = None,
+        *,
+        pidfile: Path | None = None,
+        cwd: str | None = None,
+        session_id: str | None = None,
+    ) -> None:
         subprocess.Popen(
             command,
             start_new_session=True,
@@ -3074,6 +3222,12 @@ class SessionHub(QMainWindow):
         if title:
             threading.Thread(
                 target=focus_window_by_title, args=(title,), daemon=True
+            ).start()
+        if pidfile is not None and cwd is not None:
+            threading.Thread(
+                target=capture_hub_launch,
+                args=(pidfile, cwd, session_id),
+                daemon=True,
             ).start()
 
     def edit_session_launch_options(self) -> None:
@@ -3135,6 +3289,7 @@ class SessionHub(QMainWindow):
         source_cwd: str | None = None,
         model: str | None = None,
         flags: list[str] | None = None,
+        pidfile: Path | None = None,
     ) -> list[str]:
         title = f"{provider} — {Path(cwd).name or cwd}"
         launch_cwd = source_cwd if provider == "Claude" and session_id else cwd
@@ -3165,16 +3320,20 @@ class SessionHub(QMainWindow):
             else:
                 command += ["-C", cwd]
         elif provider == "Claude":
-            command += [executable("claude")]
+            claude_args = [executable("claude")]
             if self.settings().get("claude_danger_mode", False):
-                command += ["--dangerously-skip-permissions"]
+                claude_args += ["--dangerously-skip-permissions"]
             if model:
-                command += ["--model", model]
-            command += flags or []
+                claude_args += ["--model", model]
+            claude_args += flags or []
             if session_id:
-                command += ["--resume", session_id]
+                claude_args += ["--resume", session_id]
                 if Path(launch_cwd) != Path(cwd):
-                    command += [f"/cd {cwd}"]
+                    claude_args += [f"/cd {cwd}"]
+            if pidfile is not None:
+                command += pid_capture_command(pidfile, claude_args)
+            else:
+                command += claude_args
         else:
             command += [executable("agy")]
             if self.settings().get("antigravity_danger_mode", False):
@@ -3209,11 +3368,15 @@ class SessionHub(QMainWindow):
                 if provider == "Claude"
                 else []
             )
+            pidfile = new_pid_capture_file() if provider == "Claude" else None
             self.spawn(
                 self.terminal_command(
-                    provider, session_id, cwd, source_cwd, model, flags
+                    provider, session_id, cwd, source_cwd, model, flags, pidfile
                 ),
                 session_key,
+                pidfile=pidfile,
+                cwd=cwd,
+                session_id=session_id,
             )
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(self, "Could not launch session", str(error))

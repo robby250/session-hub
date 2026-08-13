@@ -1278,6 +1278,127 @@ class SessionHubTests(unittest.TestCase):
         )
         thread.return_value.start.assert_called_once()
 
+    def test_pid_capture_command_wraps_real_args_via_exec(self):
+        wrapped = session_hub.pid_capture_command(
+            Path("/tmp/x.pid"), ["claude", "--resume", "abc"]
+        )
+        self.assertEqual(
+            wrapped,
+            [
+                "bash",
+                "-c",
+                'echo $$ > "$1"; shift; exec "$@"',
+                "session-hub",
+                "/tmp/x.pid",
+                "claude",
+                "--resume",
+                "abc",
+            ],
+        )
+
+    def test_read_pid_capture_file_reads_and_deletes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pidfile = Path(temp) / "x.pid"
+            pidfile.write_text("4242\n")
+            pid = session_hub.read_pid_capture_file(pidfile, timeout=1)
+        self.assertEqual(pid, 4242)
+        self.assertFalse(pidfile.exists())
+
+    def test_read_pid_capture_file_times_out_when_never_written(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pidfile = Path(temp) / "never.pid"
+            pid = session_hub.read_pid_capture_file(pidfile, timeout=0.2)
+        self.assertIsNone(pid)
+
+    def test_process_alive_true_for_current_process_false_for_bogus_pid(self):
+        self.assertTrue(session_hub.process_alive(os.getpid()))
+        self.assertFalse(session_hub.process_alive(999999999999))
+
+    def test_resolve_clear_continuations_links_old_and_new_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / f"{os.getpid()}.json").write_text(
+                json.dumps({"cwd": "/home/user/proj", "session_id": "old-id"})
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "new-id", "title", "/home/user/proj",
+                    "/home/user/proj", 500_000, Path("/tmp/new.jsonl"),
+                )
+            ]
+            metadata = {}
+            with patch("session_hub.PID_DIR", pid_dir):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+            tracking = json.loads((pid_dir / f"{os.getpid()}.json").read_text())
+        self.assertTrue(changed)
+        self.assertEqual(tracking["session_id"], "new-id")
+        (link,) = metadata["links"].values()
+        self.assertEqual(set(link["members"]), {"Claude:old-id", "Claude:new-id"})
+        self.assertEqual(link["active"], "Claude:new-id")
+
+    def test_resolve_clear_continuations_extends_existing_chain(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / f"{os.getpid()}.json").write_text(
+                json.dumps({"cwd": "/home/user/proj", "session_id": "mid-id"})
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "newest-id", "title", "/home/user/proj",
+                    "/home/user/proj", 500_000, Path("/tmp/newest.jsonl"),
+                )
+            ]
+            metadata = {
+                "links": {
+                    "clear:existing": {
+                        "members": ["Claude:old-id", "Claude:mid-id"],
+                        "active": "Claude:mid-id",
+                    }
+                }
+            }
+            with patch("session_hub.PID_DIR", pid_dir):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+        self.assertTrue(changed)
+        self.assertEqual(len(metadata["links"]), 1)
+        link = metadata["links"]["clear:existing"]
+        self.assertEqual(
+            set(link["members"]),
+            {"Claude:old-id", "Claude:mid-id", "Claude:newest-id"},
+        )
+        self.assertEqual(link["active"], "Claude:newest-id")
+
+    def test_resolve_clear_continuations_first_sighting_records_without_link(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / f"{os.getpid()}.json").write_text(
+                json.dumps({"cwd": "/home/user/proj", "session_id": None})
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "first-id", "title", "/home/user/proj",
+                    "/home/user/proj", 500_000, Path("/tmp/first.jsonl"),
+                )
+            ]
+            metadata = {}
+            with patch("session_hub.PID_DIR", pid_dir):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+            tracking = json.loads((pid_dir / f"{os.getpid()}.json").read_text())
+        self.assertFalse(changed)
+        self.assertEqual(tracking["session_id"], "first-id")
+        self.assertEqual(metadata.get("links", {}), {})
+
+    def test_resolve_clear_continuations_cleans_up_dead_process_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            tracking_file = pid_dir / "999999999999.json"
+            tracking_file.write_text(
+                json.dumps({"cwd": "/home/user/proj", "session_id": "old-id"})
+            )
+            with patch("session_hub.PID_DIR", pid_dir):
+                changed = session_hub.resolve_clear_continuations({}, [])
+            self.assertFalse(tracking_file.exists())
+        self.assertFalse(changed)
+
     def test_flags_editor_uses_typed_widget_for_effort(self):
         editor = session_hub.EnvEditor(
             {"--effort": "xhigh"}, specs=session_hub.CLI_FLAG_SPECS
@@ -1475,7 +1596,7 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
         self.assertEqual(
-            terminal_command.call_args.args[-1], ["--effort", "xhigh"]
+            terminal_command.call_args.args[-2], ["--effort", "xhigh"]
         )
 
     def test_settings_toggles_hide_providers(self):
