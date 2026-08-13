@@ -1936,6 +1936,52 @@ class SessionHubTests(unittest.TestCase):
                         dialog.row_context_menu(point)
                     session_arg = actions.call_args[0][0]
                     self.assertEqual(session_arg.key, "group:/tmp/vamp#vamp-s1")
+                    menu = menu_cls.return_value
+                    labels = [call.args[0].text() for call in menu.addAction.call_args_list]
+                    self.assertEqual(labels, ["Remove from group"])
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
+
+    def test_matched_sessions_prefers_override_key_name_over_native_key(self):
+        # Rename (routed through row_session, see row_context_menu) writes
+        # the display name under the row's override_key. A stale native-key
+        # override left over from an old restart or a manual link must not
+        # shadow it - override_key is the row's stable identity, the native
+        # key changes every restart.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {
+                    "Claude:abc123": {"name": "stale leftover name"},
+                    "group:/tmp/vamp#vamp-s1": {"name": "VAMPULSE-orchestrator"},
+                },
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}
+                        ],
+                    }
+                },
+            }
+            live = session_hub.Session(
+                "Claude", "abc123", "raw title", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/x.jsonl"), agent_name="vamp-s1",
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.claude_sessions", return_value=[live]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    with patch("session_hub.claude_sessions", return_value=[live]):
+                        pairs = dialog.matched_sessions()
+                    self.assertEqual(pairs[0][1].title, "VAMPULSE-orchestrator")
                 finally:
                     dialog.close()
             finally:

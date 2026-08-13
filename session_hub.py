@@ -3089,6 +3089,14 @@ class ManageGroupDialog(QDialog):
         applies - group members are hidden from self.hub.sessions (that's
         the point of the group-collapsing pass), so this re-derives from raw
         claude_sessions() rather than reusing that already-filtered list.
+
+        Checked by override_key first, native key second: "Rename" in this
+        dialog's own context menu writes through row_session(), whose .key
+        is the row's override_key (see row_context_menu) - not the matched
+        session's native key, which changes on every restart and would
+        otherwise make a rename get silently shadowed by whatever native-key
+        override (an old link copy, a stale rename from a previous native
+        session) happens to exist once the row re-matches a new process.
         """
         group = self.group()
         if not group:
@@ -3099,9 +3107,12 @@ class ManageGroupDialog(QDialog):
         for row in group.get("rows", []):
             match = find_group_member_session(row, self.cwd, live)
             if match:
-                custom = overrides.get(match.key, {})
-                match.title = custom.get("name") or match.title
-                match.cwd = custom.get("cwd") or match.cwd
+                row_custom = overrides.get(row["override_key"], {})
+                native_custom = overrides.get(match.key, {})
+                match.title = (
+                    row_custom.get("name") or native_custom.get("name") or match.title
+                )
+                match.cwd = row_custom.get("cwd") or native_custom.get("cwd") or match.cwd
             pairs.append((row, match))
         return pairs
 
@@ -3222,38 +3233,10 @@ class ManageGroupDialog(QDialog):
                 action.triggered.connect(slot)
                 menu.addAction(action)
             menu.addSeparator()
-        rename_action = QAction("Rename row", self)
-        rename_action.triggered.connect(lambda: self.rename_row(row["name"]))
-        menu.addAction(rename_action)
         remove_action = QAction("Remove from group", self)
         remove_action.triggered.connect(lambda: self.remove_row(row["name"]))
         menu.addAction(remove_action)
-        delete_action = QAction("Delete row", self)
-        delete_action.triggered.connect(lambda: self.delete_row(row["name"]))
-        menu.addAction(delete_action)
         menu.exec(self.table.viewport().mapToGlobal(point))
-        self.reload()
-
-    def rename_row(self, name: str) -> None:
-        group = self.group()
-        if not group:
-            return
-        row = next((r for r in group["rows"] if r["name"] == name), None)
-        if not row:
-            return
-        new_name, accepted = QInputDialog.getText(
-            self, "Rename row", "Session name (used as --name on next launch):", text=name
-        )
-        new_name = new_name.strip()
-        if not accepted or not new_name or new_name == name:
-            return
-        if any(r["name"] == new_name for r in group["rows"]):
-            QMessageBox.warning(
-                self, "Duplicate name", f"“{new_name}” is already used in this group."
-            )
-            return
-        row["name"] = new_name
-        write_metadata(self.hub.metadata)
         self.reload()
 
     def remove_row(self, name: str) -> None:
@@ -3261,34 +3244,6 @@ class ManageGroupDialog(QDialog):
         if not group:
             return
         group["rows"] = [row for row in group["rows"] if row["name"] != name]
-        write_metadata(self.hub.metadata)
-        self.hub.refresh()
-        self.reload()
-
-    def delete_row(self, name: str) -> None:
-        group = self.group()
-        if not group:
-            return
-        row = next((r for r in group["rows"] if r["name"] == name), None)
-        if not row:
-            return
-        live = find_group_member_session(row, self.cwd, claude_sessions())
-        if live:
-            answer = QMessageBox.warning(
-                self,
-                "Delete session?",
-                f"Move “{name}” to Session Hub's trash?",
-                QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
-                QMessageBox.StandardButton.Cancel,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-            try:
-                self.hub.move_session_to_trash(live)
-            except OSError as error:
-                QMessageBox.critical(self, "Could not delete", str(error))
-                return
-        group["rows"] = [r for r in group["rows"] if r["name"] != name]
         write_metadata(self.hub.metadata)
         self.hub.refresh()
         self.reload()
