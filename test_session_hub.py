@@ -1,3 +1,5 @@
+import contextlib
+import io
 import os
 import json
 import tempfile
@@ -498,6 +500,21 @@ class SessionHubTests(unittest.TestCase):
             metadata["links"][source_key]["members"],
         )
 
+    def test_native_session_index_applies_name_overrides(self):
+        claude = session_hub.Session(
+            "Claude", "id-old", "Fix parser bug in ordnance defects module",
+            "/tmp/vamp", "/tmp/vamp", 100, Path("/tmp/old.jsonl"),
+        )
+        metadata = {"sessions": {"Claude:id-old": {"name": "tm4-ordnance-defects-fixes"}}}
+        with (
+            patch("session_hub.codex_sessions", return_value=[]),
+            patch("session_hub.claude_sessions", return_value=[claude]),
+            patch("session_hub.antigravity_sessions", return_value=[]),
+            patch("session_hub.read_metadata", return_value=metadata),
+        ):
+            index = session_hub.native_session_index()
+        self.assertEqual(index["Claude:id-old"].title, "tm4-ordnance-defects-fixes")
+
     def test_linked_conversations_exclude_active_native_session(self):
         active = session_hub.Session(
             "Codex",
@@ -626,6 +643,50 @@ class SessionHubTests(unittest.TestCase):
                 link = next(iter(links.values()))
                 self.assertEqual(set(link["members"]), {"Claude:id-old", "Claude:id-new"})
                 self.assertEqual(link["active"], "Claude:id-new")
+            finally:
+                window.close()
+
+    def test_link_to_existing_conversation_copies_old_name_and_launch_overrides(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {
+                    "Claude:id-old": {
+                        "name": "vamp-s1",
+                        "env": {"ANTHROPIC_MODEL": "opus"},
+                        "flags": {"--dangerously-skip-permissions": True},
+                    }
+                },
+                "settings": {},
+                "groups": {},
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                new_session = session_hub.Session(
+                    "Claude", "id-new", "Claude 3e410ca0", "/tmp/vamp", "/tmp/vamp",
+                    200, Path("/tmp/new.jsonl"),
+                )
+                old_session = session_hub.Session(
+                    "Claude", "id-old", "vamp-s1", "/tmp/vamp", "/tmp/vamp",
+                    100, Path("/tmp/old.jsonl"),
+                )
+                index = {s.native_key: s for s in (new_session, old_session)}
+                with (
+                    patch("session_hub.native_session_index", return_value=index),
+                    patch(
+                        "session_hub.QInputDialog.getItem",
+                        return_value=("Claude — vamp-s1  [id-old]", True),
+                    ),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.link_to_existing_conversation_for(new_session)
+                link_id = next(iter(window.metadata["links"]))
+                link_overrides = window.metadata["sessions"][link_id]
+                self.assertEqual(link_overrides["name"], "vamp-s1")
+                self.assertEqual(link_overrides["env"], {"ANTHROPIC_MODEL": "opus"})
+                self.assertEqual(
+                    link_overrides["flags"], {"--dangerously-skip-permissions": True}
+                )
             finally:
                 window.close()
 
@@ -1780,61 +1841,159 @@ class SessionHubTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_manage_group_dialog_launch_row_strips_env_when_transcripts_checked(self):
-        group = {
-            "cwd": "/tmp/vamp",
-            "rows": [
-                {
-                    "name": "vamp-s1",
-                    "override_key": "group:/tmp/vamp#vamp-s1",
-                    "transcripts": True,
-                }
-            ],
-        }
+    def test_manage_group_dialog_launch_row_delegates_to_hub(self):
         hub = MagicMock()
-        hub.metadata = {"groups": {"/tmp/vamp": group}}
         dialog = session_hub.ManageGroupDialog.__new__(session_hub.ManageGroupDialog)
         dialog.hub = hub
         dialog.cwd = "/tmp/vamp"
         dialog.reload = MagicMock()
-        with patch("session_hub.write_metadata"):
-            dialog.launch_row("vamp-s1")
-        hub.launch.assert_called_once_with(
-            "Claude",
-            None,
-            "/tmp/vamp",
-            session_key="group:/tmp/vamp#vamp-s1",
-            flag_overrides={"--name": "vamp-s1"},
-            strip_env=["CLAUDE_CODE_CHILD_SESSION"],
-        )
+        dialog.launch_row("vamp-s1")
+        hub.launch_group_row.assert_called_once_with("/tmp/vamp", "vamp-s1")
+        hub.refresh.assert_called_once()
+        dialog.reload.assert_called_once()
 
-    def test_manage_group_dialog_launch_row_keeps_env_when_transcripts_unchecked(self):
-        group = {
-            "cwd": "/tmp/vamp",
-            "rows": [
-                {
-                    "name": "vamp-s1",
-                    "override_key": "group:/tmp/vamp#vamp-s1",
-                    "transcripts": False,
-                }
-            ],
-        }
-        hub = MagicMock()
-        hub.metadata = {"groups": {"/tmp/vamp": group}}
-        dialog = session_hub.ManageGroupDialog.__new__(session_hub.ManageGroupDialog)
-        dialog.hub = hub
-        dialog.cwd = "/tmp/vamp"
-        dialog.reload = MagicMock()
-        with patch("session_hub.write_metadata"):
-            dialog.launch_row("vamp-s1")
-        hub.launch.assert_called_once_with(
-            "Claude",
-            None,
-            "/tmp/vamp",
-            session_key="group:/tmp/vamp#vamp-s1",
-            flag_overrides={"--name": "vamp-s1"},
-            strip_env=None,
-        )
+    def test_launch_group_row_strips_env_when_transcripts_checked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {
+                                "name": "vamp-s1",
+                                "override_key": "group:/tmp/vamp#vamp-s1",
+                                "transcripts": True,
+                            }
+                        ],
+                    }
+                },
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    result = window.launch_group_row("/tmp/vamp", "vamp-s1")
+                launch.assert_called_once_with(
+                    "Claude",
+                    None,
+                    "/tmp/vamp",
+                    session_key="group:/tmp/vamp#vamp-s1",
+                    flag_overrides={"--name": "vamp-s1"},
+                    strip_env=["CLAUDE_CODE_CHILD_SESSION"],
+                    wait_for_tracking=False,
+                )
+                self.assertEqual(result, {"status": "launched", "name": "vamp-s1"})
+            finally:
+                window.close()
+
+    def test_launch_group_row_keeps_env_when_transcripts_unchecked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {
+                                "name": "vamp-s1",
+                                "override_key": "group:/tmp/vamp#vamp-s1",
+                                "transcripts": False,
+                            }
+                        ],
+                    }
+                },
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.launch_group_row("/tmp/vamp", "vamp-s1")
+                launch.assert_called_once_with(
+                    "Claude",
+                    None,
+                    "/tmp/vamp",
+                    session_key="group:/tmp/vamp#vamp-s1",
+                    flag_overrides={"--name": "vamp-s1"},
+                    strip_env=None,
+                    wait_for_tracking=False,
+                )
+            finally:
+                window.close()
+
+    def test_launch_group_row_skips_relaunch_when_already_tracked_alive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {
+                                "name": "vamp-s1",
+                                "override_key": "group:/tmp/vamp#vamp-s1",
+                                "transcripts": True,
+                            }
+                        ],
+                    }
+                },
+            }
+            live = session_hub.Session(
+                "Claude", "abc123", "vamp-s1", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/x.jsonl"), agent_name="vamp-s1",
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.claude_sessions", return_value=[live]),
+                    patch("session_hub.session_is_tracked_alive", return_value=True),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    result = window.launch_group_row("/tmp/vamp", "vamp-s1")
+                launch.assert_not_called()
+                self.assertEqual(result, {"status": "already_running", "session_id": "abc123"})
+            finally:
+                window.close()
+
+    def test_launch_group_row_reports_error_for_unknown_group_or_row(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {"sessions": {}, "settings": {}, "groups": {}}
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"):
+                    result = window.launch_group_row("/tmp/nowhere", "vamp-s1")
+                self.assertEqual(result["status"], "error")
+            finally:
+                window.close()
+
+    def test_launch_group_row_cli_prints_json_and_exits_nonzero_on_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {"sessions": {}, "settings": {}, "groups": {}}
+            with (
+                patch("session_hub.read_metadata", return_value=metadata),
+                patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+            ):
+                buffer = io.StringIO()
+                with contextlib.redirect_stdout(buffer):
+                    code = session_hub.launch_group_row_cli(
+                        ["session_hub.py", "--launch-group-row", "/tmp/nowhere", "vamp-s1"]
+                    )
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(buffer.getvalue())["status"], "error")
 
     def test_suggest_session_name_first_then_numbered(self):
         directory = Path("/home/user/Dropbox/Backups/projects/VAMPULSE-game")

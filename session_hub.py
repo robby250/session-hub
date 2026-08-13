@@ -1632,10 +1632,19 @@ def discover_sessions(metadata: dict) -> list[Session]:
 
 
 def native_session_index() -> dict[str, Session]:
-    return {
-        session.native_key: session
-        for session in codex_sessions() + claude_sessions() + antigravity_sessions()
-    }
+    """All known sessions by native key, with per-session name/cwd overrides applied.
+
+    Used by conversation pickers (linked_conversations, link_to_existing_conversation_for,
+    continue_with_other_agent_for) that need the user-facing title Session Hub shows
+    elsewhere, not the raw transcript-derived one.
+    """
+    sessions = codex_sessions() + claude_sessions() + antigravity_sessions()
+    overrides = read_metadata().get("sessions", {})
+    for session in sessions:
+        custom = overrides.get(session.native_key, {})
+        session.title = custom.get("name") or session.title
+        session.cwd = custom.get("cwd") or session.cwd
+    return {session.native_key: session for session in sessions}
 
 
 def focus_window_by_title(title: str, timeout: float = 3.0) -> None:
@@ -2845,6 +2854,45 @@ class AddGroupSessionDialog(QDialog):
         super().accept()
 
 
+def configure_resizable_columns(
+    table: QTableWidget,
+    columns: list[str] | tuple[str, ...],
+    default_widths: dict[str, int],
+    stretch_column: str | None,
+) -> None:
+    """Independently-resizable columns, with one column absorbing table resizes.
+
+    Interactive columns keep whatever width the user drags them to; the
+    stretch column is the only one that grows or shrinks when the table
+    itself is resized, so it's the one that gets truncated first on a
+    narrower window instead of every column being squeezed down together.
+    """
+    header = table.horizontalHeader()
+    for index, column in enumerate(columns):
+        header.setSectionResizeMode(
+            index,
+            QHeaderView.ResizeMode.Stretch
+            if column == stretch_column
+            else QHeaderView.ResizeMode.Interactive,
+        )
+        width = default_widths.get(column)
+        if width is not None:
+            header.resizeSection(index, width)
+
+
+def restore_column_widths(table: QTableWidget, encoded: str | None) -> None:
+    if not encoded:
+        return
+    try:
+        table.horizontalHeader().restoreState(QByteArray.fromBase64(encoded.encode("ascii")))
+    except (AttributeError, ValueError):
+        pass
+
+
+def column_widths_state(table: QTableWidget) -> str:
+    return bytes(table.horizontalHeader().saveState().toBase64()).decode("ascii")
+
+
 class _GroupSessionTable(QTableWidget):
     """QTableWidget with drag-to-reorder that also relocates cell widgets.
 
@@ -2880,11 +2928,19 @@ class ManageGroupDialog(QDialog):
     group-row management on top of the main listview's own context menu).
     """
 
+    # Session ID is rendered separately, as the table's own last column
+    # (after the group-specific Transcripts/Launch columns), so it's the
+    # one that shrinks first on a narrower dialog instead of squeezing
+    # Name down - populate_session_table only fills a contiguous block of
+    # columns, and Session ID isn't adjacent to the rest here.
     SHARED_COLUMNS = tuple(
-        column for column in SESSION_TABLE_COLUMNS if column != "Working directory"
+        column
+        for column in SESSION_TABLE_COLUMNS
+        if column not in ("Working directory", "Session ID")
     )
     TRANSCRIPTS_COLUMN = len(SHARED_COLUMNS)
     STATUS_COLUMN = len(SHARED_COLUMNS) + 1
+    SESSION_ID_COLUMN = len(SHARED_COLUMNS) + 2
 
     def __init__(self, hub, cwd: str, parent=None) -> None:
         super().__init__(parent)
@@ -2898,20 +2954,23 @@ class ManageGroupDialog(QDialog):
         self.intro.setWordWrap(True)
         layout.addWidget(self.intro)
 
-        self.table = _GroupSessionTable(self, 0, len(self.SHARED_COLUMNS) + 2)
-        self.table.setHorizontalHeaderLabels(list(self.SHARED_COLUMNS) + ["Transcripts", ""])
+        self.table = _GroupSessionTable(self, 0, len(self.SHARED_COLUMNS) + 3)
+        self.table.setHorizontalHeaderLabels(
+            list(self.SHARED_COLUMNS) + ["Transcripts", "", "Session ID"]
+        )
+        configure_resizable_columns(
+            self.table,
+            self.SHARED_COLUMNS,
+            {"Agent": 90, "Model": 90, "Name": 260, "Last updated": 140},
+            stretch_column=None,
+        )
         header = self.table.horizontalHeader()
-        for column in range(len(self.SHARED_COLUMNS)):
-            header.setSectionResizeMode(
-                column,
-                QHeaderView.ResizeMode.Stretch
-                if self.SHARED_COLUMNS[column] == "Name"
-                else QHeaderView.ResizeMode.ResizeToContents,
-            )
         header.setSectionResizeMode(
             self.TRANSCRIPTS_COLUMN, QHeaderView.ResizeMode.ResizeToContents
         )
         header.setSectionResizeMode(self.STATUS_COLUMN, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.SESSION_ID_COLUMN, QHeaderView.ResizeMode.Stretch)
+        restore_column_widths(self.table, self.hub.settings().get("group_table_columns"))
         self.table.verticalHeader().setVisible(False)
         self.table.setMinimumHeight(200)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -2935,7 +2994,25 @@ class ManageGroupDialog(QDialog):
         buttons.rejected.connect(self.accept)
         layout.addWidget(buttons)
 
+        encoded_geometry = self.hub.settings().get("group_dialog_geometry")
+        if encoded_geometry:
+            try:
+                self.restoreGeometry(QByteArray.fromBase64(encoded_geometry.encode("ascii")))
+            except (AttributeError, ValueError):
+                pass
+
         self.reload()
+
+    def done(self, result: int) -> None:
+        # The "Close" button (wired to accept()) and the window's own X button
+        # (which goes through reject()) both funnel through here, unlike
+        # closeEvent - which only fires for the X button - so this is the one
+        # place that reliably sees every way the dialog can close.
+        settings = self.hub.settings()
+        settings["group_dialog_geometry"] = bytes(self.saveGeometry().toBase64()).decode("ascii")
+        settings["group_table_columns"] = column_widths_state(self.table)
+        write_metadata(self.hub.metadata)
+        super().done(result)
 
     def group(self) -> dict | None:
         group = self.hub.metadata.get("groups", {}).get(self.cwd)
@@ -3003,10 +3080,12 @@ class ManageGroupDialog(QDialog):
         name = group.get("display_name") or Path(self.cwd).name or self.cwd
         self.intro.setText(f"{name} — {self.cwd}")
         pairs = self.matched_sessions()
-        self.hub.populate_session_table(
-            self.table, [self.row_session(row, match) for row, match in pairs], self.SHARED_COLUMNS
-        )
-        for index, (row, match) in enumerate(pairs):
+        row_sessions = [self.row_session(row, match) for row, match in pairs]
+        self.hub.populate_session_table(self.table, row_sessions, self.SHARED_COLUMNS)
+        for index, ((row, match), row_session) in enumerate(zip(pairs, row_sessions)):
+            self.table.setItem(
+                index, self.SESSION_ID_COLUMN, QTableWidgetItem(row_session.session_id)
+            )
             checkbox = QCheckBox()
             checkbox.setChecked(row.get("transcripts", True))
             checkbox.toggled.connect(
@@ -3039,25 +3118,7 @@ class ManageGroupDialog(QDialog):
         write_metadata(self.hub.metadata)
 
     def launch_row(self, name: str) -> None:
-        group = self.group()
-        if not group:
-            return
-        row = next((r for r in group["rows"] if r["name"] == name), None)
-        if not row:
-            return
-        strip_env = (
-            ["CLAUDE_CODE_CHILD_SESSION"]
-            if row.get("transcripts", True)
-            else None
-        )
-        self.hub.launch(
-            "Claude",
-            None,
-            self.cwd,
-            session_key=row["override_key"],
-            flag_overrides={"--name": row["name"]},
-            strip_env=strip_env,
-        )
+        self.hub.launch_group_row(self.cwd, name)
         self.hub.refresh()
         self.reload()
 
@@ -3609,13 +3670,13 @@ class SessionHub(QMainWindow):
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
         self.table.verticalHeader().setVisible(False)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        configure_resizable_columns(
+            self.table,
+            SessionHub.SESSION_TABLE_COLUMNS,
+            {"Agent": 90, "Model": 90, "Name": 220, "Working directory": 320, "Last updated": 140},
+            stretch_column="Session ID",
+        )
+        restore_column_widths(self.table, self.settings().get("main_table_columns"))
         self.table.doubleClicked.connect(self.resume_selected)
         for key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             shortcut = QShortcut(QKeySequence(key), self.table)
@@ -3675,6 +3736,7 @@ class SessionHub(QMainWindow):
             latest["settings"]["window_geometry"] = bytes(
                 self.saveGeometry().toBase64()
             ).decode("ascii")
+            latest["settings"]["main_table_columns"] = column_widths_state(self.table)
             self.metadata = latest
             write_metadata(latest)
         super().closeEvent(event)
@@ -4136,6 +4198,7 @@ class SessionHub(QMainWindow):
         session_id: str | None = None,
         focus: bool = True,
         strip_env: list[str] | None = None,
+        wait_for_tracking: bool = False,
     ) -> None:
         subprocess.Popen(
             command,
@@ -4151,11 +4214,20 @@ class SessionHub(QMainWindow):
                 target=focus_window_by_title, args=(title,), daemon=True
             ).start()
         if pidfile is not None and cwd is not None:
-            threading.Thread(
-                target=capture_hub_launch,
-                args=(pidfile, cwd, session_id),
-                daemon=True,
-            ).start()
+            if wait_for_tracking:
+                # The GUI stays running long after this returns, so the
+                # normal path leaves PID capture to a daemon thread in the
+                # background. A one-shot CLI invocation has no "background"
+                # - the process exits right after this call - so it must
+                # block here or the daemon thread gets killed mid-capture
+                # and the launch silently never becomes /clear-trackable.
+                capture_hub_launch(pidfile, cwd, session_id)
+            else:
+                threading.Thread(
+                    target=capture_hub_launch,
+                    args=(pidfile, cwd, session_id),
+                    daemon=True,
+                ).start()
 
     def edit_session_launch_options(self) -> None:
         session = self.selected()
@@ -4289,6 +4361,7 @@ class SessionHub(QMainWindow):
         flag_overrides: dict | None = None,
         focus: bool = True,
         strip_env: list[str] | None = None,
+        wait_for_tracking: bool = False,
     ) -> None:
         if not Path(cwd).is_dir():
             QMessageBox.warning(self, "Missing directory", f"This directory does not exist:\n{cwd}")
@@ -4317,6 +4390,7 @@ class SessionHub(QMainWindow):
                 session_id=session_id,
                 focus=focus,
                 strip_env=strip_env,
+                wait_for_tracking=wait_for_tracking,
             )
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(self, "Could not launch session", str(error))
@@ -4526,10 +4600,20 @@ class SessionHub(QMainWindow):
                     link["members"].append(key)
             link["active"] = new_key
         else:
-            links[f"manual:{uuid.uuid4().hex}"] = {
-                "members": [old_key, new_key],
-                "active": new_key,
-            }
+            link_id = f"manual:{uuid.uuid4().hex}"
+            links[link_id] = {"members": [old_key, new_key], "active": new_key}
+
+        # The new session is the continuation of the old one, so it inherits
+        # the old one's display name and launch overrides (env/flags)
+        # instead of showing up as "Claude <hash>" and reverting to global
+        # launch options - whatever made the old session identifiable.
+        overrides = self.metadata.setdefault("sessions", {})
+        old_overrides = overrides.get(old_key, {})
+        link_overrides = overrides.setdefault(link_id, {})
+        for field in ("name", "env", "flags"):
+            if field not in link_overrides and field in old_overrides:
+                link_overrides[field] = old_overrides[field]
+
         write_metadata(self.metadata)
         self.refresh()
 
@@ -4845,6 +4929,40 @@ class SessionHub(QMainWindow):
             entry.setdefault("env", {})["ANTHROPIC_MODEL"] = model_alias
         return {"name": name, "override_key": override_key}
 
+    def launch_group_row(
+        self, cwd: str, name: str, *, wait_for_tracking: bool = False
+    ) -> dict:
+        """Launch (or report already-running) a single saved group row.
+
+        Shared by ManageGroupDialog's per-row Launch button and the
+        --launch-group-row CLI flag, so an orchestrator session's own Bash
+        tool can bring up its group-mates through the same tracked launch
+        path (PID capture for /clear detection, launch_env/launch_flags
+        overrides) a GUI click uses - not a bypass that skips tracking.
+        """
+        group = self.metadata.get("groups", {}).get(cwd)
+        if not group:
+            return {"status": "error", "message": f"No session group for {cwd}"}
+        row = next((r for r in group.get("rows", []) if r["name"] == name), None)
+        if not row:
+            return {"status": "error", "message": f"No row named {name!r} in this group"}
+        live = find_group_member_session(row, cwd, claude_sessions())
+        if live and session_is_tracked_alive(live):
+            return {"status": "already_running", "session_id": live.session_id}
+        strip_env = (
+            ["CLAUDE_CODE_CHILD_SESSION"] if row.get("transcripts", True) else None
+        )
+        self.launch(
+            "Claude",
+            None,
+            cwd,
+            session_key=row["override_key"],
+            flag_overrides={"--name": row["name"]},
+            strip_env=strip_env,
+            wait_for_tracking=wait_for_tracking,
+        )
+        return {"status": "launched", "name": name}
+
     def add_session_to_group(self) -> None:
         session = self.selected()
         if not session:
@@ -5104,9 +5222,37 @@ def diagnostic() -> int:
     return 0
 
 
+def launch_group_row_cli(argv: list[str]) -> int:
+    """Headless `--launch-group-row <cwd> <name>`, for an orchestrator's own Bash tool.
+
+    Builds a real (but never shown) SessionHub so the launch goes through
+    the exact same tracked path (PID capture, launch_env/launch_flags
+    overrides) a GUI click uses - see SessionHub.launch_group_row. Blocks
+    briefly (wait_for_tracking) since this process exits right after, unlike
+    the GUI where a background daemon thread has the app's whole lifetime to
+    finish capturing the launched PID.
+    """
+    try:
+        index = argv.index("--launch-group-row")
+        cwd, name = argv[index + 1], argv[index + 2]
+    except (ValueError, IndexError):
+        print(json.dumps({
+            "status": "error",
+            "message": "usage: session_hub.py --launch-group-row <cwd> <name>",
+        }))
+        return 1
+    app = QApplication.instance() or QApplication(argv[:1])
+    window = SessionHub()
+    result = window.launch_group_row(cwd, name, wait_for_tracking=True)
+    print(json.dumps(result))
+    return 0 if result.get("status") != "error" else 1
+
+
 def main() -> int:
     if "--diagnose" in sys.argv:
         return diagnostic()
+    if "--launch-group-row" in sys.argv:
+        return launch_group_row_cli(sys.argv)
     app = QApplication(sys.argv)
     app.setApplicationName("Session Hub")
     app.setDesktopFileName("session-hub")
