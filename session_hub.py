@@ -1217,11 +1217,24 @@ def claude_project_key(path: str) -> str:
     return path.replace("/", "-").replace(".", "-")
 
 
-def _scan_claude_file(path: Path, max_lines: int = 500, max_bytes: int = 5_000_000) -> dict:
-    # Title, entrypoint, and cwd are all established in the first few turns of
-    # a session, so a bounded prefix scan finds them just as reliably as a
-    # full scan would on multi-hundred-MB transcripts from long-running
-    # sessions - it just doesn't pay to read the other 99% of the file.
+def _scan_claude_file(
+    path: Path, max_lines: int = 200_000, max_bytes: int = 200_000_000
+) -> dict:
+    # `cwd` on each row is the tool call's cwd at that moment (it wanders with
+    # every `cd` a Bash command makes), NOT the session's actual project root
+    # - so the one exact match (claude_project_key(cwd) == project_key) can
+    # legitimately sit thousands of lines in, especially in a long session
+    # resumed after /compact where the opening lines are dominated by a burst
+    # of Bash calls into some subdirectory. A short prefix scan found "most
+    # common cwd among the first 500 lines" instead of the real project root,
+    # which sent Resume's terminal to the wrong directory (found 2026-08-12,
+    # milano session 0034d5f4: 500-line scan landed on the parent
+    # /home/user/projects instead of /home/user/projects/milano, because the
+    # exact match only appears after ~500 lines of /catalog and /ciucuri-
+    # perdea churn). This is `_cached_file_scan`-cached by mtime, so scanning
+    # the whole file costs nothing on repeat refreshes - only re-paid when the
+    # transcript actually grows. The bounds here are just a safety valve
+    # against a pathological single file, not a real limit in practice.
     # `updated_ms` is intentionally not tracked here: the file's own mtime
     # (used by callers as a fallback) already is the last-write time.
     result: dict = {}
@@ -1961,6 +1974,10 @@ class NewSessionDialog(QDialog):
         self.directory: Path | None = None
         self.model: str | None = None
         self.caveman: str = ""
+        self.last_choice: dict = {}
+        self._remembered = (settings.get("last_new_session") or {}).get(
+            provider
+        ) or {}
         self.setWindowTitle(f"New {provider} Session")
         self.setMinimumWidth(600)
         layout = QVBoxLayout(self)
@@ -2036,6 +2053,18 @@ class NewSessionDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        remembered_location = self._remembered.get("location")
+        if remembered_location:
+            index = self.location.findData(remembered_location)
+            if index >= 0:
+                self.location.setCurrentIndex(index)
+        remembered_project_name = self._remembered.get("project_name")
+        if remembered_project_name:
+            self.project_name.setText(remembered_project_name)
+        remembered_existing_path = self._remembered.get("existing_path")
+        if remembered_existing_path:
+            self.existing_path.setText(remembered_existing_path)
+
         self.project_name.textChanged.connect(self.update_preview)
         self.update_fields()
 
@@ -2109,6 +2138,11 @@ class NewSessionDialog(QDialog):
             QMessageBox.warning(self, "Missing folder", f"Folder not found:\n{directory}")
             return
         self.directory = directory
+        self.last_choice = {"location": location}
+        if location in {"primary", "secondary"}:
+            self.last_choice["project_name"] = name
+        elif location == "existing":
+            self.last_choice["existing_path"] = str(directory)
         if self.model_combo is not None:
             self.model = self.model_combo.currentData()
         if self.caveman_combo is not None:
@@ -3482,6 +3516,9 @@ class SessionHub(QMainWindow):
     def launch_new(self, provider: str) -> None:
         dialog = NewSessionDialog(provider, self.settings(), self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.directory:
+            settings = self.settings()
+            settings.setdefault("last_new_session", {})[provider] = dialog.last_choice
+            write_metadata(self.metadata)
             self.launch(
                 provider,
                 None,
