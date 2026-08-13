@@ -1974,10 +1974,6 @@ class NewSessionDialog(QDialog):
         self.directory: Path | None = None
         self.model: str | None = None
         self.caveman: str = ""
-        self.last_choice: dict = {}
-        self._remembered = (settings.get("last_new_session") or {}).get(
-            provider
-        ) or {}
         self.setWindowTitle(f"New {provider} Session")
         self.setMinimumWidth(600)
         layout = QVBoxLayout(self)
@@ -2053,17 +2049,6 @@ class NewSessionDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-        remembered_location = self._remembered.get("location")
-        if remembered_location:
-            index = self.location.findData(remembered_location)
-            if index >= 0:
-                self.location.setCurrentIndex(index)
-        remembered_project_name = self._remembered.get("project_name")
-        if remembered_project_name:
-            self.project_name.setText(remembered_project_name)
-        remembered_existing_path = self._remembered.get("existing_path")
-        if remembered_existing_path:
-            self.existing_path.setText(remembered_existing_path)
 
         self.project_name.textChanged.connect(self.update_preview)
         self.update_fields()
@@ -2138,11 +2123,6 @@ class NewSessionDialog(QDialog):
             QMessageBox.warning(self, "Missing folder", f"Folder not found:\n{directory}")
             return
         self.directory = directory
-        self.last_choice = {"location": location}
-        if location in {"primary", "secondary"}:
-            self.last_choice["project_name"] = name
-        elif location == "existing":
-            self.last_choice["existing_path"] = str(directory)
         if self.model_combo is not None:
             self.model = self.model_combo.currentData()
         if self.caveman_combo is not None:
@@ -3516,9 +3496,6 @@ class SessionHub(QMainWindow):
     def launch_new(self, provider: str) -> None:
         dialog = NewSessionDialog(provider, self.settings(), self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.directory:
-            settings = self.settings()
-            settings.setdefault("last_new_session", {})[provider] = dialog.last_choice
-            write_metadata(self.metadata)
             self.launch(
                 provider,
                 None,
