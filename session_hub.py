@@ -10,6 +10,7 @@ import os
 import pty
 import re
 import select
+import shlex
 import shutil
 import sqlite3
 import struct
@@ -1699,6 +1700,94 @@ def pid_capture_command(pidfile: Path, real_args: list[str]) -> list[str]:
     ]
 
 
+def prefix_env_command(
+    args: list[str], env_overrides: dict[str, str], strip: list[str] | None
+) -> list[str]:
+    """Prefix `args` with `env` so overrides/strips apply to the exec'd
+    process directly, independent of whatever environment the process that
+    execs it happens to have.
+
+    Needed for tmux_group_launch_command: Popen's env= kwarg only reaches
+    the process Session Hub directly spawns, not a session an
+    already-running tmux server creates on that process's behalf.
+
+    No `--` before the command: `env`'s NAME=VALUE parsing already stops at
+    the first argument that isn't a NAME=VALUE pair, and (confirmed against
+    a real launch failure) not every env build treats `--` as a supported
+    separator there - one rejected it outright ("env: '--': No such file or
+    directory"), which killed the whole tmux session before it could ever
+    attach.
+    """
+    if not env_overrides and not strip:
+        return args
+    prefix = ["env"]
+    for key in strip or []:
+        prefix += ["-u", key]
+    for key, value in env_overrides.items():
+        prefix.append(f"{key}={value}")
+    return [*prefix, *args]
+
+
+def tmux_group_launch_command(name: str, cwd: str, claude_args: list[str]) -> list[str]:
+    """Launch `claude_args` detached inside a tmux session named `name`,
+    then open a terminal already attached to it.
+
+    Requested by the VAMPULSE-orchestrator session: peer sessions drive each
+    other via injected keystrokes, and gnome-terminal's VTE silently
+    discards synthetic XSendEvent keystrokes (confirmed empty-terminal in
+    testing), so any no-focus-impact automation has to go through
+    `tmux send-keys` instead - which only reaches processes actually running
+    inside tmux. The tmux session name must equal the Claude `--name` value
+    exactly: external tooling looks a session up by that name, not by PID.
+
+    Unlike pid_capture_command, this does NOT capture the launched claude
+    process's PID - it isn't a child of the process this command spawns (tmux
+    daemonizes it), so the "echo $$ into a pidfile" trick can't reach it.
+    /clear-detection and "already running" tracking are therefore not yet
+    wired up for tmux-launched sessions (deliberately out of scope for this
+    pass - see SessionHub.launch_group_row_via_tmux).
+    """
+    terminal = shutil.which("gnome-terminal")
+    if not terminal:
+        raise RuntimeError("Launching into tmux currently requires gnome-terminal.")
+    tmux = shutil.which("tmux")
+    if not tmux:
+        raise RuntimeError("tmux is not installed.")
+    claude_command = shlex.join(claude_args)
+    # has-session first, not straight to new-session: `tmux new-session -d
+    # -s NAME` FAILS outright ("duplicate session") if a session by that
+    # name already exists - and since this used to be chained with `&&`,
+    # that failure silently skipped the exec attach step entirely, so
+    # nothing visibly happened at all. A name collision is the normal case
+    # here, not an edge case: the tmux session name always equals the row's
+    # own name, so re-launching (or double-clicking) a row whose earlier
+    # tmux session never got torn down hits this every time - attach to
+    # whatever is already there instead of erroring.
+    # set-titles: tmux ships it OFF, so it never sets the terminal's title and the emulator falls
+    # back to its own default -- on a ja_JP desktop that is the literal string 端末, IDENTICALLY for
+    # every window. Tooling that resolves a session by window title then maps several windows onto
+    # one session and silently loses the rest, which is dangerous rather than merely untidy: it is
+    # how a "/compact" keystroke can land in the wrong terminal. `#S` is the tmux session name, which
+    # this launcher already forces to equal the row name and the Claude --name, so one string
+    # identifies the window, the tmux session and the Claude session.
+    # `-g` is a SERVER option, so it does not survive the tmux server dying -- setting it on EVERY
+    # launch is deliberate, cheap and idempotent, and beats a ~/.tmux.conf the user has to maintain.
+    return [
+        "bash",
+        "-c",
+        '"$1" has-session -t "$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
+        ' "$1" set-option -g set-titles on >/dev/null;'
+        ' "$1" set-option -g set-titles-string "#S" >/dev/null;'
+        ' exec "$5" -- "$1" attach -t "$2"',
+        "session-hub",
+        tmux,
+        name,
+        cwd,
+        claude_command,
+        terminal,
+    ]
+
+
 def read_pid_capture_file(pidfile: Path, timeout: float = 2.0) -> int | None:
     deadline = time.monotonic() + timeout
     pid: int | None = None
@@ -1718,17 +1807,29 @@ def read_pid_capture_file(pidfile: Path, timeout: float = 2.0) -> int | None:
     return pid
 
 
-def capture_hub_launch(pidfile: Path, cwd: str, session_id: str | None) -> None:
+def capture_hub_launch(
+    pidfile: Path, cwd: str, session_id: str | None, model: str | None = None
+) -> None:
     pid = read_pid_capture_file(pidfile)
     if pid is not None:
-        record_hub_launch(pid, cwd, session_id)
+        record_hub_launch(pid, cwd, session_id, model)
 
 
-def record_hub_launch(pid: int, cwd: str, session_id: str | None) -> None:
+def record_hub_launch(
+    pid: int, cwd: str, session_id: str | None, model: str | None = None
+) -> None:
     PID_DIR.mkdir(parents=True, exist_ok=True)
     tracking_file = PID_DIR / f"{pid}.json"
+    payload = {"cwd": cwd, "session_id": session_id}
+    if model:
+        # Carries the model chosen in the New Session dialog forward to
+        # resolve_clear_continuations, which is the first place this brand
+        # new session's real native key becomes known - that's where it
+        # turns into a durable per-session ANTHROPIC_MODEL override, the
+        # same bucket "Edit launch options..." writes to.
+        payload["pending_model"] = model
     try:
-        tracking_file.write_text(json.dumps({"cwd": cwd, "session_id": session_id}))
+        tracking_file.write_text(json.dumps(payload))
     except OSError:
         pass
 
@@ -1763,8 +1864,29 @@ def session_is_tracked_alive(session: Session) -> bool:
     return False
 
 
-def find_untracked_claude_pids() -> list[tuple[int, str]]:
-    """(pid, cwd) for live processes that look like a `claude` CLI, not yet tracked.
+def parse_claude_cmdline_identity(cmdline: str) -> tuple[str | None, str | None]:
+    """(--resume SESSION_ID, --name NAME) explicitly present in a claude argv, if any.
+
+    `cmdline` is /proc's NUL-joined argv. Reading these straight off the
+    process's own arguments gives an exact identity instead of a guess -
+    see adopt_untracked_sessions, which needs this to disambiguate multiple
+    untracked processes sharing one cwd (every member of a tmux-launched
+    session group does, since none of them get PID-tracked at launch time -
+    see tmux_group_launch_command).
+    """
+    parts = cmdline.split("\x00")
+    resume_id = None
+    name = None
+    for index, part in enumerate(parts):
+        if part == "--resume" and index + 1 < len(parts) and parts[index + 1]:
+            resume_id = parts[index + 1]
+        elif part == "--name" and index + 1 < len(parts) and parts[index + 1]:
+            name = parts[index + 1]
+    return resume_id, name
+
+
+def find_untracked_claude_pids() -> list[tuple[int, str, str | None, str | None]]:
+    """(pid, cwd, resume_id, name) for live `claude` CLI processes not yet tracked.
 
     Best-effort /proc scan: matches any process whose cmdline mentions "claude"
     (covers both a direct binary and a node-shebang-wrapped script) and whose
@@ -1774,7 +1896,8 @@ def find_untracked_claude_pids() -> list[tuple[int, str]]:
     file under PID_DIR, not in-memory state - so this only needs to cover
     sessions that were never launched *through* Session Hub in the first place
     (a `claude` typed directly into a terminal, one running from before this
-    tracking feature existed, ...). See adopt_untracked_sessions.
+    tracking feature existed, a tmux-launched group member - see
+    tmux_group_launch_command - ...). See adopt_untracked_sessions.
     """
     if not PROC_ROOT.is_dir():
         return []
@@ -1800,7 +1923,8 @@ def find_untracked_claude_pids() -> list[tuple[int, str]]:
             cwd = os.readlink(entry / "cwd")
         except OSError:
             continue
-        found.append((pid, cwd))
+        resume_id, name = parse_claude_cmdline_identity(cmdline)
+        found.append((pid, cwd, resume_id, name))
     return found
 
 
@@ -1808,23 +1932,46 @@ def adopt_untracked_sessions(sessions: list[Session]) -> None:
     """Backfill PID tracking for live `claude` processes Session Hub didn't launch.
 
     Lets /clear-detection (resolve_clear_continuations) start working on a
-    session going forward, even though Session Hub missed its actual launch.
-    Only adopts an unambiguous match: exactly the most-recently-updated Claude
-    session for that process's cwd. A wrong or ambiguous guess just means that
-    one process stays untracked (same as today), not a corrupted link - there's
-    no metadata write here, only a new PID_DIR tracking file.
+    session going forward, even though Session Hub missed its actual launch -
+    which every tmux-launched session group member needs, since tmux launches
+    never get PID-tracked at launch time (see tmux_group_launch_command).
+
+    Prefers an exact identity read straight off the process's own argv
+    (--resume SESSION_ID, or --name NAME matched against that cwd's
+    sessions) over guessing. A session group's members all share one cwd, so
+    the old "most-recently-updated session in this cwd" guess - the only
+    signal available for a plain `claude` typed into a terminal with no
+    identifying flags - picked the SAME session for every untracked PID in
+    that cwd, corrupting tracking for every member but one: their "Running"
+    status came from a sibling's PID instead of their own (staying "Running"
+    after their own process died as long as any sibling lived), and their
+    own /clear was never detected since resolve_clear_continuations was
+    watching the wrong session id entirely. Falls back to the guess only
+    when a process has neither flag (the original plain-`claude` case).
     """
     candidates = find_untracked_claude_pids()
     if not candidates:
         return
+    by_cwd: dict[str, list[Session]] = {}
     latest_by_cwd: dict[str, Session] = {}
     for session in sessions:
         if session.provider != "Claude":
             continue
+        by_cwd.setdefault(session.cwd, []).append(session)
         current = latest_by_cwd.get(session.cwd)
         if not current or session.updated_ms > current.updated_ms:
             latest_by_cwd[session.cwd] = session
-    for pid, cwd in candidates:
+    for pid, cwd, resume_id, name in candidates:
+        if resume_id:
+            record_hub_launch(pid, cwd, resume_id)
+            continue
+        if name:
+            match = next(
+                (s for s in by_cwd.get(cwd, []) if s.agent_name == name), None
+            )
+            if match:
+                record_hub_launch(pid, cwd, match.session_id)
+            continue
         session = latest_by_cwd.get(cwd)
         if session:
             record_hub_launch(pid, cwd, session.session_id)
@@ -1927,13 +2074,25 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
             if session_key.startswith("Claude:"):
                 claimed.add(session_key[len("Claude:"):])
 
+    session_overrides = metadata.get("sessions", {})
     changed = False
     for tracking_file, entry in tracked:
         candidates = [
             session
             for session in by_cwd.get(entry.get("cwd"), [])
             if session.session_id == entry.get("session_id")
-            or session.session_id not in claimed
+            or (
+                session.session_id not in claimed
+                # A session the user has already explicitly named is a
+                # deliberately distinct, identified session - not a fresh,
+                # anonymous /clear continuation to silently absorb. Group
+                # directories intentionally hold many sessions sharing one
+                # cwd, so without this, "most recently updated session in
+                # this cwd" can and does pick a totally unrelated, already-
+                # named sibling (see the VAMPULSE-orchestrator/VAMPULSE-old
+                # incident this guards against).
+                and not session_overrides.get(session.native_key, {}).get("name")
+            )
         ]
         latest = max(candidates, key=lambda session: session.updated_ms, default=None)
         if not latest:
@@ -1942,9 +2101,16 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
         if old_session_id == latest.session_id:
             continue
         if old_session_id is None:
+            pending_model = entry.pop("pending_model", None)
             entry["session_id"] = latest.session_id
             tracking_file.write_text(json.dumps(entry))
             claimed.add(latest.session_id)
+            if pending_model:
+                overrides = metadata.setdefault("sessions", {}).setdefault(
+                    latest.native_key, {}
+                )
+                overrides.setdefault("env", {})["ANTHROPIC_MODEL"] = pending_model
+                changed = True
             continue
 
         old_key = f"Claude:{old_session_id}"
@@ -1957,7 +2123,6 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
             ),
             None,
         )
-        session_overrides = metadata.get("sessions", {})
         old_title = session_overrides.get(old_key, {}).get("name") or (
             old_session.title if old_session else None
         )
@@ -2427,7 +2592,6 @@ class NewSessionDialog(QDialog):
         }
         self.directory: Path | None = None
         self.model: str | None = None
-        self.caveman: str = ""
         self.setWindowTitle(f"New {provider} Session")
         self.setMinimumWidth(600)
         layout = QVBoxLayout(self)
@@ -2454,24 +2618,11 @@ class NewSessionDialog(QDialog):
         form.addRow("Location:", self.location)
 
         self.model_combo: QComboBox | None = None
-        self.caveman_combo: QComboBox | None = None
         if provider == "Claude":
             self.model_combo = QComboBox()
             for label, alias in CLAUDE_MODELS:
                 self.model_combo.addItem(label, alias)
             form.addRow("Model:", self.model_combo)
-
-            # Pre-selected from the global flag so this row shows the standing
-            # default rather than silently disagreeing with it; changing it here
-            # affects only the session being started.
-            self.caveman_combo = QComboBox()
-            for label, value in CLI_FLAG_SPECS["--caveman"]["choices"]:
-                self.caveman_combo.addItem(label, value)
-            current = str((settings.get("global_flags") or {}).get("--caveman", ""))
-            index = self.caveman_combo.findData(current)
-            if index >= 0:
-                self.caveman_combo.setCurrentIndex(index)
-            form.addRow("Caveman:", self.caveman_combo)
 
         self.project_name = QLineEdit()
         self.project_name.setPlaceholderText("project-name")
@@ -2579,13 +2730,7 @@ class NewSessionDialog(QDialog):
         self.directory = directory
         if self.model_combo is not None:
             self.model = self.model_combo.currentData()
-        if self.caveman_combo is not None:
-            self.caveman = str(self.caveman_combo.currentData() or "")
         super().accept()
-
-    def flag_overrides(self) -> dict[str, str]:
-        """One-off flag choices from this dialog, highest precedence at launch."""
-        return {"--caveman": self.caveman} if self.caveman else {}
 
 
 class NewSessionGroupDialog(QDialog):
@@ -2610,6 +2755,7 @@ class NewSessionGroupDialog(QDialog):
             ),
         }
         self.directory: Path | None = None
+        self.use_tmux: bool = False
         self.setWindowTitle("New Claude Session Group")
         self.setMinimumWidth(640)
         layout = QVBoxLayout(self)
@@ -2655,6 +2801,16 @@ class NewSessionGroupDialog(QDialog):
         self.preview = QLabel()
         self.preview.setWordWrap(True)
         layout.addWidget(self.preview)
+
+        self.tmux_checkbox = QCheckBox("Launch members detached inside tmux")
+        self.tmux_checkbox.setToolTip(
+            "Runs each session inside its own tmux session (named to match "
+            "--name) instead of directly in a terminal, so tooling can drive "
+            "it via `tmux send-keys` with no focus impact. Requires tmux to "
+            "be installed. /clear-detection isn't available yet for "
+            "tmux-launched sessions."
+        )
+        layout.addWidget(self.tmux_checkbox)
 
         layout.addWidget(QLabel("Sessions to launch:"))
         self.table = QTableWidget(0, 2)
@@ -2852,74 +3008,103 @@ class NewSessionGroupDialog(QDialog):
 
         self.directory = directory
         self.group_rows = rows
+        self.use_tmux = self.tmux_checkbox.isChecked()
         super().accept()
 
 
-class AddGroupSessionDialog(QDialog):
-    """Add one more named Claude session to an existing saved group."""
+class MoveToGroupDialog(QDialog):
+    """Pick an existing saved group to move an already-running session into.
 
-    def __init__(self, group: dict, parent=None) -> None:
+    No Model/Name fields and nothing gets launched - this only files the
+    already-selected session into `group["rows"]` (see
+    SessionHub.add_session_to_group_for). `initial_cwd`, when it names a
+    real group, just preselects that row as a convenience.
+    """
+
+    def __init__(self, groups: dict, initial_cwd: str | None, parent=None) -> None:
         super().__init__(parent)
-        self.group = group
-        self.row: dict | None = None
+        self.groups = groups
+        self.cwd: str | None = None
         self.setWindowTitle("Add session to group")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(380)
         layout = QVBoxLayout(self)
-        intro = QLabel(f"Directory: {group.get('cwd', '')}")
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
 
         form = QFormLayout()
-        self.model_combo = QComboBox()
-        for label, alias in CLAUDE_MODELS:
-            self.model_combo.addItem(label, alias)
-        self.model_combo.setCurrentIndex(1)
-        self.model_combo.currentIndexChanged.connect(lambda _i: self.suggest_name())
-        form.addRow("Model:", self.model_combo)
+        self.group_combo = QComboBox()
+        for cwd, group in sorted(
+            groups.items(),
+            key=lambda item: item[1].get("display_name") or Path(item[0]).name or item[0],
+        ):
+            label = group.get("display_name") or Path(cwd).name or cwd
+            self.group_combo.addItem(label, cwd)
+        if initial_cwd is not None:
+            index = self.group_combo.findData(initial_cwd)
+            if index >= 0:
+                self.group_combo.setCurrentIndex(index)
+        self.group_combo.currentIndexChanged.connect(self.on_group_changed)
+        form.addRow("Group:", self.group_combo)
 
-        self.name_edit = QLineEdit()
-        self.name_edit.auto_suggested = True
-        self.name_edit.textEdited.connect(
-            lambda _text: setattr(self.name_edit, "auto_suggested", False)
-        )
-        form.addRow("Name:", self.name_edit)
+        self.directory_label = QLabel()
+        self.directory_label.setWordWrap(True)
+        form.addRow("Directory:", self.directory_label)
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Launch")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Add")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-        self.suggest_name()
+        self.on_group_changed()
 
-    def suggest_name(self) -> None:
-        if not getattr(self.name_edit, "auto_suggested", True):
-            return
-        cwd = self.group.get("cwd")
-        directory = Path(cwd) if cwd else None
-        alias = self.model_combo.currentData()
-        existing = {row["name"] for row in self.group.get("rows", [])}
-        suggested = suggest_session_name(directory, alias, existing)
-        self.name_edit.blockSignals(True)
-        self.name_edit.setText(suggested)
-        self.name_edit.blockSignals(False)
-        self.name_edit.auto_suggested = True
+    def on_group_changed(self) -> None:
+        self.directory_label.setText(self.group_combo.currentData() or "")
 
     def accept(self) -> None:
-        name = self.name_edit.text().strip()
-        if not name:
-            QMessageBox.warning(self, "Missing name", "Enter a session name.")
-            return
-        if name in {row["name"] for row in self.group.get("rows", [])}:
-            QMessageBox.warning(
-                self, "Duplicate name", f"“{name}” is already used in this group."
-            )
-            return
-        self.row = {"name": name, "model": self.model_combo.currentData()}
+        self.cwd = self.group_combo.currentData()
+        super().accept()
+
+
+class PickGroupSessionDialog(QDialog):
+    """Pick an already-running session to file into this group - no launch.
+
+    `sessions` is every ungrouped session the hub knows about (any cwd,
+    any provider) - the target group's cwd is already fixed by the
+    ManageGroupDialog this is opened from, so there's nothing to pick but
+    which session. See SessionHub.file_session_into_group.
+    """
+
+    def __init__(self, sessions: list["Session"], parent=None) -> None:
+        super().__init__(parent)
+        self.sessions = sessions
+        self.session: "Session | None" = None
+        self.setWindowTitle("Add session to group")
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.session_combo = QComboBox()
+        for session in sessions:
+            self.session_combo.addItem(f"{session.title} — {session.cwd}")
+        form.addRow("Session:", self.session_combo)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Add")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def accept(self) -> None:
+        index = self.session_combo.currentIndex()
+        if 0 <= index < len(self.sessions):
+            self.session = self.sessions[index]
         super().accept()
 
 
@@ -3084,6 +3269,11 @@ class ManageGroupDialog(QDialog):
         self.table.setMinimumHeight(200)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        # Double-click is wired to launch/resume below; without this, Qt's
+        # default edit triggers also open the cell for inline text editing
+        # on the same double-click, which looks like (and was mistaken for)
+        # a rename.
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setDragEnabled(True)
         self.table.setAcceptDrops(True)
         self.table.setDropIndicatorShown(True)
@@ -3097,6 +3287,23 @@ class ManageGroupDialog(QDialog):
         launch_all = QPushButton("Launch all")
         launch_all.clicked.connect(self.launch_all)
         controls.addWidget(launch_all)
+        add_session_button = QPushButton("Add session…")
+        add_session_button.setToolTip(
+            "File an already-running Claude session into this group - no "
+            "new session gets launched."
+        )
+        add_session_button.clicked.connect(self.add_existing_session)
+        controls.addWidget(add_session_button)
+        self.tmux_checkbox = QCheckBox("Launch in tmux")
+        self.tmux_checkbox.setToolTip(
+            "New launches of this group's members run detached inside tmux "
+            "instead of directly in a terminal. Already-running sessions "
+            "are unaffected until relaunched."
+        )
+        group = self.group()
+        self.tmux_checkbox.setChecked(bool(group.get("tmux")) if group else False)
+        self.tmux_checkbox.toggled.connect(self.set_tmux)
+        controls.addWidget(self.tmux_checkbox)
         controls.addStretch(1)
         layout.addLayout(controls)
 
@@ -3273,6 +3480,13 @@ class ManageGroupDialog(QDialog):
         row["transcripts"] = enabled
         write_metadata(self.hub.metadata)
 
+    def set_tmux(self, enabled: bool) -> None:
+        group = self.group()
+        if not group:
+            return
+        group["tmux"] = enabled
+        write_metadata(self.hub.metadata)
+
     def launch_row(self, name: str) -> None:
         self.hub.launch_group_row(self.cwd, name)
         self.hub.refresh()
@@ -3290,7 +3504,7 @@ class ManageGroupDialog(QDialog):
             return
         row, match = pair
         if match:
-            self.hub.resume_session(self.row_session(row, match))
+            self.hub.resume_group_row(self.cwd, row["name"])
         else:
             self.hub.launch_group_row(self.cwd, row["name"])
         self.hub.refresh()
@@ -3304,6 +3518,26 @@ class ManageGroupDialog(QDialog):
             if match and session_is_tracked_alive(match):
                 continue
             self.launch_row(row["name"])
+
+    def add_existing_session(self) -> None:
+        # self.hub.sessions already excludes group members (see
+        # matched_sessions), so every entry here is a legitimate,
+        # not-yet-grouped session - any cwd, any provider is fine, since
+        # file_session_into_group applies a cwd override the same way
+        # add_session_to_group_for does.
+        eligible = list(self.hub.sessions)
+        if not eligible:
+            QMessageBox.information(
+                self,
+                "No sessions available",
+                "There are no other sessions to add to this group.",
+            )
+            return
+        dialog = PickGroupSessionDialog(eligible, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.session:
+            return
+        self.hub.file_session_into_group(dialog.session, self.cwd)
+        self.reload()
 
     def reorder_row(self, source_row: int, target_row: int) -> None:
         group = self.group()
@@ -3350,6 +3584,13 @@ class ManageGroupDialog(QDialog):
             for label, slot in self.hub.context_menu_actions(session):
                 if label == "Add session to group…":
                     continue
+                if label == "Resume in new terminal":
+                    # Not the generic bound slot: that calls hub.launch()
+                    # directly with no use_tmux/tmux_name, so a tmux-enabled
+                    # group silently resumed in a plain terminal instead.
+                    # resume_group_row is the same tmux-aware path double-
+                    # click already uses.
+                    slot = lambda n=row["name"]: self.hub.resume_group_row(self.cwd, n)
                 action = QAction(label, self)
                 action.triggered.connect(slot)
                 menu.addAction(action)
@@ -3364,6 +3605,21 @@ class ManageGroupDialog(QDialog):
         group = self.group()
         if not group:
             return
+        row = next((r for r in group["rows"] if r["name"] == name), None)
+        if row:
+            # A group member's model/name/cwd/flags overrides live under its
+            # synthetic override_key (see register_group_row, matched_sessions),
+            # not under the live session's own native key. Once the row is
+            # removed, nothing looks in that bucket anymore - so without this,
+            # the session silently reverts to defaults (e.g. loses "launch as
+            # opus") the moment it leaves the group.
+            match = find_group_member_session(row, self.cwd, claude_sessions())
+            if match:
+                overrides = self.hub.metadata.setdefault("sessions", {})
+                row_overrides = overrides.get(row["override_key"], {})
+                native_overrides = overrides.setdefault(match.native_key, {})
+                for field, value in row_overrides.items():
+                    native_overrides.setdefault(field, value)
         group["rows"] = [row for row in group["rows"] if row["name"] != name]
         write_metadata(self.hub.metadata)
         self.hub.refresh()
@@ -3689,6 +3945,7 @@ class SessionHub(QMainWindow):
         self.usage_headers: dict[str, QLabel] = {}
         self.usage_workers: dict[str, UsageWorker] = {}
         self.thread_pool = QThreadPool.globalInstance()
+        self.group_dialogs: dict[str, "ManageGroupDialog"] = {}
         self.setWindowTitle("Session Hub")
         self.setWindowIcon(
             QIcon(str(APP_ICON)) if APP_ICON.is_file() else QIcon.fromTheme("utilities-terminal")
@@ -4335,6 +4592,7 @@ class SessionHub(QMainWindow):
         focus: bool = True,
         strip_env: list[str] | None = None,
         wait_for_tracking: bool = False,
+        model: str | None = None,
     ) -> None:
         subprocess.Popen(
             command,
@@ -4357,11 +4615,11 @@ class SessionHub(QMainWindow):
                 # - the process exits right after this call - so it must
                 # block here or the daemon thread gets killed mid-capture
                 # and the launch silently never becomes /clear-trackable.
-                capture_hub_launch(pidfile, cwd, session_id)
+                capture_hub_launch(pidfile, cwd, session_id, model)
             else:
                 threading.Thread(
                     target=capture_hub_launch,
-                    args=(pidfile, cwd, session_id),
+                    args=(pidfile, cwd, session_id, model),
                     daemon=True,
                 ).start()
 
@@ -4486,6 +4744,30 @@ class SessionHub(QMainWindow):
                 command += ["--conversation", session_id]
         return command
 
+    def group_env_overrides(self, session_key: str | None) -> dict[str, str]:
+        """Just the env overrides (global + per-session) - no os.environ merge.
+
+        launch_env returns the full merged environment for Popen's env=
+        kwarg, which only reaches the process Session Hub directly spawns.
+        A tmux-launched claude process isn't that process (tmux daemonizes
+        it, often onto an already-running server that does NOT inherit
+        Popen's env=), so it needs these injected explicitly into the
+        command tmux execs instead - see tmux_group_launch_command and
+        launch's use_tmux branch.
+        """
+        global_env = self.settings().get("global_env") or {}
+        overrides: dict = {}
+        if session_key:
+            overrides = (
+                (self.metadata.get("sessions") or {}).get(session_key) or {}
+            ).get("env") or {}
+        combined: dict[str, str] = {}
+        for source in (global_env, overrides):
+            for name, value in source.items():
+                if str(name).strip():
+                    combined[str(name)] = str(value)
+        return combined
+
     def launch(
         self,
         provider: str,
@@ -4498,6 +4780,8 @@ class SessionHub(QMainWindow):
         focus: bool = True,
         strip_env: list[str] | None = None,
         wait_for_tracking: bool = False,
+        use_tmux: bool = False,
+        tmux_name: str | None = None,
     ) -> None:
         if not Path(cwd).is_dir():
             QMessageBox.warning(self, "Missing directory", f"This directory does not exist:\n{cwd}")
@@ -4515,6 +4799,31 @@ class SessionHub(QMainWindow):
                 if provider == "Claude"
                 else []
             )
+            if use_tmux and provider == "Claude":
+                # tmux_name, not flag_overrides["--name"]: resuming a group
+                # row (session_id set) never passes --name at all - Claude
+                # already knows which conversation to continue via --resume,
+                # but the tmux session still needs a name to send-keys at,
+                # and it must be the row's own name to match a fresh launch.
+                name = tmux_name or (flag_overrides or {}).get("--name")
+                if not name:
+                    raise RuntimeError("Launching into tmux requires a session name.")
+                claude_args = [executable("claude")]
+                if self.settings().get("claude_danger_mode", False):
+                    claude_args += ["--dangerously-skip-permissions"]
+                if model:
+                    claude_args += ["--model", model]
+                claude_args += flags
+                if session_id:
+                    claude_args += ["--resume", session_id]
+                claude_args = prefix_env_command(
+                    claude_args, self.group_env_overrides(session_key), strip_env
+                )
+                command = tmux_group_launch_command(name, cwd, claude_args)
+                self.spawn(
+                    command, session_key, cwd=cwd, focus=focus, strip_env=strip_env
+                )
+                return
             pidfile = new_pid_capture_file() if provider == "Claude" else None
             self.spawn(
                 self.terminal_command(
@@ -4527,6 +4836,7 @@ class SessionHub(QMainWindow):
                 focus=focus,
                 strip_env=strip_env,
                 wait_for_tracking=wait_for_tracking,
+                model=model,
             )
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(self, "Could not launch session", str(error))
@@ -4558,8 +4868,24 @@ class SessionHub(QMainWindow):
             return
         if session.cwd not in self.metadata.get("groups", {}):
             return
+        existing = self.group_dialogs.get(session.cwd)
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        # show(), not exec(): the main window must stay interactable while
+        # this is open (e.g. to launch other sessions, or manage a second
+        # group at the same time) - exec() is application-modal and blocks
+        # everything else. WA_DeleteOnClose plus the finished signal keep
+        # group_dialogs from accumulating closed dialogs.
         dialog = ManageGroupDialog(self, session.cwd, self)
-        dialog.exec()
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.finished.connect(lambda _: self.group_dialogs.pop(session.cwd, None))
+        self.group_dialogs[session.cwd] = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def rename_group(self) -> None:
         session = self.selected()
@@ -4996,7 +5322,6 @@ class SessionHub(QMainWindow):
                 None,
                 str(dialog.directory),
                 model=dialog.model,
-                flag_overrides=dialog.flag_overrides(),
             )
 
     def launch_selected_provider(self) -> None:
@@ -5010,6 +5335,7 @@ class SessionHub(QMainWindow):
         group = self.metadata.setdefault("groups", {}).setdefault(
             directory, {"cwd": directory, "rows": []}
         )
+        group["tmux"] = dialog.use_tmux
         existing_names = {row["name"] for row in group["rows"]}
         for row in dialog.group_rows:
             if row["name"] in existing_names:
@@ -5022,6 +5348,7 @@ class SessionHub(QMainWindow):
                 session_key=registered["override_key"],
                 flag_overrides={"--name": registered["name"]},
                 focus=False,
+                use_tmux=dialog.use_tmux,
             )
             group["rows"].append(registered)
             existing_names.add(registered["name"])
@@ -5060,9 +5387,14 @@ class SessionHub(QMainWindow):
         row = next((r for r in group.get("rows", []) if r["name"] == name), None)
         if not row:
             return {"status": "error", "message": f"No row named {name!r} in this group"}
-        live = find_group_member_session(row, cwd, claude_sessions())
-        if live and session_is_tracked_alive(live):
-            return {"status": "already_running", "session_id": live.session_id}
+        # No session_is_tracked_alive gate here: that "Running" read is only
+        # ever as good as PID tracking (untrustworthy for anything not
+        # launched directly through Session Hub - a tmux group member's own
+        # process death between refreshes reads as "Running" for as long as
+        # any sibling in the same cwd stays alive; see
+        # adopt_untracked_sessions). A regular (non-group) session's own
+        # "Resume in new terminal"/double-click has never gated on this
+        # either - always trust the click.
         strip_env = (
             ["CLAUDE_CODE_CHILD_SESSION"] if row.get("transcripts", True) else None
         )
@@ -5074,8 +5406,40 @@ class SessionHub(QMainWindow):
             flag_overrides={"--name": row["name"]},
             strip_env=strip_env,
             wait_for_tracking=wait_for_tracking,
+            use_tmux=group.get("tmux", False),
         )
         return {"status": "launched", "name": name}
+
+    def resume_group_row(self, cwd: str, name: str) -> dict:
+        """Resume a saved group row that already has history.
+
+        The launch_group_row counterpart for a row that isn't fresh - shares
+        the same tmux opt-in, so double-clicking an idle row in a
+        tmux-enabled group relaunches it inside tmux (via --resume) exactly
+        like a first-time launch does, instead of always falling back to a
+        plain terminal.
+        """
+        group = self.metadata.get("groups", {}).get(cwd)
+        if not group:
+            return {"status": "error", "message": f"No session group for {cwd}"}
+        row = next((r for r in group.get("rows", []) if r["name"] == name), None)
+        if not row:
+            return {"status": "error", "message": f"No row named {name!r} in this group"}
+        live = find_group_member_session(row, cwd, claude_sessions())
+        if not live:
+            return {"status": "error", "message": f"{name!r} has no history to resume"}
+        # No session_is_tracked_alive gate: see the matching comment in
+        # launch_group_row.
+        self.launch(
+            "Claude",
+            live.session_id,
+            cwd,
+            live.source_cwd,
+            session_key=row["override_key"],
+            use_tmux=group.get("tmux", False),
+            tmux_name=row["name"],
+        )
+        return {"status": "resumed", "name": name}
 
     def add_session_to_group(self) -> None:
         session = self.selected()
@@ -5084,29 +5448,68 @@ class SessionHub(QMainWindow):
         self.add_session_to_group_for(session)
 
     def add_session_to_group_for(self, session: Session) -> None:
-        group = self.metadata.get("groups", {}).get(session.cwd)
-        if not group:
+        """File the already-running `session` into a saved group - no launch.
+
+        Picks a target group (any of them, not just one matching the
+        session's own cwd - see MoveToGroupDialog), then hands off to
+        file_session_into_group for the actual bookkeeping.
+        """
+        groups = self.metadata.get("groups", {})
+        if not groups:
             QMessageBox.information(
                 self,
-                "No group for this session",
-                "This session isn't part of a saved group. Use "
-                "“New session group…” first to create one.",
+                "No groups yet",
+                "Use “New session group…” first to create one.",
             )
             return
-        dialog = AddGroupSessionDialog(group, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.row:
+        dialog = MoveToGroupDialog(groups, session.cwd, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.cwd:
             return
-        row = self.register_group_row(
-            group["cwd"], dialog.row["name"], dialog.row.get("model")
+        self.file_session_into_group(session, dialog.cwd)
+
+    def file_session_into_group(self, session: Session, cwd: str) -> None:
+        """Add a row for the already-running `session` to the group at `cwd`.
+
+        Keys the row by the session's own native id, so
+        find_group_member_session recognizes it as that row's live session
+        on the next refresh with no new process started. If `cwd` differs
+        from the session's own, a cwd override makes the two agree (the same
+        mechanism change_directory_for uses) - resuming afterward still opens
+        at the session's real location and then /cd's into the group's
+        directory, same as any other cwd-overridden session.
+
+        Existing env/flags/name overrides live under the session's native
+        key; group members are looked up by their row's override_key instead
+        (see matched_sessions), so they're copied forward here - otherwise a
+        moved session's model/flags would silently stop applying, the same
+        bug remove_row used to have in reverse.
+        """
+        group = self.metadata["groups"][cwd]
+        existing_names = {row["name"] for row in group.get("rows", [])}
+        base_name = session.title.strip() or session.session_id[:8]
+        name = base_name
+        suffix = 2
+        while name in existing_names:
+            name = f"{base_name}-{suffix}"
+            suffix += 1
+        override_key = f"group:{cwd}#{name}"
+        overrides = self.metadata.setdefault("sessions", {})
+        native_overrides = overrides.get(session.native_key, {})
+        # A fresh dict, not overrides.setdefault(override_key, {}): that name
+        # can collide with a stale bucket orphaned by an earlier move/retry
+        # (a group row that was since renamed or removed), and reusing it
+        # would silently bleed that unrelated session's old name/env/flags
+        # into this one instead of the session actually being moved here.
+        row_overrides = {}
+        for field in ("env", "flags", "name"):
+            if field in native_overrides:
+                row_overrides[field] = native_overrides[field]
+        overrides[override_key] = row_overrides
+        if session.cwd != cwd:
+            overrides.setdefault(session.native_key, {})["cwd"] = cwd
+        group["rows"].append(
+            {"name": name, "override_key": override_key, "session_key": session.native_key}
         )
-        self.launch(
-            "Claude",
-            None,
-            group["cwd"],
-            session_key=row["override_key"],
-            flag_overrides={"--name": row["name"]},
-        )
-        group["rows"].append(row)
         write_metadata(self.metadata)
         self.refresh()
 

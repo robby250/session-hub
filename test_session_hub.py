@@ -2,6 +2,7 @@ import contextlib
 import io
 import os
 import json
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -19,6 +20,29 @@ class SessionHubTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        # Safety net, not a substitute for tests patching these deliberately:
+        # a bare SessionHub() with no read_metadata patch still reads the
+        # real metadata.json, and discover_sessions() has conditional
+        # write_metadata() paths (clear-continuation linking, group
+        # session_key resync) that can fire against real data mid-test and
+        # write it straight back out. Defaulting METADATA_PATH/PID_DIR to a
+        # throwaway temp dir here means any test that forgets its own patch
+        # still can't touch the user's real files - see the incident where
+        # this exact gap overwrote real settings with test fixture data.
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        metadata_patcher = patch(
+            "session_hub.METADATA_PATH", Path(temp_dir.name) / "metadata.json"
+        )
+        pid_dir_patcher = patch(
+            "session_hub.PID_DIR", Path(temp_dir.name) / "pids"
+        )
+        metadata_patcher.start()
+        pid_dir_patcher.start()
+        self.addCleanup(metadata_patcher.stop)
+        self.addCleanup(pid_dir_patcher.stop)
 
     def test_discovers_both_agents(self):
         sessions = session_hub.discover_sessions({"sessions": {}})
@@ -1434,6 +1458,174 @@ class SessionHubTests(unittest.TestCase):
             ],
         )
 
+    def test_prefix_env_command_adds_env_overrides_and_strips(self):
+        # No "--" before the command: confirmed against a real launch
+        # failure that some env builds reject it there ("env: '--': No
+        # such file or directory"), silently killing the whole tmux
+        # session before it could ever attach - see prefix_env_command.
+        wrapped = session_hub.prefix_env_command(
+            ["claude", "--name", "vamp-s1"],
+            {"ANTHROPIC_MODEL": "opus"},
+            ["CLAUDE_CODE_CHILD_SESSION"],
+        )
+        self.assertEqual(
+            wrapped,
+            [
+                "env",
+                "-u",
+                "CLAUDE_CODE_CHILD_SESSION",
+                "ANTHROPIC_MODEL=opus",
+                "claude",
+                "--name",
+                "vamp-s1",
+            ],
+        )
+        self.assertNotIn("--", wrapped)
+
+    def test_prefix_env_command_is_actually_runnable_by_the_real_env_binary(self):
+        # Regression: the old "-- " placement parsed fine in isolation but
+        # broke the real launch, because this system's env only recognizes
+        # NAME=VALUE assignments up to the first non-matching argument and
+        # does not treat a later "--" as an options terminator. Exercise
+        # the real env binary, not just string-shape assertions, so this
+        # class of bug can't slip through unnoticed again.
+        wrapped = session_hub.prefix_env_command(
+            ["bash", "-c", "echo $MARKER_VAR"],
+            {"MARKER_VAR": "it-worked"},
+            None,
+        )
+        result = subprocess.run(wrapped, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), "it-worked")
+
+    def test_prefix_env_command_is_noop_with_nothing_to_apply(self):
+        args = ["claude", "--name", "vamp-s1"]
+        self.assertEqual(session_hub.prefix_env_command(args, {}, None), args)
+
+    @patch("session_hub.shutil.which")
+    def test_tmux_group_launch_command_matches_name_to_tmux_session(self, which):
+        # VAMPULSE-orchestrator's request: the tmux session name and the
+        # Claude --name must be identical - external tooling looks a
+        # session up by that exact name via `tmux send-keys -t <name>`.
+        which.side_effect = lambda name: {
+            "gnome-terminal": "/usr/bin/gnome-terminal",
+            "tmux": "/usr/bin/tmux",
+        }.get(name)
+        command = session_hub.tmux_group_launch_command(
+            "vamp-sonnet1",
+            "/home/user/VAMPULSE-game",
+            [
+                "claude", "--dangerously-skip-permissions",
+                "--name", "vamp-sonnet1", "--model", "sonnet",
+            ],
+        )
+        self.assertEqual(
+            command,
+            [
+                "bash",
+                "-c",
+                '"$1" has-session -t "$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
+                ' "$1" set-option -g set-titles on >/dev/null;'
+                ' "$1" set-option -g set-titles-string "#S" >/dev/null;'
+                ' exec "$5" -- "$1" attach -t "$2"',
+                "session-hub",
+                "/usr/bin/tmux",
+                "vamp-sonnet1",
+                "/home/user/VAMPULSE-game",
+                "claude --dangerously-skip-permissions --name vamp-sonnet1 --model sonnet",
+                "/usr/bin/gnome-terminal",
+            ],
+        )
+
+    @patch("session_hub.shutil.which", return_value=None)
+    def test_tmux_group_launch_command_raises_when_tmux_missing(self, which):
+        with self.assertRaises(RuntimeError):
+            session_hub.tmux_group_launch_command("vamp-s1", "/tmp/vamp", ["claude"])
+
+    def test_tmux_group_launch_command_actually_creates_a_live_tmux_session(self):
+        # Regression: string-shape assertions alone missed a real bug (env's
+        # "--" placement, see prefix_env_command) that killed the tmux
+        # session before it could ever attach - only running the real
+        # binaries end to end catches that class of failure.
+        if not (session_hub.shutil.which("tmux") and session_hub.shutil.which("gnome-terminal")):
+            self.skipTest("tmux/gnome-terminal not installed")
+        session_name = f"session-hub-test-{session_hub.uuid.uuid4().hex[:8]}"
+        claude_args = session_hub.prefix_env_command(
+            ["bash", "-c", "echo $MARKER_VAR; sleep 10"],
+            {"MARKER_VAR": "it-worked"},
+            None,
+        )
+        command = session_hub.tmux_group_launch_command(session_name, "/tmp", claude_args)
+        proc = subprocess.Popen(command, start_new_session=True)
+        try:
+            deadline = session_hub.time.monotonic() + 5
+            output = ""
+            while session_hub.time.monotonic() < deadline:
+                result = subprocess.run(
+                    ["tmux", "capture-pane", "-t", session_name, "-p"],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0:
+                    output = result.stdout
+                    break
+                session_hub.time.sleep(0.2)
+            self.assertIn("it-worked", output)
+        finally:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", session_name], capture_output=True
+            )
+            proc.wait(timeout=5)
+
+    @patch("session_hub.shutil.which")
+    def test_launch_with_tmux_builds_tmux_command_and_skips_pid_capture(self, which):
+        which.side_effect = lambda name: {
+            "gnome-terminal": "/usr/bin/gnome-terminal",
+            "tmux": "/usr/bin/tmux",
+            "claude": "/home/user/.local/bin/claude",
+        }.get(name)
+        metadata = {
+            "sessions": {
+                "group:/tmp/vamp#vamp-s1": {"env": {"ANTHROPIC_MODEL": "opus"}}
+            },
+            "settings": {"claude_danger_mode": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            with patch.object(session_hub.SessionHub, "spawn") as spawn:
+                window.launch(
+                    "Claude",
+                    None,
+                    "/tmp/vamp",
+                    session_key="group:/tmp/vamp#vamp-s1",
+                    flag_overrides={"--name": "vamp-s1"},
+                    use_tmux=True,
+                )
+            spawn.assert_called_once()
+            command = spawn.call_args.args[0]
+            self.assertEqual(command[0], "bash")
+            self.assertEqual(command[5], "vamp-s1")
+            claude_command = command[-2]
+            self.assertIn("ANTHROPIC_MODEL=opus", claude_command)
+            self.assertIn("--dangerously-skip-permissions", claude_command)
+            self.assertIn("--name vamp-s1", claude_command)
+            self.assertNotIn("pidfile", spawn.call_args.kwargs)
+        finally:
+            window.close()
+
+    def test_launch_with_tmux_requires_a_name(self):
+        window = session_hub.SessionHub()
+        try:
+            with patch.object(session_hub.SessionHub, "spawn") as spawn, patch(
+                "session_hub.QMessageBox.critical"
+            ) as critical:
+                window.launch("Claude", None, str(Path.home()), use_tmux=True)
+            spawn.assert_not_called()
+            critical.assert_called_once()
+        finally:
+            window.close()
+
     def test_read_pid_capture_file_reads_and_deletes(self):
         with tempfile.TemporaryDirectory() as temp:
             pidfile = Path(temp) / "x.pid"
@@ -1596,6 +1788,38 @@ class SessionHubTests(unittest.TestCase):
                 ),
             ]
             metadata = {}
+            with (
+                patch("session_hub.PID_DIR", pid_dir),
+                patch("session_hub.process_alive", return_value=True),
+            ):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+        self.assertFalse(changed)
+        self.assertEqual(metadata.get("links", {}), {})
+
+    def test_resolve_clear_continuations_does_not_absorb_an_already_named_sibling(self):
+        # Regression (real incident): the orchestrator's tracked PID lost
+        # track of its own session_id, and the "most recently updated,
+        # unclaimed session in this cwd" guess landed on VAMPULSE-old - a
+        # completely unrelated, already-named session sharing the group's
+        # directory, not a fresh /clear continuation. It was neither another
+        # tracked PID's own session nor a claimed group row's session_key,
+        # so the older "claimed" guard alone didn't catch it. A session the
+        # user has explicitly named is a deliberately distinct identity and
+        # must never be silently absorbed into someone else's continuation.
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / "111111.json").write_text(
+                json.dumps(
+                    {"cwd": "/home/user/vamp", "session_id": "orchestrator-old"}
+                )
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "vampulse-old", "VAMPULSE-old", "/home/user/vamp",
+                    "/home/user/vamp", 999_000, Path("/tmp/old.jsonl"),
+                )
+            ]
+            metadata = {"sessions": {"Claude:vampulse-old": {"name": "VAMPULSE-old"}}}
             with (
                 patch("session_hub.PID_DIR", pid_dir),
                 patch("session_hub.process_alive", return_value=True),
@@ -1776,6 +2000,35 @@ class SessionHubTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(tracking["session_id"], "first-id")
         self.assertEqual(metadata.get("links", {}), {})
+
+    def test_resolve_clear_continuations_applies_pending_model_on_first_sighting(self):
+        # The model chosen in the New Session dialog has nowhere to live
+        # until the brand new session's real native key is known - it rides
+        # along in the PID tracking file (see record_hub_launch) and turns
+        # into a durable ANTHROPIC_MODEL override right here, the first time
+        # that key is discovered.
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / f"{os.getpid()}.json").write_text(
+                json.dumps(
+                    {"cwd": "/home/user/proj", "session_id": None, "pending_model": "opus"}
+                )
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "first-id", "title", "/home/user/proj",
+                    "/home/user/proj", 500_000, Path("/tmp/first.jsonl"),
+                )
+            ]
+            metadata = {}
+            with patch("session_hub.PID_DIR", pid_dir):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+            tracking = json.loads((pid_dir / f"{os.getpid()}.json").read_text())
+        self.assertTrue(changed)
+        self.assertEqual(
+            metadata["sessions"]["Claude:first-id"]["env"], {"ANTHROPIC_MODEL": "opus"}
+        )
+        self.assertNotIn("pending_model", tracking)
 
     def test_resolve_clear_continuations_cleans_up_dead_process_file(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2064,6 +2317,34 @@ class SessionHubTests(unittest.TestCase):
         hub.refresh.assert_called_once()
         dialog.reload.assert_called_once()
 
+    def test_manage_group_dialog_table_disables_double_click_edit(self):
+        # Double-click is wired to launch/resume (see launch_or_resume_row) -
+        # it must not also open the cell for inline text editing, which read
+        # like an accidental rename.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {"/tmp/vamp": {"cwd": "/tmp/vamp", "rows": []}},
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    self.assertEqual(
+                        dialog.table.editTriggers(),
+                        session_hub.QTableWidget.EditTrigger.NoEditTriggers,
+                    )
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
+
     def test_row_context_menu_uses_override_key_for_shared_actions(self):
         # "Launch options..." (and every other shared action) must resolve
         # the SAME override bucket the Model column reads from
@@ -2112,6 +2393,60 @@ class SessionHubTests(unittest.TestCase):
                     menu = menu_cls.return_value
                     labels = [call.args[0].text() for call in menu.addAction.call_args_list]
                     self.assertEqual(labels, ["Remove from group"])
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
+
+    def test_remove_row_preserves_model_override_on_ungrouped_session(self):
+        # Regression: removing a member from a group used to just drop its
+        # row and leave the model/env override sitting under the row's
+        # override_key - the ungrouped session (now keyed by its own native
+        # key) silently reverted to "Default" the moment it left the group.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {
+                    "group:/tmp/vamp#vamp-orchestrator": {
+                        "env": {"ANTHROPIC_MODEL": "opus"}
+                    }
+                },
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {
+                                "name": "vamp-orchestrator",
+                                "override_key": "group:/tmp/vamp#vamp-orchestrator",
+                            }
+                        ],
+                    }
+                },
+            }
+            live = session_hub.Session(
+                "Claude", "abc123", "raw title", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/x.jsonl"), agent_name="vamp-orchestrator",
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.claude_sessions", return_value=[live]),
+                    patch("session_hub.session_is_tracked_alive", return_value=False),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    with (
+                        patch("session_hub.claude_sessions", return_value=[live]),
+                        patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                    ):
+                        dialog.remove_row("vamp-orchestrator")
+                    self.assertEqual(
+                        window.metadata["sessions"]["Claude:abc123"]["env"],
+                        {"ANTHROPIC_MODEL": "opus"},
+                    )
+                    self.assertEqual(window.metadata["groups"]["/tmp/vamp"]["rows"], [])
                 finally:
                     dialog.close()
             finally:
@@ -2405,13 +2740,13 @@ class SessionHubTests(unittest.TestCase):
                 try:
                     with (
                         patch.object(window, "launch_group_row") as launch_group_row,
-                        patch.object(window, "resume_session") as resume_session,
+                        patch.object(window, "resume_group_row") as resume_group_row,
                         patch("session_hub.claude_sessions", return_value=[]),
                     ):
                         index = dialog.table.model().index(0, 0)
                         dialog.launch_or_resume_row(index)
                     launch_group_row.assert_called_once_with("/tmp/vamp", "vamp-s1")
-                    resume_session.assert_not_called()
+                    resume_group_row.assert_not_called()
                 finally:
                     dialog.close()
             finally:
@@ -2447,15 +2782,12 @@ class SessionHubTests(unittest.TestCase):
                 try:
                     with (
                         patch.object(window, "launch_group_row") as launch_group_row,
-                        patch.object(window, "resume_session") as resume_session,
+                        patch.object(window, "resume_group_row") as resume_group_row,
                         patch("session_hub.claude_sessions", return_value=[live]),
                     ):
                         index = dialog.table.model().index(0, 0)
                         dialog.launch_or_resume_row(index)
-                    resume_session.assert_called_once()
-                    resumed = resume_session.call_args[0][0]
-                    self.assertEqual(resumed.session_id, "abc123")
-                    self.assertEqual(resumed.key, "group:/tmp/vamp#vamp-s1")
+                    resume_group_row.assert_called_once_with("/tmp/vamp", "vamp-s1")
                     launch_group_row.assert_not_called()
                 finally:
                     dialog.close()
@@ -2497,6 +2829,7 @@ class SessionHubTests(unittest.TestCase):
                     flag_overrides={"--name": "vamp-s1"},
                     strip_env=["CLAUDE_CODE_CHILD_SESSION"],
                     wait_for_tracking=False,
+                    use_tmux=False,
                 )
                 self.assertEqual(result, {"status": "launched", "name": "vamp-s1"})
             finally:
@@ -2537,6 +2870,7 @@ class SessionHubTests(unittest.TestCase):
                     flag_overrides={"--name": "vamp-s1"},
                     strip_env=None,
                     wait_for_tracking=False,
+                    use_tmux=False,
                 )
             finally:
                 window.close()
@@ -2590,6 +2924,109 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_resume_group_row_uses_tmux_when_group_flagged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "tmux": True,
+                        "rows": [
+                            {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}
+                        ],
+                    }
+                },
+            }
+            live = session_hub.Session(
+                "Claude", "abc123", "vamp-s1", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/x.jsonl"), agent_name="vamp-s1",
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.claude_sessions", return_value=[live]),
+                    patch("session_hub.session_is_tracked_alive", return_value=False),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    result = window.resume_group_row("/tmp/vamp", "vamp-s1")
+                launch.assert_called_once_with(
+                    "Claude",
+                    "abc123",
+                    "/tmp/vamp",
+                    "/tmp/vamp",
+                    session_key="group:/tmp/vamp#vamp-s1",
+                    use_tmux=True,
+                    tmux_name="vamp-s1",
+                )
+                self.assertEqual(result, {"status": "resumed", "name": "vamp-s1"})
+            finally:
+                window.close()
+
+    def test_resume_group_row_skips_relaunch_when_already_tracked_alive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}
+                        ],
+                    }
+                },
+            }
+            live = session_hub.Session(
+                "Claude", "abc123", "vamp-s1", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/x.jsonl"), agent_name="vamp-s1",
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.claude_sessions", return_value=[live]),
+                    patch("session_hub.session_is_tracked_alive", return_value=True),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    result = window.resume_group_row("/tmp/vamp", "vamp-s1")
+                launch.assert_not_called()
+                self.assertEqual(result, {"status": "already_running", "session_id": "abc123"})
+            finally:
+                window.close()
+
+    def test_resume_group_row_errors_when_row_has_no_history(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}
+                        ],
+                    }
+                },
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    result = window.resume_group_row("/tmp/vamp", "vamp-s1")
+                launch.assert_not_called()
+                self.assertEqual(result["status"], "error")
+            finally:
+                window.close()
+
     def test_launch_group_row_cli_prints_json_and_exits_nonzero_on_error(self):
         with tempfile.TemporaryDirectory() as temp:
             metadata = {"sessions": {}, "settings": {}, "groups": {}}
@@ -2631,6 +3068,47 @@ class SessionHubTests(unittest.TestCase):
             self.assertEqual(dialog.table.rowCount(), 1)
             dialog.close()
 
+    def test_new_session_group_dialog_tmux_checkbox_carries_into_accept(self):
+        with tempfile.TemporaryDirectory() as temp:
+            dialog = session_hub.NewSessionGroupDialog({})
+            dialog.location.setCurrentIndex(dialog.location.findData("existing"))
+            dialog.existing_path.setText(temp)
+            dialog.update_preview()
+            self.assertFalse(dialog.tmux_checkbox.isChecked())
+            dialog.tmux_checkbox.setChecked(True)
+            dialog.accept()
+            self.assertTrue(dialog.use_tmux)
+            dialog.close()
+
+    def test_manage_group_dialog_tmux_checkbox_persists_to_group(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {"/tmp/vamp": {"cwd": "/tmp/vamp", "rows": []}},
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch(
+                        "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
+                    ),
+                ):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    self.assertFalse(dialog.tmux_checkbox.isChecked())
+                    with patch(
+                        "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
+                    ):
+                        dialog.tmux_checkbox.setChecked(True)
+                    self.assertTrue(window.metadata["groups"]["/tmp/vamp"]["tmux"])
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
+
     def test_new_session_group_dialog_rejects_duplicate_names(self):
         with tempfile.TemporaryDirectory() as temp:
             dialog = session_hub.NewSessionGroupDialog({})
@@ -2664,6 +3142,7 @@ class SessionHubTests(unittest.TestCase):
                     {"name": "vampulse-fable", "model": "fable"},
                     {"name": "vampulse-sonnet", "model": "sonnet"},
                 ]
+                dialog_instance.use_tmux = False
                 dialog_instance.exec = MagicMock(
                     return_value=session_hub.QDialog.DialogCode.Accepted
                 )
@@ -2711,6 +3190,7 @@ class SessionHubTests(unittest.TestCase):
                     {"name": "vampulse-fable", "model": "fable"},
                     {"name": "vampulse-sonnet", "model": "sonnet"},
                 ]
+                dialog_instance.use_tmux = False
                 dialog_instance.exec = MagicMock(
                     return_value=session_hub.QDialog.DialogCode.Accepted
                 )
@@ -2747,10 +3227,19 @@ class SessionHubTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_add_session_to_group_launches_and_appends_row(self):
+    def test_add_session_to_group_moves_existing_session_without_launching(self):
+        # "Add session to group" on an already-running session must file it
+        # into the group as-is - no new process, no Model/Name prompt (see
+        # MoveToGroupDialog). Regression: this used to always launch a brand
+        # new session instead of using the one you selected.
         with tempfile.TemporaryDirectory() as temp:
             metadata = {
-                "sessions": {},
+                "sessions": {
+                    "Claude:id-1": {
+                        "env": {"ANTHROPIC_MODEL": "opus"},
+                        "flags": {"--dangerously-skip-permissions": True},
+                    }
+                },
                 "settings": {},
                 "groups": {
                     "/home/user/proj": {
@@ -2763,13 +3252,13 @@ class SessionHubTests(unittest.TestCase):
                 window = session_hub.SessionHub()
             try:
                 session = session_hub.Session(
-                    "Claude", "id-1", "title", "/home/user/proj",
+                    "Claude", "id-1", "vampulse-orchestrator", "/home/user/proj",
                     "/home/user/proj", 100, Path("/tmp/x.jsonl"),
                 )
-                dialog_instance = session_hub.AddGroupSessionDialog.__new__(
-                    session_hub.AddGroupSessionDialog
+                dialog_instance = session_hub.MoveToGroupDialog.__new__(
+                    session_hub.MoveToGroupDialog
                 )
-                dialog_instance.row = {"name": "proj-sonnet", "model": "sonnet"}
+                dialog_instance.cwd = "/home/user/proj"
                 dialog_instance.exec = MagicMock(
                     return_value=session_hub.QDialog.DialogCode.Accepted
                 )
@@ -2777,19 +3266,74 @@ class SessionHubTests(unittest.TestCase):
                     patch.object(window, "selected", return_value=session),
                     patch.object(session_hub.SessionHub, "launch") as launch,
                     patch(
-                        "session_hub.AddGroupSessionDialog", return_value=dialog_instance
+                        "session_hub.MoveToGroupDialog", return_value=dialog_instance
                     ),
                     patch(
                         "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
                     ),
                 ):
                     window.add_session_to_group()
-                launch.assert_called_once()
+                launch.assert_not_called()
+                rows = window.metadata["groups"]["/home/user/proj"]["rows"]
+                self.assertEqual(len(rows), 2)
+                new_row = rows[-1]
+                self.assertEqual(new_row["name"], "vampulse-orchestrator")
+                self.assertEqual(new_row["session_key"], "Claude:id-1")
+                row_overrides = window.metadata["sessions"][new_row["override_key"]]
+                self.assertEqual(row_overrides["env"], {"ANTHROPIC_MODEL": "opus"})
                 self.assertEqual(
-                    launch.call_args.kwargs["flag_overrides"], {"--name": "proj-sonnet"}
+                    row_overrides["flags"], {"--dangerously-skip-permissions": True}
                 )
+            finally:
+                window.close()
+
+    def test_add_session_to_group_dedupes_name_and_overrides_cwd_for_other_group(self):
+        # Moving into a group whose directory differs from the session's own
+        # requires a cwd override so find_group_member_session's cwd check
+        # matches on the next refresh (same mechanism change_directory_for
+        # uses) - and a name collision must not silently clobber the
+        # existing row.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/home/user/vamp": {
+                        "cwd": "/home/user/vamp",
+                        "rows": [{"name": "worker", "override_key": "group:/home/user/vamp#worker"}],
+                    }
+                },
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                session = session_hub.Session(
+                    "Claude", "id-2", "worker", "/home/user/elsewhere",
+                    "/home/user/elsewhere", 100, Path("/tmp/x.jsonl"),
+                )
+                dialog_instance = session_hub.MoveToGroupDialog.__new__(
+                    session_hub.MoveToGroupDialog
+                )
+                dialog_instance.cwd = "/home/user/vamp"
+                dialog_instance.exec = MagicMock(
+                    return_value=session_hub.QDialog.DialogCode.Accepted
+                )
+                with (
+                    patch.object(window, "selected", return_value=session),
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch(
+                        "session_hub.MoveToGroupDialog", return_value=dialog_instance
+                    ),
+                    patch(
+                        "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
+                    ),
+                ):
+                    window.add_session_to_group()
+                launch.assert_not_called()
+                rows = window.metadata["groups"]["/home/user/vamp"]["rows"]
+                self.assertEqual([row["name"] for row in rows], ["worker", "worker-2"])
                 self.assertEqual(
-                    len(window.metadata["groups"]["/home/user/proj"]["rows"]), 2
+                    window.metadata["sessions"]["Claude:id-2"]["cwd"], "/home/user/vamp"
                 )
             finally:
                 window.close()
@@ -2804,6 +3348,162 @@ class SessionHubTests(unittest.TestCase):
                 self.assertIn("Add session to group…", labels)
         finally:
             window.close()
+
+    def test_add_group_session_dialog_lists_all_groups_and_preselects_match(self):
+        groups = {
+            "/tmp/vamp": {"cwd": "/tmp/vamp", "rows": [], "display_name": "VAMPULSE"},
+            "/tmp/other": {"cwd": "/tmp/other", "rows": []},
+        }
+        dialog = session_hub.AddGroupSessionDialog(groups, "/tmp/other")
+        try:
+            labels = [
+                dialog.group_combo.itemText(i) for i in range(dialog.group_combo.count())
+            ]
+            self.assertEqual(set(labels), {"VAMPULSE", "other"})
+            self.assertEqual(dialog.group_combo.currentData(), "/tmp/other")
+            self.assertEqual(dialog.directory_label.text(), "/tmp/other")
+        finally:
+            dialog.close()
+
+    def test_move_to_group_dialog_lists_all_groups_and_preselects_match(self):
+        groups = {
+            "/tmp/vamp": {"cwd": "/tmp/vamp", "rows": [], "display_name": "VAMPULSE"},
+            "/tmp/other": {"cwd": "/tmp/other", "rows": []},
+        }
+        dialog = session_hub.MoveToGroupDialog(groups, "/tmp/other")
+        try:
+            labels = [
+                dialog.group_combo.itemText(i) for i in range(dialog.group_combo.count())
+            ]
+            self.assertEqual(set(labels), {"VAMPULSE", "other"})
+            self.assertEqual(dialog.group_combo.currentData(), "/tmp/other")
+            self.assertEqual(dialog.directory_label.text(), "/tmp/other")
+            dialog.accept()
+            self.assertEqual(dialog.cwd, "/tmp/other")
+        finally:
+            dialog.close()
+
+    def test_add_session_to_group_offers_picker_for_unmatched_cwd(self):
+        # The selected session's own directory has no group of its own, but
+        # a group exists elsewhere - this must open the picker rather than
+        # refuse with "no group for this session" (see
+        # SessionHub.add_session_to_group_for).
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {"cwd": "/tmp/vamp", "rows": []},
+                },
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                session = session_hub.Session(
+                    "Claude", "id-1", "title", "/home/user/unrelated",
+                    "/home/user/unrelated", 100, Path("/tmp/x.jsonl"),
+                )
+                dialog_instance = session_hub.MoveToGroupDialog.__new__(
+                    session_hub.MoveToGroupDialog
+                )
+                dialog_instance.cwd = "/tmp/vamp"
+                dialog_instance.exec = MagicMock(
+                    return_value=session_hub.QDialog.DialogCode.Accepted
+                )
+                with (
+                    patch.object(window, "selected", return_value=session),
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch(
+                        "session_hub.MoveToGroupDialog",
+                        return_value=dialog_instance,
+                    ) as dialog_cls,
+                    patch("session_hub.QMessageBox.information") as info,
+                    patch(
+                        "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
+                    ),
+                ):
+                    window.add_session_to_group()
+                info.assert_not_called()
+                dialog_cls.assert_called_once()
+                self.assertEqual(dialog_cls.call_args.args[1], "/home/user/unrelated")
+                launch.assert_not_called()
+                self.assertEqual(
+                    len(window.metadata["groups"]["/tmp/vamp"]["rows"]), 1
+                )
+            finally:
+                window.close()
+
+    def test_add_to_group_works_without_a_selected_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {"/tmp/vamp": {"cwd": "/tmp/vamp", "rows": []}},
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                dialog_instance = session_hub.AddGroupSessionDialog.__new__(
+                    session_hub.AddGroupSessionDialog
+                )
+                dialog_instance.row = {"name": "vamp-extra", "model": "opus"}
+                dialog_instance.cwd = "/tmp/vamp"
+                dialog_instance.exec = MagicMock(
+                    return_value=session_hub.QDialog.DialogCode.Accepted
+                )
+                with (
+                    patch.object(window, "selected") as selected,
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch(
+                        "session_hub.AddGroupSessionDialog",
+                        return_value=dialog_instance,
+                    ),
+                    patch(
+                        "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
+                    ),
+                ):
+                    window.add_to_group()
+                selected.assert_not_called()
+                launch.assert_called_once()
+            finally:
+                window.close()
+
+    def test_manage_group_reuses_open_dialog_instead_of_a_duplicate(self):
+        # exec() is application-modal and used to freeze the whole main
+        # window while a group was being managed; show() (non-modal) fixes
+        # that, but then a second "Manage group…" click on the same group
+        # must raise the existing window rather than open a second one.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {"/tmp/vamp": {"cwd": "/tmp/vamp", "rows": []}},
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                session = session_hub.Session(
+                    "Claude", "group:/tmp/vamp", "VAMPULSE", "/tmp/vamp",
+                    "/tmp/vamp", 100, Path("/tmp/vamp"),
+                )
+                with (
+                    patch.object(window, "selected", return_value=session),
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch(
+                        "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
+                    ),
+                ):
+                    window.manage_group()
+                    first = window.group_dialogs["/tmp/vamp"]
+                    self.assertEqual(
+                        first.windowModality(), session_hub.Qt.WindowModality.NonModal
+                    )
+                    window.manage_group()
+                    self.assertIs(window.group_dialogs["/tmp/vamp"], first)
+                first.close()
+                self.assertNotIn("/tmp/vamp", window.group_dialogs)
+            finally:
+                window.close()
 
     def test_flags_editor_uses_typed_widget_for_effort(self):
         editor = session_hub.EnvEditor(
@@ -2925,21 +3625,12 @@ class SessionHubTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_new_session_dialog_defaults_caveman_to_global_flag(self):
-        settings = {"global_flags": {"--caveman": "full+files"}}
-        dialog = session_hub.NewSessionDialog("Claude", settings)
+    def test_new_session_dialog_has_no_caveman_combo(self):
+        dialog = session_hub.NewSessionDialog(
+            "Claude", {"global_flags": {"--caveman": "full+files"}}
+        )
         try:
-            self.assertEqual(dialog.caveman_combo.currentData(), "full+files")
-            dialog.caveman = str(dialog.caveman_combo.currentData())
-            self.assertEqual(dialog.flag_overrides(), {"--caveman": "full+files"})
-        finally:
-            dialog.close()
-
-    def test_new_session_dialog_has_no_caveman_row_for_codex(self):
-        dialog = session_hub.NewSessionDialog("Codex", {})
-        try:
-            self.assertIsNone(dialog.caveman_combo)
-            self.assertEqual(dialog.flag_overrides(), {})
+            self.assertFalse(hasattr(dialog, "caveman_combo"))
         finally:
             dialog.close()
 
@@ -3064,7 +3755,12 @@ class SessionHubTests(unittest.TestCase):
             window = session_hub.SessionHub()
         self.assertTrue(window.continue_with_other_button.isHidden())
         self.assertTrue(window.prepare_handoff_button.isHidden())
-        labels = [label for label, _ in window.context_menu_actions()]
+        # context_menu_actions() with no session falls through to selected(),
+        # which pops a real (blocking, never auto-dismissed) QMessageBox when
+        # nothing is selected in a fresh table - patch it out like every
+        # other no-selection context_menu_actions() call in this file does.
+        with patch.object(window, "selected", return_value=None):
+            labels = [label for label, _ in window.context_menu_actions()]
         self.assertNotIn("Continue with other agent", labels)
         self.assertNotIn("Prepare handoff summary", labels)
         window.close()
@@ -3082,7 +3778,8 @@ class SessionHubTests(unittest.TestCase):
             window = session_hub.SessionHub()
         self.assertFalse(window.continue_with_other_button.isHidden())
         self.assertFalse(window.prepare_handoff_button.isHidden())
-        labels = [label for label, _ in window.context_menu_actions()]
+        with patch.object(window, "selected", return_value=None):
+            labels = [label for label, _ in window.context_menu_actions()]
         self.assertIn("Continue with other agent", labels)
         self.assertIn("Prepare handoff summary", labels)
         window.close()
