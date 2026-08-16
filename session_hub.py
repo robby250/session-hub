@@ -4859,6 +4859,13 @@ class SessionHub(QMainWindow):
             session.cwd,
             session.source_cwd,
             session_key=session.key,
+            # Strip the inherited child-session marker, as launch_group_row already
+            # does. A single session has no `transcripts` toggle, so it is always on
+            # and the marker is always wrong to pass down. Latent until --resume-session
+            # made "Session Hub launched from inside a Claude session" a normal path:
+            # the Hub inherits the marker there and every session it opens starts with
+            # transcript saving off.
+            strip_env=["CLAUDE_CODE_CHILD_SESSION"],
             wait_for_tracking=wait_for_tracking,
         )
 
