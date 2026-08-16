@@ -4847,7 +4847,9 @@ class SessionHub(QMainWindow):
             return
         self.resume_session(session)
 
-    def resume_session(self, session: Session) -> None:
+    def resume_session(
+        self, session: Session, *, wait_for_tracking: bool = False
+    ) -> None:
         if self.is_group_session(session):
             self.manage_group()
             return
@@ -4857,7 +4859,55 @@ class SessionHub(QMainWindow):
             session.cwd,
             session.source_cwd,
             session_key=session.key,
+            wait_for_tracking=wait_for_tracking,
         )
+
+    def resume_session_by_name(
+        self, wanted: str, *, wait_for_tracking: bool = False
+    ) -> dict:
+        """Find ONE non-group session by Hub name, key or raw id, and resume it.
+
+        The single-session counterpart to launch_group_row, shared by the
+        --resume-session CLI flag. Matching checks the Hub's custom name
+        first, because the name in the Hub's list is what the user reads and
+        types; the transcript title and the raw ids are fallbacks. An
+        ambiguous name is an error with the candidates listed rather than a
+        guess - resuming the wrong session is not something the caller can
+        see from a JSON line.
+        """
+        sessions = getattr(self, "sessions", None) or discover_sessions(self.metadata)
+        overrides = self.metadata.get("sessions", {}) or {}
+        needle = wanted.strip().lower()
+        matches = []
+        for session in sessions:
+            custom = (overrides.get(session.key) or {}).get("name") or ""
+            candidates = (custom, session.title or "", session.key, session.session_id)
+            if any(c and c.lower() == needle for c in candidates):
+                matches.append((custom or session.title, session))
+        if not matches:
+            return {"status": "error", "message": f"No session matching {wanted!r}"}
+        if len(matches) > 1:
+            return {
+                "status": "error",
+                "message": f"{wanted!r} matches {len(matches)} sessions -- use a key",
+                "candidates": [s.key for _, s in matches],
+            }
+        name, session = matches[0]
+        if self.is_group_session(session):
+            return {
+                "status": "error",
+                "message": (
+                    f"{wanted!r} is a session GROUP -- use "
+                    f"--launch-group-row {session.cwd!r} <row-name>"
+                ),
+            }
+        self.resume_session(session, wait_for_tracking=wait_for_tracking)
+        return {
+            "status": "resumed",
+            "name": name,
+            "key": session.key,
+            "cwd": session.cwd,
+        }
 
     def is_group_session(self, session: Session) -> bool:
         return session.session_id.startswith("group:")
@@ -5765,11 +5815,37 @@ def launch_group_row_cli(argv: list[str]) -> int:
     return 0 if result.get("status") != "error" else 1
 
 
+def resume_session_cli(argv: list[str]) -> int:
+    """Headless `--resume-session <name|key|id>`, for an orchestrator's own Bash.
+
+    The single-session counterpart to --launch-group-row: same never-shown
+    SessionHub, so the resume goes through the exact tracked path (PID
+    capture, launch_env/launch_flags overrides) a GUI double-click uses.
+    Blocks briefly (wait_for_tracking) since this process exits right after.
+    """
+    try:
+        index = argv.index("--resume-session")
+        wanted = argv[index + 1]
+    except (ValueError, IndexError):
+        print(json.dumps({
+            "status": "error",
+            "message": "usage: session_hub.py --resume-session <name|key|session-id>",
+        }))
+        return 1
+    app = QApplication.instance() or QApplication(argv[:1])
+    window = SessionHub()
+    result = window.resume_session_by_name(wanted, wait_for_tracking=True)
+    print(json.dumps(result))
+    return 0 if result.get("status") != "error" else 1
+
+
 def main() -> int:
     if "--diagnose" in sys.argv:
         return diagnostic()
     if "--launch-group-row" in sys.argv:
         return launch_group_row_cli(sys.argv)
+    if "--resume-session" in sys.argv:
+        return resume_session_cli(sys.argv)
     app = QApplication(sys.argv)
     app.setApplicationName("Session Hub")
     app.setDesktopFileName("session-hub")
