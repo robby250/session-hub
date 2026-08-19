@@ -2306,6 +2306,184 @@ class SessionHubTests(unittest.TestCase):
         finally:
             window.close()
 
+    def _group_metadata(self):
+        return {
+            "sessions": {},
+            "settings": {
+                "global_env": {"ANTHROPIC_MODEL": "sonnet"},
+                "global_flags": {"--effort": "low"},
+            },
+            "groups": {
+                "/tmp/vamp": {
+                    "cwd": "/tmp/vamp",
+                    "env": {"ANTHROPIC_MODEL": "opus"},
+                    "flags": {"--effort": "high"},
+                    "rows": [
+                        {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}
+                    ],
+                }
+            },
+        }
+
+    def test_group_cwd_for_session_key_resolves_both_key_shapes(self):
+        metadata = self._group_metadata()
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertEqual(
+                window.group_cwd_for_session_key("group:/tmp/vamp#vamp-s1"), "/tmp/vamp"
+            )
+            self.assertEqual(
+                window.group_cwd_for_session_key("Claude:group:/tmp/vamp"), "/tmp/vamp"
+            )
+            self.assertIsNone(window.group_cwd_for_session_key("Claude:abc123"))
+            self.assertIsNone(window.group_cwd_for_session_key(None))
+        finally:
+            window.close()
+
+    def test_effective_model_falls_back_global_then_group_then_session(self):
+        metadata = self._group_metadata()
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            # No session-level override yet: group's model wins over global.
+            self.assertEqual(window.effective_model("group:/tmp/vamp#vamp-s1"), "opus")
+            # A row's own override still wins over the group.
+            metadata["sessions"]["group:/tmp/vamp#vamp-s1"] = {
+                "env": {"ANTHROPIC_MODEL": "fable"}
+            }
+            self.assertEqual(window.effective_model("group:/tmp/vamp#vamp-s1"), "fable")
+            # Ungrouped session key: only global applies.
+            self.assertEqual(window.effective_model("Claude:abc123"), "sonnet")
+        finally:
+            window.close()
+
+    def test_launch_env_and_flags_apply_group_tier_between_global_and_session(self):
+        metadata = self._group_metadata()
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            env = window.launch_env("group:/tmp/vamp#vamp-s1")
+            self.assertEqual(env["ANTHROPIC_MODEL"], "opus")
+            flags = window.launch_flags("group:/tmp/vamp#vamp-s1")
+            self.assertEqual(flags, ["--effort", "high"])
+
+            metadata["sessions"]["group:/tmp/vamp#vamp-s1"] = {
+                "env": {"ANTHROPIC_MODEL": "fable"},
+                "flags": {"--effort": "medium"},
+            }
+            env = window.launch_env("group:/tmp/vamp#vamp-s1")
+            self.assertEqual(env["ANTHROPIC_MODEL"], "fable")
+            flags = window.launch_flags("group:/tmp/vamp#vamp-s1")
+            self.assertEqual(flags, ["--effort", "medium"])
+        finally:
+            window.close()
+
+    def test_edit_group_launch_options_persists_env_and_flags(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {"/tmp/vamp": {"cwd": "/tmp/vamp", "rows": []}},
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                dialog_instance = session_hub.SessionLaunchOptionsDialog.__new__(
+                    session_hub.SessionLaunchOptionsDialog
+                )
+                dialog_instance.exec = MagicMock(
+                    return_value=session_hub.QDialog.DialogCode.Accepted
+                )
+                dialog_instance.env = MagicMock(return_value={"ANTHROPIC_MODEL": "opus"})
+                dialog_instance.flags = MagicMock(return_value={"--effort": "high"})
+                with (
+                    patch(
+                        "session_hub.SessionLaunchOptionsDialog",
+                        return_value=dialog_instance,
+                    ) as dialog_cls,
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.edit_group_launch_options("/tmp/vamp")
+                self.assertEqual(dialog_cls.call_args.kwargs["scope"], "this group")
+                group = window.metadata["groups"]["/tmp/vamp"]
+                self.assertEqual(group["env"], {"ANTHROPIC_MODEL": "opus"})
+                self.assertEqual(group["flags"], {"--effort": "high"})
+            finally:
+                window.close()
+
+    def test_manage_group_dialog_selection_mode_allows_ctrl_click_multi_select(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {"/tmp/vamp": {"cwd": "/tmp/vamp", "rows": []}},
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    self.assertEqual(
+                        dialog.table.selectionMode(),
+                        session_hub.QTableWidget.SelectionMode.ExtendedSelection,
+                    )
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
+
+    def test_manage_group_dialog_launch_selected_rows_launches_each_selection(self):
+        hub = MagicMock()
+        dialog = session_hub.ManageGroupDialog.__new__(session_hub.ManageGroupDialog)
+        dialog.hub = hub
+        dialog.cwd = "/tmp/vamp"
+        dialog.reload = MagicMock()
+        dialog.pair_at_table_row = MagicMock(
+            side_effect=[
+                ({"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}, None),
+                (
+                    {"name": "vamp-s2", "override_key": "group:/tmp/vamp#vamp-s2"},
+                    MagicMock(),
+                ),
+            ]
+        )
+        index0, index1 = MagicMock(), MagicMock()
+        index0.row.return_value = 0
+        index1.row.return_value = 1
+        selection_model = MagicMock()
+        selection_model.selectedRows.return_value = [index0, index1]
+        dialog.table = MagicMock()
+        dialog.table.selectionModel.return_value = selection_model
+
+        dialog.launch_selected_rows()
+
+        hub.launch_group_row.assert_called_once_with("/tmp/vamp", "vamp-s1")
+        hub.resume_group_row.assert_called_once_with("/tmp/vamp", "vamp-s2")
+        hub.refresh.assert_called_once()
+        dialog.reload.assert_called_once()
+
+    def test_manage_group_dialog_launch_selected_rows_does_nothing_when_empty(self):
+        hub = MagicMock()
+        dialog = session_hub.ManageGroupDialog.__new__(session_hub.ManageGroupDialog)
+        dialog.hub = hub
+        dialog.reload = MagicMock()
+        selection_model = MagicMock()
+        selection_model.selectedRows.return_value = []
+        dialog.table = MagicMock()
+        dialog.table.selectionModel.return_value = selection_model
+
+        dialog.launch_selected_rows()
+
+        hub.launch_group_row.assert_not_called()
+        hub.resume_group_row.assert_not_called()
+        hub.refresh.assert_not_called()
+        dialog.reload.assert_not_called()
+
     def test_manage_group_dialog_launch_row_delegates_to_hub(self):
         hub = MagicMock()
         dialog = session_hub.ManageGroupDialog.__new__(session_hub.ManageGroupDialog)

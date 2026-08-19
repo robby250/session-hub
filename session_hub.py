@@ -690,6 +690,7 @@ class SessionLaunchOptionsDialog(QDialog):
         global_flags: dict,
         flag_overrides: dict,
         parent=None,
+        scope: str = "this session",
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Session launch options")
@@ -697,7 +698,7 @@ class SessionLaunchOptionsDialog(QDialog):
         layout = QVBoxLayout(self)
         intro = QLabel(
             f"Launch options for “{session_title}”. These override the global "
-            "settings for this session only."
+            f"settings for {scope} only."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -3268,7 +3269,12 @@ class ManageGroupDialog(QDialog):
         self.table.verticalHeader().setVisible(False)
         self.table.setMinimumHeight(200)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        # ExtendedSelection: plain click selects one row, Ctrl+click toggles
+        # extra rows into the selection, Shift+click selects a range - the
+        # usual Qt multi-select gesture. launch_selected_rows() (wired below
+        # to Enter/Return via _GroupSessionTable.keyPressEvent) acts on
+        # however many rows that leaves selected.
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         # Double-click is wired to launch/resume below; without this, Qt's
         # default edit triggers also open the cell for inline text editing
         # on the same double-click, which looks like (and was mistaken for)
@@ -3281,6 +3287,10 @@ class ManageGroupDialog(QDialog):
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.row_context_menu)
         self.table.doubleClicked.connect(self.launch_or_resume_row)
+        for key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            shortcut = QShortcut(QKeySequence(key), self.table)
+            shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            shortcut.activated.connect(self.launch_selected_rows)
         layout.addWidget(self.table)
 
         controls = QHBoxLayout()
@@ -3294,6 +3304,14 @@ class ManageGroupDialog(QDialog):
         )
         add_session_button.clicked.connect(self.add_existing_session)
         controls.addWidget(add_session_button)
+        group_options_button = QPushButton("Group launch options…")
+        group_options_button.setToolTip(
+            "Env vars and CLI flags applied to every row in this group. "
+            "Override the global settings; a row's own launch options "
+            "(right-click a row → Launch options…) override these."
+        )
+        group_options_button.clicked.connect(self.edit_group_launch_options)
+        controls.addWidget(group_options_button)
         self.tmux_checkbox = QCheckBox("Launch in tmux")
         self.tmux_checkbox.setToolTip(
             "New launches of this group's members run detached inside tmux "
@@ -3518,6 +3536,32 @@ class ManageGroupDialog(QDialog):
             if match and session_is_tracked_alive(match):
                 continue
             self.launch_row(row["name"])
+
+    def launch_selected_rows(self) -> None:
+        """Enter/Return on the table: launch or resume every selected row.
+
+        Mirrors launch_or_resume_row's per-row launch-vs-resume choice, but
+        for the whole (Ctrl/Shift-click) selection at once instead of just
+        the row under the cursor.
+        """
+        table_rows = {index.row() for index in self.table.selectionModel().selectedRows()}
+        if not table_rows:
+            return
+        for table_row in table_rows:
+            pair = self.pair_at_table_row(table_row)
+            if pair is None:
+                continue
+            row, match = pair
+            if match:
+                self.hub.resume_group_row(self.cwd, row["name"])
+            else:
+                self.hub.launch_group_row(self.cwd, row["name"])
+        self.hub.refresh()
+        self.reload()
+
+    def edit_group_launch_options(self) -> None:
+        self.hub.edit_group_launch_options(self.cwd)
+        self.reload()
 
     def add_existing_session(self) -> None:
         # self.hub.sessions already excludes group members (see
@@ -4420,21 +4464,55 @@ class SessionHub(QMainWindow):
         self.refresh()
         self.refresh_usage()
 
+    def group_cwd_for_session_key(self, session_key: str | None) -> str | None:
+        """Recover a session group's cwd from either shape of group-linked key.
+
+        Two different keys both mean "this belongs to a saved session group":
+        a row's own override_key ("group:{cwd}#{name}", minted by
+        register_group_row) and the main listview's pseudo-row native key
+        ("{provider}:group:{cwd}", built in discover_sessions for the
+        group's own collapsed row). Both need to resolve to the same
+        group-level launch options.
+        """
+        if not session_key:
+            return None
+        if session_key.startswith("group:") and "#" in session_key:
+            cwd = session_key[len("group:"):].rsplit("#", 1)[0]
+        elif ":group:" in session_key:
+            cwd = session_key.split(":group:", 1)[1]
+        else:
+            return None
+        return cwd if cwd in self.metadata.get("groups", {}) else None
+
+    def group_launch_options(self, session_key: str | None) -> tuple[dict, dict]:
+        """(env, flags) saved on the session group `session_key` belongs to, if any."""
+        cwd = self.group_cwd_for_session_key(session_key)
+        if not cwd:
+            return {}, {}
+        group = self.metadata.get("groups", {}).get(cwd) or {}
+        return group.get("env") or {}, group.get("flags") or {}
+
     def effective_model(self, session_key: str | None) -> str | None:
         """The ANTHROPIC_MODEL a session would (re)launch with, if any is set.
 
-        Same global-then-session-override precedence as launch_env, just
-        surfacing the one value rather than merging a whole environment -
-        this is what the Model column (main listview and group dialog alike)
-        displays.
+        Same global-then-group-then-session-override precedence as
+        launch_env, just surfacing the one value rather than merging a whole
+        environment - this is what the Model column (main listview and group
+        dialog alike) displays.
         """
         global_env = self.settings().get("global_env") or {}
+        group_env, _ = self.group_launch_options(session_key)
         overrides: dict = {}
         if session_key:
             overrides = (
                 (self.metadata.get("sessions") or {}).get(session_key) or {}
             ).get("env") or {}
-        return overrides.get("ANTHROPIC_MODEL") or global_env.get("ANTHROPIC_MODEL") or None
+        return (
+            overrides.get("ANTHROPIC_MODEL")
+            or group_env.get("ANTHROPIC_MODEL")
+            or global_env.get("ANTHROPIC_MODEL")
+            or None
+        )
 
     def populate_session_table(
         self, table: QTableWidget, sessions: list[Session], columns: tuple[str, ...]
@@ -4519,23 +4597,25 @@ class SessionHub(QMainWindow):
     def launch_env(
         self, session_key: str | None = None, strip: list[str] | None = None
     ) -> dict[str, str] | None:
-        """Merge global + per-session env overrides onto the current process env.
+        """Merge global + group + per-session env overrides onto the current process env.
 
         Returns None when nothing is configured or stripped so the launched
         process simply inherits Session Hub's environment as-is. Per-session
-        values win over global. `strip` removes inherited keys outright (e.g.
-        CLAUDE_CODE_CHILD_SESSION, which Session Hub itself may have inherited
-        if it was launched from inside another Claude session, and which
-        disables transcript saving in whatever it's launched into).
+        values win over the session's group, which wins over global. `strip`
+        removes inherited keys outright (e.g. CLAUDE_CODE_CHILD_SESSION, which
+        Session Hub itself may have inherited if it was launched from inside
+        another Claude session, and which disables transcript saving in
+        whatever it's launched into).
         """
         global_env = self.settings().get("global_env") or {}
+        group_env, _ = self.group_launch_options(session_key)
         overrides: dict = {}
         if session_key:
             overrides = (
                 (self.metadata.get("sessions") or {}).get(session_key) or {}
             ).get("env") or {}
         combined: dict[str, str] = {}
-        for source in (global_env, overrides):
+        for source in (global_env, group_env, overrides):
             for name, value in source.items():
                 if str(name).strip():
                     combined[str(name)] = str(value)
@@ -4549,20 +4629,22 @@ class SessionHub(QMainWindow):
     def launch_flags(
         self, session_key: str | None = None, extra: dict | None = None
     ) -> list[str]:
-        """Merge global + per-session CLI flag overrides into argv fragments.
+        """Merge global + group + per-session CLI flag overrides into argv fragments.
 
-        Per-session values win over global, matching launch_env's precedence.
-        `extra` wins over both -- it carries a one-off choice made in the launch
-        dialog, which has no session key yet because the session does not exist.
+        Per-session values win over the session's group, which wins over
+        global, matching launch_env's precedence. `extra` wins over all three
+        -- it carries a one-off choice made in the launch dialog, which has
+        no session key yet because the session does not exist.
         """
         global_flags = self.settings().get("global_flags") or {}
+        _, group_flags = self.group_launch_options(session_key)
         overrides: dict = {}
         if session_key:
             overrides = (
                 (self.metadata.get("sessions") or {}).get(session_key) or {}
             ).get("flags") or {}
         combined: dict[str, str] = {}
-        for source in (global_flags, overrides, extra or {}):
+        for source in (global_flags, group_flags, overrides, extra or {}):
             for name, value in source.items():
                 if str(name).strip():
                     combined[str(name)] = str(value)
@@ -4633,11 +4715,12 @@ class SessionHub(QMainWindow):
         existing = (self.metadata.get("sessions") or {}).get(session.key, {})
         env_overrides = existing.get("env") or {}
         flag_overrides = existing.get("flags") or {}
+        group_env, group_flags = self.group_launch_options(session.key)
         dialog = SessionLaunchOptionsDialog(
             session.title,
-            self.settings().get("global_env") or {},
+            {**(self.settings().get("global_env") or {}), **group_env},
             env_overrides,
-            self.settings().get("global_flags") or {},
+            {**(self.settings().get("global_flags") or {}), **group_flags},
             flag_overrides,
             self,
         )
@@ -4655,6 +4738,40 @@ class SessionHub(QMainWindow):
                 entry["flags"] = flags
             else:
                 entry.pop("flags", None)
+            write_metadata(self.metadata)
+            self.refresh()
+
+    def edit_group_launch_options(self, cwd: str) -> None:
+        """Edit the env/flag overrides applied to every row in the group at `cwd`.
+
+        Sits between global settings and a row's own launch options in
+        precedence (see launch_env/launch_flags/effective_model) - a row
+        that sets its own override still wins over this.
+        """
+        group = self.metadata.get("groups", {}).get(cwd)
+        if not group:
+            return
+        name = group.get("display_name") or Path(cwd).name or cwd
+        dialog = SessionLaunchOptionsDialog(
+            name,
+            self.settings().get("global_env") or {},
+            group.get("env") or {},
+            self.settings().get("global_flags") or {},
+            group.get("flags") or {},
+            self,
+            scope="this group",
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            env = dialog.env()
+            if env:
+                group["env"] = env
+            else:
+                group.pop("env", None)
+            flags = dialog.flags()
+            if flags:
+                group["flags"] = flags
+            else:
+                group.pop("flags", None)
             write_metadata(self.metadata)
             self.refresh()
 
@@ -4745,7 +4862,7 @@ class SessionHub(QMainWindow):
         return command
 
     def group_env_overrides(self, session_key: str | None) -> dict[str, str]:
-        """Just the env overrides (global + per-session) - no os.environ merge.
+        """Just the env overrides (global + group + per-session) - no os.environ merge.
 
         launch_env returns the full merged environment for Popen's env=
         kwarg, which only reaches the process Session Hub directly spawns.
@@ -4756,13 +4873,14 @@ class SessionHub(QMainWindow):
         launch's use_tmux branch.
         """
         global_env = self.settings().get("global_env") or {}
+        group_env, _ = self.group_launch_options(session_key)
         overrides: dict = {}
         if session_key:
             overrides = (
                 (self.metadata.get("sessions") or {}).get(session_key) or {}
             ).get("env") or {}
         combined: dict[str, str] = {}
-        for source in (global_env, overrides):
+        for source in (global_env, group_env, overrides):
             for name, value in source.items():
                 if str(name).strip():
                     combined[str(name)] = str(value)
