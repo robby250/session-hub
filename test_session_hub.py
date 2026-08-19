@@ -2205,8 +2205,31 @@ class SessionHubTests(unittest.TestCase):
             with patch.object(window, "selected", return_value=group_session):
                 labels = [label for label, _ in window.context_menu_actions()]
             self.assertEqual(
-                labels, ["Manage group…", "Rename group", "Delete group"]
+                labels,
+                [
+                    "Manage group…",
+                    "Group launch options…",
+                    "Rename group",
+                    "Delete group",
+                ],
             )
+        finally:
+            window.close()
+
+    def test_context_menu_group_launch_options_targets_the_right_click_groups_cwd(self):
+        metadata = {"sessions": {}, "settings": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            group_session = session_hub.Session(
+                "Claude", "group:/tmp/vamp", "vamp", "/tmp/vamp", "/tmp/vamp",
+                100, Path("/tmp/vamp"),
+            )
+            with patch.object(window, "selected", return_value=group_session):
+                actions = dict(window.context_menu_actions())
+            with patch.object(window, "edit_group_launch_options") as edit:
+                actions["Group launch options…"]()
+            edit.assert_called_once_with("/tmp/vamp")
         finally:
             window.close()
 

@@ -5823,6 +5823,10 @@ class SessionHub(QMainWindow):
         if target and self.is_group_session(target):
             return [
                 ("Manage group…", self.manage_group),
+                (
+                    "Group launch options…",
+                    lambda: self.edit_group_launch_options(target.cwd),
+                ),
                 ("Rename group", self.rename_group),
                 ("Delete group", self.delete_group),
             ]
