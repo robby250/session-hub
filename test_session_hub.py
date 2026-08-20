@@ -1527,7 +1527,7 @@ class SessionHubTests(unittest.TestCase):
                 '"$1" has-session -t "$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
                 ' "$1" set-option -g set-titles on >/dev/null;'
                 ' "$1" set-option -g set-titles-string "#S" >/dev/null;'
-                ' exec "$5" -- "$1" attach -t "$2"',
+                ' exec "$5" --window -- "$1" attach -t "$2"',
                 "session-hub",
                 "/usr/bin/tmux",
                 "vamp-sonnet1",
@@ -1902,6 +1902,85 @@ class SessionHubTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(metadata.get("links", {}), {})
 
+    def test_resolve_clear_continuations_does_not_discard_an_identified_old_session(self):
+        # Regression (real incident): VAMPULSE-orchestrator's tracked PID's
+        # own session_id was still perfectly valid and still present, but
+        # Vampulse-sonnet1 - a totally unrelated, unnamed sibling in the
+        # same group cwd - had more recent activity of its own, so the old
+        # "most recently updated in this cwd, unclaimed, unnamed" guess won
+        # the max() race even though the tracked session was never gone.
+        # The result: orchestrator's session_id got /clear-linked into
+        # sonnet1's, and every future refresh silently repointed the
+        # orchestrator row at sonnet1's conversation. An old session that's
+        # explicitly named or is a saved group row's own session_key must
+        # never lose that race just for being the less recently active one.
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / "111111.json").write_text(
+                json.dumps({"cwd": "/home/user/vamp", "session_id": "orchestrator-id"})
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "orchestrator-id", "title", "/home/user/vamp",
+                    "/home/user/vamp", 100_000, Path("/tmp/orch.jsonl"),
+                ),
+                session_hub.Session(
+                    "Claude", "sonnet1-id", "title", "/home/user/vamp",
+                    "/home/user/vamp", 999_000, Path("/tmp/sonnet1.jsonl"),
+                ),
+            ]
+            metadata = {
+                "sessions": {"Claude:orchestrator-id": {"name": "VAMPULSE-orchestrator"}}
+            }
+            with (
+                patch("session_hub.PID_DIR", pid_dir),
+                patch("session_hub.process_alive", return_value=True),
+            ):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+        self.assertFalse(changed)
+        self.assertEqual(metadata.get("links", {}), {})
+
+    def test_resolve_clear_continuations_does_not_discard_a_group_rows_own_session(self):
+        # Same incident as above, but identified via a group row's
+        # session_key instead of an explicit metadata["sessions"] name -
+        # this is how a freshly-launched, never-manually-renamed group
+        # member's identity is actually recorded in practice.
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / "111111.json").write_text(
+                json.dumps({"cwd": "/home/user/vamp", "session_id": "orchestrator-id"})
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "orchestrator-id", "title", "/home/user/vamp",
+                    "/home/user/vamp", 100_000, Path("/tmp/orch.jsonl"),
+                ),
+                session_hub.Session(
+                    "Claude", "sonnet1-id", "title", "/home/user/vamp",
+                    "/home/user/vamp", 999_000, Path("/tmp/sonnet1.jsonl"),
+                ),
+            ]
+            metadata = {
+                "groups": {
+                    "/home/user/vamp": {
+                        "cwd": "/home/user/vamp",
+                        "rows": [
+                            {
+                                "name": "VAMPULSE-orchestrator",
+                                "session_key": "Claude:orchestrator-id",
+                            },
+                        ],
+                    }
+                }
+            }
+            with (
+                patch("session_hub.PID_DIR", pid_dir),
+                patch("session_hub.process_alive", return_value=True),
+            ):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+        self.assertFalse(changed)
+        self.assertEqual(metadata.get("links", {}), {})
+
     def test_adopt_untracked_sessions_backfills_tracking_for_live_claude_process(self):
         with tempfile.TemporaryDirectory() as temp:
             proc_root = Path(temp) / "proc"
@@ -2210,6 +2289,7 @@ class SessionHubTests(unittest.TestCase):
                     "Manage group…",
                     "Group launch options…",
                     "Rename group",
+                    "Change directory",
                     "Delete group",
                 ],
             )
@@ -2260,6 +2340,83 @@ class SessionHubTests(unittest.TestCase):
                     window.metadata["groups"]["/tmp/vamp"]["display_name"],
                     "VAMPULSE team",
                 )
+            finally:
+                window.close()
+
+    def test_change_group_directory_rekeys_group_and_overrides_members(self):
+        metadata = {
+            "sessions": {},
+            "settings": {},
+            "groups": {
+                "/tmp/vamp": {
+                    "cwd": "/tmp/vamp",
+                    "rows": [
+                        {"name": "vamp-opus", "override_key": "group:/tmp/vamp#vamp-opus"},
+                        {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"},
+                    ],
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                group_session = session_hub.Session(
+                    "Claude", "group:/tmp/vamp", "vamp", "/tmp/vamp", "/tmp/vamp",
+                    100, Path("/tmp/vamp"),
+                )
+                with (
+                    patch.object(window, "selected", return_value=group_session),
+                    patch(
+                        "session_hub.QFileDialog.getExistingDirectory",
+                        return_value="/tmp/vamp-new",
+                    ),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.change_group_directory()
+                self.assertNotIn("/tmp/vamp", window.metadata["groups"])
+                new_group = window.metadata["groups"]["/tmp/vamp-new"]
+                self.assertEqual(new_group["cwd"], "/tmp/vamp-new")
+                self.assertEqual(
+                    window.metadata["sessions"]["group:/tmp/vamp#vamp-opus"]["cwd"],
+                    "/tmp/vamp-new",
+                )
+                self.assertEqual(
+                    window.metadata["sessions"]["group:/tmp/vamp#vamp-s1"]["cwd"],
+                    "/tmp/vamp-new",
+                )
+            finally:
+                window.close()
+
+    def test_change_group_directory_refuses_when_target_already_a_group(self):
+        metadata = {
+            "sessions": {},
+            "settings": {},
+            "groups": {
+                "/tmp/vamp": {"cwd": "/tmp/vamp", "rows": []},
+                "/tmp/other": {"cwd": "/tmp/other", "rows": []},
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                group_session = session_hub.Session(
+                    "Claude", "group:/tmp/vamp", "vamp", "/tmp/vamp", "/tmp/vamp",
+                    100, Path("/tmp/vamp"),
+                )
+                with (
+                    patch.object(window, "selected", return_value=group_session),
+                    patch(
+                        "session_hub.QFileDialog.getExistingDirectory",
+                        return_value="/tmp/other",
+                    ),
+                    patch("session_hub.QMessageBox.warning") as warning,
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.change_group_directory()
+                warning.assert_called_once()
+                self.assertIn("/tmp/vamp", window.metadata["groups"])
             finally:
                 window.close()
 
@@ -2435,6 +2592,65 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_edit_session_launch_options_offers_tmux_for_an_independent_session(self):
+        # Group members already have their own tmux opt-in (ManageGroupDialog's
+        # "Launch in tmux" checkbox) - this dialog only needs to offer it for
+        # sessions that aren't part of any saved group.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {"sessions": {}, "settings": {}, "groups": {}}
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                session = session_hub.Session(
+                    "Claude", "id-1", "Independent", "/tmp/vamp", "/tmp/vamp",
+                    100, Path("/tmp/a.jsonl"),
+                )
+                dialog_instance = session_hub.SessionLaunchOptionsDialog.__new__(
+                    session_hub.SessionLaunchOptionsDialog
+                )
+                dialog_instance.exec = MagicMock(
+                    return_value=session_hub.QDialog.DialogCode.Accepted
+                )
+                dialog_instance.env = MagicMock(return_value={})
+                dialog_instance.flags = MagicMock(return_value={"--name": "indie"})
+                dialog_instance.tmux = MagicMock(return_value=True)
+                with (
+                    patch(
+                        "session_hub.SessionLaunchOptionsDialog",
+                        return_value=dialog_instance,
+                    ) as dialog_cls,
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.edit_session_launch_options_for(session)
+                self.assertTrue(dialog_cls.call_args.kwargs["show_tmux"])
+                self.assertEqual(
+                    window.metadata["sessions"]["Claude:id-1"]["tmux"], True
+                )
+            finally:
+                window.close()
+
+    def test_resume_session_launches_via_tmux_when_session_opted_in(self):
+        metadata = {
+            "sessions": {
+                "Claude:id-1": {"tmux": True, "flags": {"--name": "indie"}}
+            },
+            "settings": {},
+            "groups": {},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            session = session_hub.Session(
+                "Claude", "id-1", "Independent", "/tmp/vamp", "/tmp/vamp",
+                100, Path("/tmp/a.jsonl"),
+            )
+            with patch.object(window, "launch") as launch:
+                window.resume_session(session)
+            self.assertTrue(launch.call_args.kwargs["use_tmux"])
+            self.assertEqual(launch.call_args.kwargs["tmux_name"], "indie")
+        finally:
+            window.close()
+
     def test_manage_group_dialog_selection_mode_allows_ctrl_click_multi_select(self):
         with tempfile.TemporaryDirectory() as temp:
             metadata = {
@@ -2488,7 +2704,12 @@ class SessionHubTests(unittest.TestCase):
         hub.launch_group_row.assert_called_once_with("/tmp/vamp", "vamp-s1")
         hub.resume_group_row.assert_called_once_with("/tmp/vamp", "vamp-s2")
         hub.refresh.assert_called_once()
-        dialog.reload.assert_called_once()
+        dialog.reload.assert_called_once_with(
+            select_override_keys={
+                "group:/tmp/vamp#vamp-s1",
+                "group:/tmp/vamp#vamp-s2",
+            }
+        )
 
     def test_manage_group_dialog_launch_selected_rows_does_nothing_when_empty(self):
         hub = MagicMock()
@@ -2513,10 +2734,17 @@ class SessionHubTests(unittest.TestCase):
         dialog.hub = hub
         dialog.cwd = "/tmp/vamp"
         dialog.reload = MagicMock()
+        dialog.group = MagicMock(
+            return_value={
+                "rows": [{"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}]
+            }
+        )
         dialog.launch_row("vamp-s1")
         hub.launch_group_row.assert_called_once_with("/tmp/vamp", "vamp-s1")
         hub.refresh.assert_called_once()
-        dialog.reload.assert_called_once()
+        dialog.reload.assert_called_once_with(
+            select_override_keys={"group:/tmp/vamp#vamp-s1"}
+        )
 
     def test_manage_group_dialog_table_disables_double_click_edit(self):
         # Double-click is wired to launch/resume (see launch_or_resume_row) -
@@ -2995,6 +3223,64 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_manage_group_dialog_double_click_keeps_selection_on_the_launched_row(self):
+        # Regression: launching a row changes its "Last updated" timestamp,
+        # which re-sorts the table, and populate_session_table() replaces
+        # every QTableWidgetItem - without reload() reselecting by
+        # override_key, the highlight was left on whatever row ended up in
+        # that visual slot next, not the row the user actually launched.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"},
+                            {"name": "vamp-s2", "override_key": "group:/tmp/vamp#vamp-s2"},
+                        ],
+                    }
+                },
+            }
+            live = session_hub.Session(
+                "Claude", "abc123", "raw title", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/x.jsonl"), agent_name="vamp-s1",
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.claude_sessions", return_value=[live]),
+                    patch("session_hub.session_is_tracked_alive", return_value=False),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                    patch("session_hub.read_metadata", return_value=metadata),
+                ):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                    try:
+                        row_of = {
+                            dialog.table.item(r, 0).data(
+                                session_hub.Qt.ItemDataRole.UserRole + 1
+                            ): r
+                            for r in range(dialog.table.rowCount())
+                        }
+                        index = dialog.table.model().index(
+                            row_of["group:/tmp/vamp#vamp-s1"], 0
+                        )
+                        with patch.object(window, "resume_group_row"):
+                            dialog.launch_or_resume_row(index)
+                        selected_keys = {
+                            dialog.table.item(idx.row(), 0).data(
+                                session_hub.Qt.ItemDataRole.UserRole + 1
+                            )
+                            for idx in dialog.table.selectionModel().selectedRows()
+                        }
+                        self.assertEqual(selected_keys, {"group:/tmp/vamp#vamp-s1"})
+                    finally:
+                        dialog.close()
+            finally:
+                window.close()
+
     def test_launch_group_row_strips_env_when_transcripts_checked(self):
         with tempfile.TemporaryDirectory() as temp:
             metadata = {
@@ -3252,12 +3538,9 @@ class SessionHubTests(unittest.TestCase):
         third = session_hub.suggest_session_name(directory, "sonnet", {first, second})
         self.assertEqual(third, "VAMPULSE-game-sonnet-3")
 
-    def test_new_session_group_dialog_add_remove_rows_and_suggests_names(self):
+    def test_launch_new_group_sessions_dialog_add_remove_rows_and_suggests_names(self):
         with tempfile.TemporaryDirectory() as temp:
-            dialog = session_hub.NewSessionGroupDialog({})
-            dialog.location.setCurrentIndex(dialog.location.findData("existing"))
-            dialog.existing_path.setText(temp)
-            dialog.update_preview()
+            dialog = session_hub.LaunchNewGroupSessionsDialog(temp, set(), False)
             self.assertEqual(dialog.table.rowCount(), 1)
             dialog.add_row()
             self.assertEqual(dialog.table.rowCount(), 2)
@@ -3269,17 +3552,13 @@ class SessionHubTests(unittest.TestCase):
             self.assertEqual(dialog.table.rowCount(), 1)
             dialog.close()
 
-    def test_new_session_group_dialog_tmux_checkbox_carries_into_accept(self):
-        with tempfile.TemporaryDirectory() as temp:
-            dialog = session_hub.NewSessionGroupDialog({})
-            dialog.location.setCurrentIndex(dialog.location.findData("existing"))
-            dialog.existing_path.setText(temp)
-            dialog.update_preview()
-            self.assertFalse(dialog.tmux_checkbox.isChecked())
-            dialog.tmux_checkbox.setChecked(True)
-            dialog.accept()
-            self.assertTrue(dialog.use_tmux)
-            dialog.close()
+    def test_launch_new_group_sessions_dialog_tmux_checkbox_carries_into_accept(self):
+        dialog = session_hub.LaunchNewGroupSessionsDialog("/tmp/vamp", set(), False)
+        self.assertFalse(dialog.tmux_checkbox.isChecked())
+        dialog.tmux_checkbox.setChecked(True)
+        dialog.accept()
+        self.assertTrue(dialog.use_tmux)
+        dialog.close()
 
     def test_manage_group_dialog_tmux_checkbox_persists_to_group(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -3310,53 +3589,51 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_new_session_group_dialog_rejects_duplicate_names(self):
-        with tempfile.TemporaryDirectory() as temp:
-            dialog = session_hub.NewSessionGroupDialog({})
-            dialog.location.setCurrentIndex(dialog.location.findData("existing"))
-            dialog.existing_path.setText(temp)
-            dialog.update_preview()
-            dialog.add_row()
-            name_edit_0 = dialog.table.cellWidget(0, 1)
-            name_edit_1 = dialog.table.cellWidget(1, 1)
-            name_edit_0.setText("same-name")
-            name_edit_0.auto_suggested = False
-            name_edit_1.setText("same-name")
-            name_edit_1.auto_suggested = False
-            with patch("session_hub.QMessageBox.warning") as warning:
-                dialog.accept()
-            warning.assert_called_once()
-            self.assertIsNone(dialog.directory)
-            dialog.close()
+    def test_launch_new_group_sessions_dialog_rejects_duplicate_names(self):
+        dialog = session_hub.LaunchNewGroupSessionsDialog("/tmp/vamp", set(), False)
+        dialog.add_row()
+        name_edit_0 = dialog.table.cellWidget(0, 1)
+        name_edit_1 = dialog.table.cellWidget(1, 1)
+        name_edit_0.setText("same-name")
+        name_edit_0.auto_suggested = False
+        name_edit_1.setText("same-name")
+        name_edit_1.auto_suggested = False
+        with patch("session_hub.QMessageBox.warning") as warning:
+            dialog.accept()
+        warning.assert_called_once()
+        self.assertEqual(dialog.group_rows, [])
+        dialog.close()
 
-    def test_new_session_group_dialog_launches_all_rows_and_saves_group(self):
+    def test_launch_new_group_sessions_dialog_rejects_name_already_in_group(self):
+        dialog = session_hub.LaunchNewGroupSessionsDialog(
+            "/tmp/vamp", {"vampulse-fable"}, False
+        )
+        name_edit = dialog.table.cellWidget(0, 1)
+        name_edit.setText("vampulse-fable")
+        name_edit.auto_suggested = False
+        with patch("session_hub.QMessageBox.warning") as warning:
+            dialog.accept()
+        warning.assert_called_once()
+        self.assertEqual(dialog.group_rows, [])
+        dialog.close()
+
+    def test_launch_new_rows_into_group_launches_all_rows_and_saves_group(self):
         with tempfile.TemporaryDirectory() as temp:
             metadata = {"sessions": {}, "settings": {}}
             with patch("session_hub.read_metadata", return_value=metadata):
                 window = session_hub.SessionHub()
             try:
-                dialog_instance = session_hub.NewSessionGroupDialog.__new__(
-                    session_hub.NewSessionGroupDialog
-                )
-                dialog_instance.directory = Path(temp)
-                dialog_instance.group_rows = [
+                rows = [
                     {"name": "vampulse-fable", "model": "fable"},
                     {"name": "vampulse-sonnet", "model": "sonnet"},
                 ]
-                dialog_instance.use_tmux = False
-                dialog_instance.exec = MagicMock(
-                    return_value=session_hub.QDialog.DialogCode.Accepted
-                )
                 with (
                     patch.object(session_hub.SessionHub, "launch") as launch,
-                    patch(
-                        "session_hub.NewSessionGroupDialog", return_value=dialog_instance
-                    ),
                     patch(
                         "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
                     ),
                 ):
-                    window.launch_new_group()
+                    window.launch_new_rows_into_group(temp, rows, False)
                 self.assertEqual(launch.call_count, 2)
                 for call in launch.call_args_list:
                     self.assertFalse(call.kwargs["focus"])
@@ -3368,7 +3645,7 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_launch_new_group_merges_without_duplicating_existing_rows(self):
+    def test_launch_new_rows_into_group_merges_without_duplicating_existing_rows(self):
         with tempfile.TemporaryDirectory() as temp:
             metadata = {
                 "sessions": {},
@@ -3383,50 +3660,146 @@ class SessionHubTests(unittest.TestCase):
             with patch("session_hub.read_metadata", return_value=metadata):
                 window = session_hub.SessionHub()
             try:
-                dialog_instance = session_hub.NewSessionGroupDialog.__new__(
-                    session_hub.NewSessionGroupDialog
-                )
-                dialog_instance.directory = Path(temp)
-                dialog_instance.group_rows = [
+                rows = [
                     {"name": "vampulse-fable", "model": "fable"},
                     {"name": "vampulse-sonnet", "model": "sonnet"},
                 ]
-                dialog_instance.use_tmux = False
-                dialog_instance.exec = MagicMock(
-                    return_value=session_hub.QDialog.DialogCode.Accepted
-                )
                 with (
                     patch.object(session_hub.SessionHub, "launch"),
-                    patch(
-                        "session_hub.NewSessionGroupDialog", return_value=dialog_instance
-                    ),
                     patch(
                         "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
                     ),
                 ):
-                    window.launch_new_group()
+                    window.launch_new_rows_into_group(temp, rows, False)
                 saved = window.metadata["groups"][temp]
                 self.assertEqual(len(saved["rows"]), 2)
             finally:
                 window.close()
 
-    def test_add_session_to_group_shows_message_when_no_group(self):
-        metadata = {"sessions": {}, "settings": {}}
-        with patch("session_hub.read_metadata", return_value=metadata):
-            window = session_hub.SessionHub()
-        try:
-            session = session_hub.Session(
-                "Claude", "id-1", "title", "/home/user/proj",
-                "/home/user/proj", 100, Path("/tmp/x.jsonl"),
-            )
-            with (
-                patch.object(window, "selected", return_value=session),
-                patch("session_hub.QMessageBox.information") as info,
-            ):
-                window.add_session_to_group()
-            info.assert_called_once()
-        finally:
-            window.close()
+    def test_manage_group_dialog_launch_new_rows_delegates_to_hub(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {"/tmp/vamp": {"cwd": "/tmp/vamp", "rows": []}},
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch(
+                        "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
+                    ),
+                ):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    dialog_instance = MagicMock()
+                    dialog_instance.exec.return_value = (
+                        session_hub.QDialog.DialogCode.Accepted
+                    )
+                    dialog_instance.group_rows = [{"name": "vamp-new", "model": None}]
+                    dialog_instance.use_tmux = True
+                    with (
+                        patch(
+                            "session_hub.LaunchNewGroupSessionsDialog",
+                            return_value=dialog_instance,
+                        ),
+                        patch.object(window, "launch_new_rows_into_group") as launch,
+                    ):
+                        dialog.launch_new_rows()
+                    launch.assert_called_once_with(
+                        "/tmp/vamp", [{"name": "vamp-new", "model": None}], True
+                    )
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
+
+    def test_add_session_to_group_new_group_creates_and_files_no_launch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {"sessions": {}, "settings": {}}
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                session = session_hub.Session(
+                    "Claude", "id-1", "vampulse-orchestrator", "/home/user/proj",
+                    "/home/user/proj", 100, Path("/tmp/x.jsonl"),
+                )
+                dialog_instance = session_hub.MoveToGroupDialog.__new__(
+                    session_hub.MoveToGroupDialog
+                )
+                dialog_instance.cwd = None
+                dialog_instance.new_group_name = "My New Group"
+                dialog_instance.exec = MagicMock(
+                    return_value=session_hub.QDialog.DialogCode.Accepted
+                )
+                with (
+                    patch.object(window, "selected", return_value=session),
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch(
+                        "session_hub.MoveToGroupDialog", return_value=dialog_instance
+                    ),
+                    patch(
+                        "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
+                    ),
+                ):
+                    window.add_session_to_group()
+                launch.assert_not_called()
+                group = window.metadata["groups"]["/home/user/proj"]
+                self.assertEqual(group["display_name"], "My New Group")
+                self.assertEqual(len(group["rows"]), 1)
+                self.assertEqual(group["rows"][0]["name"], "vampulse-orchestrator")
+            finally:
+                window.close()
+
+    def test_add_session_to_group_new_group_reuses_existing_group_at_same_cwd(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/home/user/proj": {
+                        "cwd": "/home/user/proj",
+                        "rows": [{"name": "proj-fable", "model": "fable"}],
+                        "display_name": "Existing",
+                    }
+                },
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                session = session_hub.Session(
+                    "Claude", "id-1", "vampulse-orchestrator", "/home/user/proj",
+                    "/home/user/proj", 100, Path("/tmp/x.jsonl"),
+                )
+                dialog_instance = session_hub.MoveToGroupDialog.__new__(
+                    session_hub.MoveToGroupDialog
+                )
+                dialog_instance.cwd = None
+                dialog_instance.new_group_name = "My New Group"
+                dialog_instance.exec = MagicMock(
+                    return_value=session_hub.QDialog.DialogCode.Accepted
+                )
+                with (
+                    patch.object(window, "selected", return_value=session),
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch(
+                        "session_hub.MoveToGroupDialog", return_value=dialog_instance
+                    ),
+                    patch(
+                        "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
+                    ),
+                    patch("session_hub.QMessageBox.information") as info,
+                ):
+                    window.add_session_to_group()
+                launch.assert_not_called()
+                info.assert_called_once()
+                group = window.metadata["groups"]["/home/user/proj"]
+                self.assertEqual(group["display_name"], "Existing")
+                self.assertEqual(len(group["rows"]), 2)
+            finally:
+                window.close()
 
     def test_add_session_to_group_moves_existing_session_without_launching(self):
         # "Add session to group" on an already-running session must file it
@@ -3550,22 +3923,6 @@ class SessionHubTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_add_group_session_dialog_lists_all_groups_and_preselects_match(self):
-        groups = {
-            "/tmp/vamp": {"cwd": "/tmp/vamp", "rows": [], "display_name": "VAMPULSE"},
-            "/tmp/other": {"cwd": "/tmp/other", "rows": []},
-        }
-        dialog = session_hub.AddGroupSessionDialog(groups, "/tmp/other")
-        try:
-            labels = [
-                dialog.group_combo.itemText(i) for i in range(dialog.group_combo.count())
-            ]
-            self.assertEqual(set(labels), {"VAMPULSE", "other"})
-            self.assertEqual(dialog.group_combo.currentData(), "/tmp/other")
-            self.assertEqual(dialog.directory_label.text(), "/tmp/other")
-        finally:
-            dialog.close()
-
     def test_move_to_group_dialog_lists_all_groups_and_preselects_match(self):
         groups = {
             "/tmp/vamp": {"cwd": "/tmp/vamp", "rows": [], "display_name": "VAMPULSE"},
@@ -3576,11 +3933,56 @@ class SessionHubTests(unittest.TestCase):
             labels = [
                 dialog.group_combo.itemText(i) for i in range(dialog.group_combo.count())
             ]
-            self.assertEqual(set(labels), {"VAMPULSE", "other"})
+            self.assertEqual(set(labels), {"New group…", "VAMPULSE", "other"})
             self.assertEqual(dialog.group_combo.currentData(), "/tmp/other")
             self.assertEqual(dialog.directory_label.text(), "/tmp/other")
             dialog.accept()
             self.assertEqual(dialog.cwd, "/tmp/other")
+        finally:
+            dialog.close()
+
+    def test_move_to_group_dialog_offers_new_group_with_no_groups(self):
+        dialog = session_hub.MoveToGroupDialog({}, None)
+        try:
+            labels = [
+                dialog.group_combo.itemText(i) for i in range(dialog.group_combo.count())
+            ]
+            self.assertEqual(labels, ["New group…"])
+        finally:
+            dialog.close()
+
+    def test_move_to_group_dialog_new_group_prompts_for_a_name(self):
+        dialog = session_hub.MoveToGroupDialog({}, None)
+        try:
+            dialog.group_combo.setCurrentIndex(
+                dialog.group_combo.findData(session_hub.MoveToGroupDialog.NEW_GROUP)
+            )
+            with patch(
+                "session_hub.QInputDialog.getText", return_value=("Workers", True)
+            ):
+                dialog.accept()
+            self.assertEqual(dialog.new_group_name, "Workers")
+            self.assertIsNone(dialog.cwd)
+        finally:
+            dialog.close()
+
+    def test_move_to_group_dialog_new_group_cancelled_stays_open(self):
+        dialog = session_hub.MoveToGroupDialog({}, None)
+        try:
+            dialog.group_combo.setCurrentIndex(
+                dialog.group_combo.findData(session_hub.MoveToGroupDialog.NEW_GROUP)
+            )
+            with (
+                patch(
+                    "session_hub.QInputDialog.getText", return_value=("", False)
+                ),
+                patch.object(
+                    session_hub.QDialog, "accept"
+                ) as base_accept,
+            ):
+                dialog.accept()
+            base_accept.assert_not_called()
+            self.assertIsNone(dialog.new_group_name)
         finally:
             dialog.close()
 
@@ -3631,41 +4033,6 @@ class SessionHubTests(unittest.TestCase):
                 self.assertEqual(
                     len(window.metadata["groups"]["/tmp/vamp"]["rows"]), 1
                 )
-            finally:
-                window.close()
-
-    def test_add_to_group_works_without_a_selected_session(self):
-        with tempfile.TemporaryDirectory() as temp:
-            metadata = {
-                "sessions": {},
-                "settings": {},
-                "groups": {"/tmp/vamp": {"cwd": "/tmp/vamp", "rows": []}},
-            }
-            with patch("session_hub.read_metadata", return_value=metadata):
-                window = session_hub.SessionHub()
-            try:
-                dialog_instance = session_hub.AddGroupSessionDialog.__new__(
-                    session_hub.AddGroupSessionDialog
-                )
-                dialog_instance.row = {"name": "vamp-extra", "model": "opus"}
-                dialog_instance.cwd = "/tmp/vamp"
-                dialog_instance.exec = MagicMock(
-                    return_value=session_hub.QDialog.DialogCode.Accepted
-                )
-                with (
-                    patch.object(window, "selected") as selected,
-                    patch.object(session_hub.SessionHub, "launch") as launch,
-                    patch(
-                        "session_hub.AddGroupSessionDialog",
-                        return_value=dialog_instance,
-                    ),
-                    patch(
-                        "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
-                    ),
-                ):
-                    window.add_to_group()
-                selected.assert_not_called()
-                launch.assert_called_once()
             finally:
                 window.close()
 

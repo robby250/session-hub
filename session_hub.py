@@ -691,6 +691,8 @@ class SessionLaunchOptionsDialog(QDialog):
         flag_overrides: dict,
         parent=None,
         scope: str = "this session",
+        show_tmux: bool = False,
+        tmux_enabled: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Session launch options")
@@ -719,6 +721,18 @@ class SessionLaunchOptionsDialog(QDialog):
             layout.addWidget(inherited)
         self.editor = LaunchOptionsEditor(env_overrides, flag_overrides)
         layout.addWidget(self.editor)
+        self.tmux_checkbox: QCheckBox | None = None
+        if show_tmux:
+            self.tmux_checkbox = QCheckBox("Launch in tmux")
+            self.tmux_checkbox.setToolTip(
+                "Relaunches/resumes this session detached inside a tmux "
+                "session (named to match its --name flag, set in the CLI "
+                "flags tab above), with a terminal attached to it. Requires "
+                "tmux and gnome-terminal, and a --name flag set for this "
+                "session."
+            )
+            self.tmux_checkbox.setChecked(tmux_enabled)
+            layout.addWidget(self.tmux_checkbox)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Cancel
@@ -732,6 +746,9 @@ class SessionLaunchOptionsDialog(QDialog):
 
     def flags(self) -> dict:
         return self.editor.flags()
+
+    def tmux(self) -> bool:
+        return bool(self.tmux_checkbox and self.tmux_checkbox.isChecked())
 
 
 @dataclass
@@ -1603,7 +1620,7 @@ def discover_sessions(metadata: dict) -> list[Session]:
         session.title = custom.get("name") or session.title
         session.cwd = custom.get("cwd") or session.cwd
 
-    # A saved session group (see NewSessionGroupDialog/ManageGroupDialog)
+    # A saved session group (see ManageGroupDialog/LaunchNewGroupSessionsDialog)
     # collapses its launched member sessions into one representative row,
     # the same way a cross-agent link does above - members stay fully
     # intact and reappear on their own once removed from the group.
@@ -1773,13 +1790,18 @@ def tmux_group_launch_command(name: str, cwd: str, claude_args: list[str]) -> li
     # identifies the window, the tmux session and the Claude session.
     # `-g` is a SERVER option, so it does not survive the tmux server dying -- setting it on EVERY
     # launch is deliberate, cheap and idempotent, and beats a ~/.tmux.conf the user has to maintain.
+    # `--window`: without it, gnome-terminal's D-Bus server folds a launch that lands while another
+    # of its windows is still opening into a TAB of that existing window instead of a new one - hit
+    # by ctrl-click-launching two group rows together (VAMPULSE-orchestrator + a worker), where the
+    # window ended up titled for one row while actually attached to the other's tmux session. The
+    # non-tmux path (terminal_command) already forces this for the same reason.
     return [
         "bash",
         "-c",
         '"$1" has-session -t "$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
         ' "$1" set-option -g set-titles on >/dev/null;'
         ' "$1" set-option -g set-titles-string "#S" >/dev/null;'
-        ' exec "$5" -- "$1" attach -t "$2"',
+        ' exec "$5" --window -- "$1" attach -t "$2"',
         "session-hub",
         tmux,
         name,
@@ -2069,19 +2091,41 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
     # moment it happened to be the most recently updated session in a
     # shared cwd - which is the normal state for a session group.
     claimed = {entry["session_id"] for _, entry in tracked if entry.get("session_id")}
+    group_session_keys = set()
     for group in metadata.get("groups", {}).values():
         for row in group.get("rows", []):
             session_key = row.get("session_key") or ""
             if session_key.startswith("Claude:"):
                 claimed.add(session_key[len("Claude:"):])
+                group_session_keys.add(session_key)
 
     session_overrides = metadata.get("sessions", {})
     changed = False
     for tracking_file, entry in tracked:
+        old_session_id = entry.get("session_id")
+        cwd_sessions = by_cwd.get(entry.get("cwd"), [])
+        old_key = f"Claude:{old_session_id}" if old_session_id else None
+        # An already-identified old session - explicitly named, or the
+        # current session_key of a saved group row - must never be treated
+        # as "gone" just because some unrelated, more recently updated
+        # sibling shares its cwd. Mirror of the already-named-sibling guard
+        # below (which stops an unrelated session being absorbed AS a
+        # target): same VAMPULSE-orchestrator incident from the other
+        # direction, where the identified session was discarded AS the
+        # source - orchestrator's session_id was still perfectly valid, it
+        # just lost the "most recently updated in this shared cwd" race to
+        # Vampulse-sonnet1's own, unrelated activity, and got /clear-linked
+        # into sonnet1's session instead of being left alone.
+        if (
+            old_key
+            and any(session.session_id == old_session_id for session in cwd_sessions)
+            and (session_overrides.get(old_key, {}).get("name") or old_key in group_session_keys)
+        ):
+            continue
         candidates = [
             session
-            for session in by_cwd.get(entry.get("cwd"), [])
-            if session.session_id == entry.get("session_id")
+            for session in cwd_sessions
+            if session.session_id == old_session_id
             or (
                 session.session_id not in claimed
                 # A session the user has already explicitly named is a
@@ -2098,7 +2142,6 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
         latest = max(candidates, key=lambda session: session.updated_ms, default=None)
         if not latest:
             continue
-        old_session_id = entry.get("session_id")
         if old_session_id == latest.session_id:
             continue
         if old_session_id is None:
@@ -2114,14 +2157,9 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
                 changed = True
             continue
 
-        old_key = f"Claude:{old_session_id}"
         new_key = latest.native_key
         old_session = next(
-            (
-                s
-                for s in by_cwd.get(entry.get("cwd"), [])
-                if s.session_id == old_session_id
-            ),
+            (s for s in cwd_sessions if s.session_id == old_session_id),
             None,
         )
         old_title = session_overrides.get(old_key, {}).get("name") or (
@@ -2734,76 +2772,32 @@ class NewSessionDialog(QDialog):
         super().accept()
 
 
-class NewSessionGroupDialog(QDialog):
-    """Define a batch of named Claude sessions to launch into one directory.
+class LaunchNewGroupSessionsDialog(QDialog):
+    """Define new named Claude sessions to launch into an already-known group directory.
 
-    For cross-session messaging (e.g. an orchestrator + workers): each row
-    picks a model and a session name (`--name`), auto-suggested but always
-    editable. The whole batch is saved as a group keyed by directory so more
-    sessions can be added to it later via "Add session to group…".
+    Row-table UI only - no directory picker, since the caller (ManageGroupDialog)
+    already knows the group's cwd. Each row picks a model and a session name
+    (`--name`), auto-suggested but always editable.
     """
 
-    def __init__(self, settings: dict, parent=None) -> None:
+    def __init__(
+        self, cwd: str, existing_names: set[str], tmux: bool, parent=None
+    ) -> None:
         super().__init__(parent)
-        self.project_roots = {
-            "primary": Path(
-                settings.get("primary_projects_dir") or HOME / "projects"
-            ).expanduser(),
-            "secondary": (
-                Path(settings["secondary_projects_dir"]).expanduser()
-                if settings.get("secondary_projects_dir")
-                else None
-            ),
-        }
-        self.directory: Path | None = None
-        self.use_tmux: bool = False
-        self.setWindowTitle("New Claude Session Group")
-        self.setMinimumWidth(640)
+        self.cwd = cwd
+        self.existing_names = existing_names
+        self.group_rows: list[dict] = []
+        self.use_tmux: bool = tmux
+        self.setWindowTitle("Launch new sessions")
+        self.setMinimumWidth(560)
         layout = QVBoxLayout(self)
-        form = QFormLayout()
 
-        self.location = QComboBox()
-        self.location.addItem("Home — questions and one-off work", "home")
-        self.location.addItem(
-            f"Primary project — {self.project_roots['primary']}", "primary"
-        )
-        secondary = self.project_roots["secondary"]
-        self.location.addItem(
-            f"Secondary project — {secondary}"
-            if secondary
-            else "Secondary project — configure in Settings",
-            "secondary",
-        )
-        if not secondary:
-            item = self.location.model().item(2)
-            if item is not None:
-                item.setEnabled(False)
-        self.location.addItem("Existing folder…", "existing")
-        self.location.currentIndexChanged.connect(self.update_fields)
-        form.addRow("Location:", self.location)
+        directory_label = QLabel(f"Working directory: {cwd}")
+        directory_label.setWordWrap(True)
+        layout.addWidget(directory_label)
 
-        self.project_name = QLineEdit()
-        self.project_name.setPlaceholderText("project-name")
-        self.project_name.textChanged.connect(self.update_preview)
-        form.addRow("Project name:", self.project_name)
-
-        existing_row = QHBoxLayout()
-        self.existing_path = QLineEdit()
-        self.existing_path.setReadOnly(True)
-        browse = QPushButton("Browse…")
-        browse.clicked.connect(self.browse_existing)
-        existing_row.addWidget(self.existing_path, 1)
-        existing_row.addWidget(browse)
-        self.existing_widget = QWidget()
-        self.existing_widget.setLayout(existing_row)
-        form.addRow("Existing folder:", self.existing_widget)
-        layout.addLayout(form)
-
-        self.preview = QLabel()
-        self.preview.setWordWrap(True)
-        layout.addWidget(self.preview)
-
-        self.tmux_checkbox = QCheckBox("Launch members detached inside tmux")
+        self.tmux_checkbox = QCheckBox("Launch detached inside tmux")
+        self.tmux_checkbox.setChecked(tmux)
         self.tmux_checkbox.setToolTip(
             "Runs each session inside its own tmux session (named to match "
             "--name) instead of directly in a terminal, so tooling can drive "
@@ -2840,49 +2834,12 @@ class NewSessionGroupDialog(QDialog):
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Launch all")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Launch")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
         self.add_row()
-        self.update_fields()
-
-    def location_type(self) -> str:
-        return str(self.location.currentData())
-
-    def update_fields(self) -> None:
-        project = self.location_type() in {"primary", "secondary"}
-        self.project_name.setEnabled(project)
-        self.existing_widget.setEnabled(self.location_type() == "existing")
-        self.update_preview()
-
-    def current_directory(self) -> Path | None:
-        location = self.location_type()
-        if location == "home":
-            return DEFAULT_SESSION_DIR
-        if location in {"primary", "secondary"}:
-            root = self.project_roots[location]
-            name = self.project_name.text().strip()
-            return root / name if root and name else None
-        text = self.existing_path.text()
-        return Path(text) if text else None
-
-    def update_preview(self) -> None:
-        directory = self.current_directory()
-        self.preview.setText(
-            f"Working directory: {directory}" if directory else "Choose a folder."
-        )
-        for row in range(self.table.rowCount()):
-            self.suggest_name(row)
-
-    def browse_existing(self) -> None:
-        directory = QFileDialog.getExistingDirectory(
-            self, "Choose working directory", str(HOME)
-        )
-        if directory:
-            self.existing_path.setText(directory)
-            self.update_preview()
 
     # -- rows ----------------------------------------------------------
     def add_row(self) -> None:
@@ -2910,7 +2867,7 @@ class NewSessionGroupDialog(QDialog):
             self.table.removeRow(row)
 
     def existing_row_names(self, exclude_row: int | None = None) -> set[str]:
-        names = set()
+        names = set(self.existing_names)
         for row in range(self.table.rowCount()):
             if row == exclude_row:
                 continue
@@ -2928,7 +2885,7 @@ class NewSessionGroupDialog(QDialog):
         model_combo = self.table.cellWidget(row, 0)
         alias = model_combo.currentData() if model_combo else None
         suggested = suggest_session_name(
-            self.current_directory(), alias, self.existing_row_names(exclude_row=row)
+            Path(self.cwd), alias, self.existing_row_names(exclude_row=row)
         )
         name_edit.blockSignals(True)
         name_edit.setText(suggested)
@@ -2949,47 +2906,6 @@ class NewSessionGroupDialog(QDialog):
         return result
 
     def accept(self) -> None:
-        location = self.location_type()
-        if location == "home":
-            directory = DEFAULT_SESSION_DIR
-            directory.mkdir(parents=True, exist_ok=True)
-        elif location in {"primary", "secondary"}:
-            name = self.project_name.text().strip()
-            if (
-                not name
-                or name in {".", ".."}
-                or Path(name).name != name
-                or "/" in name
-            ):
-                QMessageBox.warning(
-                    self,
-                    "Invalid project name",
-                    "Enter one folder name without slashes.",
-                )
-                return
-            base = self.project_roots[location]
-            if base is None:
-                QMessageBox.warning(
-                    self,
-                    "Project location not configured",
-                    "Configure the secondary projects folder in Settings first.",
-                )
-                return
-            directory = base / name
-            try:
-                directory.mkdir(parents=True, exist_ok=True)
-            except OSError as error:
-                QMessageBox.critical(self, "Could not create project", str(error))
-                return
-        else:
-            if not self.existing_path.text():
-                QMessageBox.warning(self, "Choose a folder", "Select an existing folder.")
-                return
-            directory = Path(self.existing_path.text())
-        if not directory.is_dir():
-            QMessageBox.warning(self, "Missing folder", f"Folder not found:\n{directory}")
-            return
-
         rows = self.rows()
         if not rows:
             QMessageBox.warning(
@@ -2998,7 +2914,7 @@ class NewSessionGroupDialog(QDialog):
             return
         seen: set[str] = set()
         for row in rows:
-            if row["name"] in seen:
+            if row["name"] in seen or row["name"] in self.existing_names:
                 QMessageBox.warning(
                     self,
                     "Duplicate name",
@@ -3007,7 +2923,6 @@ class NewSessionGroupDialog(QDialog):
                 return
             seen.add(row["name"])
 
-        self.directory = directory
         self.group_rows = rows
         self.use_tmux = self.tmux_checkbox.isChecked()
         super().accept()
@@ -3022,16 +2937,21 @@ class MoveToGroupDialog(QDialog):
     real group, just preselects that row as a convenience.
     """
 
+    NEW_GROUP = "__new__"
+    new_group_name: str | None = None
+
     def __init__(self, groups: dict, initial_cwd: str | None, parent=None) -> None:
         super().__init__(parent)
         self.groups = groups
         self.cwd: str | None = None
+        self.new_group_name: str | None = None
         self.setWindowTitle("Add session to group")
         self.setMinimumWidth(380)
         layout = QVBoxLayout(self)
 
         form = QFormLayout()
         self.group_combo = QComboBox()
+        self.group_combo.addItem("New group…", self.NEW_GROUP)
         for cwd, group in sorted(
             groups.items(),
             key=lambda item: item[1].get("display_name") or Path(item[0]).name or item[0],
@@ -3062,10 +2982,23 @@ class MoveToGroupDialog(QDialog):
         self.on_group_changed()
 
     def on_group_changed(self) -> None:
-        self.directory_label.setText(self.group_combo.currentData() or "")
+        data = self.group_combo.currentData()
+        if data == self.NEW_GROUP:
+            self.directory_label.setText("The session's own working directory")
+        else:
+            self.directory_label.setText(data or "")
 
     def accept(self) -> None:
-        self.cwd = self.group_combo.currentData()
+        data = self.group_combo.currentData()
+        if data == self.NEW_GROUP:
+            name, accepted = QInputDialog.getText(self, "New group", "Group name:")
+            name = name.strip()
+            if not accepted or not name:
+                return
+            self.new_group_name = name
+            self.cwd = None
+        else:
+            self.cwd = data
         super().accept()
 
 
@@ -3304,6 +3237,13 @@ class ManageGroupDialog(QDialog):
         )
         add_session_button.clicked.connect(self.add_existing_session)
         controls.addWidget(add_session_button)
+        launch_new_button = QPushButton("Launch new…")
+        launch_new_button.setToolTip(
+            "Define one or more brand-new named Claude sessions and launch "
+            "them into this group."
+        )
+        launch_new_button.clicked.connect(self.launch_new_rows)
+        controls.addWidget(launch_new_button)
         group_options_button = QPushButton("Group launch options…")
         group_options_button.setToolTip(
             "Env vars and CLI flags applied to every row in this group. "
@@ -3458,7 +3398,16 @@ class ManageGroupDialog(QDialog):
                 return row, match
         return None
 
-    def reload(self) -> None:
+    def reload(self, select_override_keys: set[str] | None = None) -> None:
+        """Repopulate the table, optionally reselecting rows by override_key.
+
+        populate_session_table() replaces every QTableWidgetItem, which
+        drops Qt's selection outright - without `select_override_keys`, a
+        launch/resume click that changes a row's "Last updated" (and so its
+        sorted position) left the highlight sitting on whatever row happened
+        to land in that visual slot next, not the row the user actually
+        launched.
+        """
         group = self.group()
         if not group:
             self.intro.setText("This group no longer exists.")
@@ -3487,6 +3436,11 @@ class ManageGroupDialog(QDialog):
             else:
                 status = "Not started"
             self.table.setItem(index, self.STATUS_COLUMN, QTableWidgetItem(status))
+        if select_override_keys:
+            for row_index in range(self.table.rowCount()):
+                item = self.table.item(row_index, 0)
+                if item and item.data(Qt.ItemDataRole.UserRole + 1) in select_override_keys:
+                    self.table.selectRow(row_index)
 
     def set_transcripts(self, name: str, enabled: bool) -> None:
         group = self.group()
@@ -3506,9 +3460,14 @@ class ManageGroupDialog(QDialog):
         write_metadata(self.hub.metadata)
 
     def launch_row(self, name: str) -> None:
+        group = self.group()
+        override_key = next(
+            (r["override_key"] for r in (group.get("rows", []) if group else []) if r["name"] == name),
+            None,
+        )
         self.hub.launch_group_row(self.cwd, name)
         self.hub.refresh()
-        self.reload()
+        self.reload(select_override_keys={override_key} if override_key else None)
 
     def launch_or_resume_row(self, index) -> None:
         """Double-click a row: launch it if it's never run, resume it if it has.
@@ -3526,7 +3485,7 @@ class ManageGroupDialog(QDialog):
         else:
             self.hub.launch_group_row(self.cwd, row["name"])
         self.hub.refresh()
-        self.reload()
+        self.reload(select_override_keys={row["override_key"]})
 
     def launch_all(self) -> None:
         group = self.group()
@@ -3547,17 +3506,19 @@ class ManageGroupDialog(QDialog):
         table_rows = {index.row() for index in self.table.selectionModel().selectedRows()}
         if not table_rows:
             return
+        override_keys = set()
         for table_row in table_rows:
             pair = self.pair_at_table_row(table_row)
             if pair is None:
                 continue
             row, match = pair
+            override_keys.add(row["override_key"])
             if match:
                 self.hub.resume_group_row(self.cwd, row["name"])
             else:
                 self.hub.launch_group_row(self.cwd, row["name"])
         self.hub.refresh()
-        self.reload()
+        self.reload(select_override_keys=override_keys)
 
     def edit_group_launch_options(self) -> None:
         self.hub.edit_group_launch_options(self.cwd)
@@ -3581,6 +3542,17 @@ class ManageGroupDialog(QDialog):
         if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.session:
             return
         self.hub.file_session_into_group(dialog.session, self.cwd)
+        self.reload()
+
+    def launch_new_rows(self) -> None:
+        group = self.group()
+        existing_names = {row["name"] for row in group.get("rows", [])} if group else set()
+        dialog = LaunchNewGroupSessionsDialog(
+            self.cwd, existing_names, self.tmux_checkbox.isChecked(), self
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.group_rows:
+            return
+        self.hub.launch_new_rows_into_group(self.cwd, dialog.group_rows, dialog.use_tmux)
         self.reload()
 
     def reorder_row(self, source_row: int, target_row: int) -> None:
@@ -4025,15 +3997,6 @@ class SessionHub(QMainWindow):
         new_button = QPushButton("New")
         new_button.clicked.connect(self.launch_selected_provider)
         toolbar.addWidget(new_button)
-
-        new_group_button = QPushButton("New session group…")
-        new_group_button.setToolTip(
-            "Launch several named Claude sessions into one directory at "
-            "once, for cross-session messaging (e.g. an orchestrator + "
-            "workers)."
-        )
-        new_group_button.clicked.connect(self.launch_new_group)
-        toolbar.addWidget(new_group_button)
 
         for label, slot in (
             ("Refresh", self.refresh_all),
@@ -4723,6 +4686,8 @@ class SessionHub(QMainWindow):
             {**(self.settings().get("global_flags") or {}), **group_flags},
             flag_overrides,
             self,
+            show_tmux=not self.is_group_session(session),
+            tmux_enabled=bool(existing.get("tmux")),
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             entry = self.metadata.setdefault("sessions", {}).setdefault(
@@ -4738,6 +4703,10 @@ class SessionHub(QMainWindow):
                 entry["flags"] = flags
             else:
                 entry.pop("flags", None)
+            if dialog.tmux():
+                entry["tmux"] = True
+            else:
+                entry.pop("tmux", None)
             write_metadata(self.metadata)
             self.refresh()
 
@@ -4971,6 +4940,7 @@ class SessionHub(QMainWindow):
         if self.is_group_session(session):
             self.manage_group()
             return
+        overrides = (self.metadata.get("sessions") or {}).get(session.key, {})
         self.launch(
             session.provider,
             session.session_id,
@@ -4985,6 +4955,8 @@ class SessionHub(QMainWindow):
             # transcript saving off.
             strip_env=["CLAUDE_CODE_CHILD_SESSION"],
             wait_for_tracking=wait_for_tracking,
+            use_tmux=bool(overrides.get("tmux")),
+            tmux_name=(overrides.get("flags") or {}).get("--name"),
         )
 
     def resume_session_by_name(
@@ -5077,6 +5049,44 @@ class SessionHub(QMainWindow):
         if not accepted or not new_name:
             return
         group["display_name"] = new_name
+        write_metadata(self.metadata)
+        self.refresh()
+
+    def change_group_directory(self) -> None:
+        """Move a saved group to a new working directory.
+
+        A group's cwd is the literal key of metadata["groups"] (unlike an
+        individual session's cwd, which is just an override) - so this
+        rekeys the group dict itself, then sets the same per-session cwd
+        override on every member row that change_directory_for would set
+        on an individual session. Like that action, this only edits
+        metadata: an already-running member keeps its own real working
+        directory until it's next resumed.
+        """
+        session = self.selected()
+        if not session or not self.is_group_session(session):
+            return
+        groups = self.metadata.get("groups", {})
+        old_cwd = session.cwd
+        group = groups.get(old_cwd)
+        if not group:
+            return
+        start = old_cwd if Path(old_cwd).is_dir() else str(HOME)
+        new_cwd = QFileDialog.getExistingDirectory(self, "Working directory", start)
+        if not new_cwd or new_cwd == old_cwd:
+            return
+        if new_cwd in groups:
+            QMessageBox.warning(
+                self,
+                "Group already exists",
+                f"A group already exists at “{new_cwd}”.",
+            )
+            return
+        group["cwd"] = new_cwd
+        groups[new_cwd] = groups.pop(old_cwd)
+        overrides = self.metadata.setdefault("sessions", {})
+        for row in group.get("rows", []):
+            overrides.setdefault(row["override_key"], {})["cwd"] = new_cwd
         write_metadata(self.metadata)
         self.refresh()
 
@@ -5502,28 +5512,35 @@ class SessionHub(QMainWindow):
     def launch_selected_provider(self) -> None:
         self.launch_new(self.new_provider.currentText())
 
-    def launch_new_group(self) -> None:
-        dialog = NewSessionGroupDialog(self.settings(), self)
-        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.directory:
-            return
-        directory = str(dialog.directory)
+    def launch_new_rows_into_group(
+        self, cwd: str, rows: list[dict], use_tmux: bool
+    ) -> None:
+        """Register and launch each row (`{"name", "model"}`) into the group at `cwd`.
+
+        Skips any name already present in the group - the same merge
+        behavior the removed top-level "New session group…" button had
+        when pointed at an existing directory. Called from
+        ManageGroupDialog's "Launch new…" button (LaunchNewGroupSessionsDialog);
+        the group itself must already exist - creating one happens either
+        via "Add session to group… → New group…" (no launch) or implicitly
+        the first time a session is filed into a not-yet-existing cwd.
+        """
         group = self.metadata.setdefault("groups", {}).setdefault(
-            directory, {"cwd": directory, "rows": []}
+            cwd, {"cwd": cwd, "rows": []}
         )
-        group["tmux"] = dialog.use_tmux
         existing_names = {row["name"] for row in group["rows"]}
-        for row in dialog.group_rows:
+        for row in rows:
             if row["name"] in existing_names:
                 continue
-            registered = self.register_group_row(directory, row["name"], row.get("model"))
+            registered = self.register_group_row(cwd, row["name"], row.get("model"))
             self.launch(
                 "Claude",
                 None,
-                directory,
+                cwd,
                 session_key=registered["override_key"],
                 flag_overrides={"--name": registered["name"]},
                 focus=False,
-                use_tmux=dialog.use_tmux,
+                use_tmux=use_tmux,
             )
             group["rows"].append(registered)
             existing_names.add(registered["name"])
@@ -5626,21 +5643,36 @@ class SessionHub(QMainWindow):
         """File the already-running `session` into a saved group - no launch.
 
         Picks a target group (any of them, not just one matching the
-        session's own cwd - see MoveToGroupDialog), then hands off to
-        file_session_into_group for the actual bookkeeping.
+        session's own cwd - see MoveToGroupDialog), or creates a brand new
+        one named on the spot (keyed by the session's own cwd - a group's
+        directory is its metadata["groups"] key, see change_group_directory),
+        then hands off to file_session_into_group for the actual bookkeeping.
+        Either way nothing gets launched.
         """
-        groups = self.metadata.get("groups", {})
-        if not groups:
-            QMessageBox.information(
-                self,
-                "No groups yet",
-                "Use “New session group…” first to create one.",
-            )
-            return
+        groups = self.metadata.setdefault("groups", {})
         dialog = MoveToGroupDialog(groups, session.cwd, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.cwd:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        self.file_session_into_group(session, dialog.cwd)
+        if dialog.new_group_name is not None:
+            cwd = session.cwd
+            if cwd in groups:
+                QMessageBox.information(
+                    self,
+                    "Group already exists",
+                    f"A group already exists at “{cwd}” - adding "
+                    "the session there instead of creating a new one.",
+                )
+            else:
+                groups[cwd] = {
+                    "cwd": cwd,
+                    "rows": [],
+                    "display_name": dialog.new_group_name,
+                }
+        elif dialog.cwd:
+            cwd = dialog.cwd
+        else:
+            return
+        self.file_session_into_group(session, cwd)
 
     def file_session_into_group(self, session: Session, cwd: str) -> None:
         """Add a row for the already-running `session` to the group at `cwd`.
@@ -5828,6 +5860,7 @@ class SessionHub(QMainWindow):
                     lambda: self.edit_group_launch_options(target.cwd),
                 ),
                 ("Rename group", self.rename_group),
+                ("Change directory", self.change_group_directory),
                 ("Delete group", self.delete_group),
             ]
         settings = self.settings()
