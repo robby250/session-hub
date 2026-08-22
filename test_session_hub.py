@@ -1537,6 +1537,33 @@ class SessionHubTests(unittest.TestCase):
             ],
         )
 
+    def test_rename_group_row_in_renames_row_key_and_bucket(self):
+        metadata = {
+            "sessions": {
+                "group:/tmp/vamp#vamp-sonnet1": {"name": "VAMP-worker1", "flags": {"--effort": "high"}},
+                "Claude:abc": {"name": "vamp-sonnet1"},
+            },
+            "groups": {"/tmp/vamp": {"cwd": "/tmp/vamp", "rows": [
+                {"name": "vamp-sonnet1", "override_key": "group:/tmp/vamp#vamp-sonnet1",
+                 "session_key": "Claude:abc"},
+                {"name": "other", "override_key": "group:/tmp/vamp#other"},
+            ]}},
+        }
+        result = session_hub.rename_group_row_in(metadata, "/tmp/vamp", "vamp-sonnet1", "VAMP-worker1")
+        self.assertEqual(result["status"], "renamed")
+        row = metadata["groups"]["/tmp/vamp"]["rows"][0]
+        self.assertEqual(row["name"], "VAMP-worker1")
+        self.assertEqual(row["override_key"], "group:/tmp/vamp#VAMP-worker1")
+        self.assertEqual(row["session_key"], "Claude:abc")
+        # bucket moved, its stale display name dropped, other fields kept
+        self.assertNotIn("group:/tmp/vamp#vamp-sonnet1", metadata["sessions"])
+        self.assertEqual(metadata["sessions"]["group:/tmp/vamp#VAMP-worker1"],
+                         {"flags": {"--effort": "high"}})
+        # collisions and unknown rows refuse
+        self.assertEqual(session_hub.rename_group_row_in(metadata, "/tmp/vamp", "VAMP-worker1", "other")["status"], "error")
+        self.assertEqual(session_hub.rename_group_row_in(metadata, "/tmp/vamp", "nope", "x")["status"], "error")
+        self.assertEqual(session_hub.rename_group_row_in(metadata, "/tmp/vamp", "other", "other")["status"], "unchanged")
+
     @patch("session_hub.shutil.which", return_value=None)
     def test_tmux_group_launch_command_raises_when_tmux_missing(self, which):
         with self.assertRaises(RuntimeError):

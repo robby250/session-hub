@@ -1531,6 +1531,65 @@ def resolve_pending_handoffs(metadata: dict, sessions: list[Session]) -> bool:
     return changed
 
 
+def rename_group_row_in(metadata: dict, cwd: str, old: str, new: str) -> dict:
+    """Rename a saved group row IN PLACE: the row's name, its override_key, the
+    override bucket under it, and nothing else.
+
+    There is ONE name per row (user 2026-08-22: *"can we make the internal row
+    id also use the display rename?"*). Before this, "Rename" on a group row
+    wrote a display override while row["name"] -- the Claude --name, the tmux
+    session name and therefore the terminal title (set-titles-string "#S") --
+    kept the name the row was created with, so the window bar still read
+    `Vampulse-sonnet2` after the table said `VAMP-worker2`. Matching a row to
+    its live session goes by session_key first (find_group_member_session), so
+    an already-launched row survives the rename; a fresh launch passes the new
+    --name.
+    """
+    new = " ".join(str(new).strip().split())
+    if not new:
+        return {"status": "error", "message": "Row name must not be empty"}
+    group = metadata.get("groups", {}).get(cwd)
+    if not group:
+        return {"status": "error", "message": f"No session group for {cwd}"}
+    rows = group.get("rows", [])
+    row = next((r for r in rows if r["name"] == old), None)
+    if not row:
+        return {"status": "error", "message": f"No row named {old!r} in this group"}
+    if new == old:
+        return {"status": "unchanged", "name": new}
+    if any(r["name"] == new for r in rows):
+        return {"status": "error", "message": f"A row named {new!r} already exists"}
+    old_key = row["override_key"]
+    new_key = f"group:{cwd}#{new}"
+    sessions = metadata.setdefault("sessions", {})
+    bucket = sessions.pop(old_key, None)
+    if bucket is not None:
+        bucket.pop("name", None)   # display name IS the row name now; a stale copy would shadow it
+        if bucket:
+            sessions[new_key] = bucket
+    row["name"] = new
+    row["override_key"] = new_key
+    return {"status": "renamed", "old": old, "name": new}
+
+
+def rename_tmux_session(old: str, new: str) -> bool:
+    """`tmux rename-session old new` if a session called `old` exists; the
+    terminal title follows on its own (set-titles-string "#S"). False when
+    tmux is absent or no such session -- nothing to rename is not an error."""
+    tmux = shutil.which("tmux")
+    if not tmux or old == new:
+        return False
+    try:
+        has = subprocess.run([tmux, "has-session", "-t", old], capture_output=True, timeout=5)
+        if has.returncode != 0:
+            return False
+        done = subprocess.run([tmux, "rename-session", "-t", old, new],
+                              capture_output=True, timeout=5)
+        return done.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def find_group_member_session(
     row: dict, cwd: str, sessions: list[Session]
 ) -> Session | None:
@@ -3607,6 +3666,11 @@ class ManageGroupDialog(QDialog):
                     # resume_group_row is the same tmux-aware path double-
                     # click already uses.
                     slot = lambda n=row["name"]: self.hub.resume_group_row(self.cwd, n)
+                if label == "Rename":
+                    # The ROW is renamed, not a display override layered over
+                    # it -- see rename_group_row_in. One name: table, --name,
+                    # tmux session, terminal title.
+                    slot = lambda n=row["name"]: self.rename_row(n)
                 action = QAction(label, self)
                 action.triggered.connect(slot)
                 menu.addAction(action)
@@ -3615,6 +3679,15 @@ class ManageGroupDialog(QDialog):
         remove_action.triggered.connect(lambda: self.remove_row(row["name"]))
         menu.addAction(remove_action)
         menu.exec(self.table.viewport().mapToGlobal(point))
+        self.reload()
+
+    def rename_row(self, name: str) -> None:
+        new, accepted = QInputDialog.getText(self, "Rename row", "Name:", text=name)
+        if not accepted or not new.strip():
+            return
+        result = self.hub.rename_group_row(self.cwd, name, new)
+        if result["status"] == "error":
+            QMessageBox.warning(self, "Rename row", result["message"])
         self.reload()
 
     def remove_row(self, name: str) -> None:
@@ -5601,6 +5674,17 @@ class SessionHub(QMainWindow):
             use_tmux=group.get("tmux", False),
         )
         return {"status": "launched", "name": name}
+
+    def rename_group_row(self, cwd: str, old: str, new: str) -> dict:
+        """Rename a group row everywhere it is named: metadata (row + override
+        bucket) and the live tmux session, so the terminal title follows.
+        See rename_group_row_in for why there is one name and not two."""
+        result = rename_group_row_in(self.metadata, cwd, old, new)
+        if result["status"] == "renamed":
+            write_metadata(self.metadata)
+            result["tmux_renamed"] = rename_tmux_session(old, result["name"])
+            self.refresh()
+        return result
 
     def resume_group_row(self, cwd: str, name: str) -> dict:
         """Resume a saved group row that already has history.
