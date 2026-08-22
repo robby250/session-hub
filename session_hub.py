@@ -1591,26 +1591,41 @@ def rename_tmux_session(old: str, new: str) -> bool:
 
 
 def find_group_member_session(
-    row: dict, cwd: str, sessions: list[Session]
+    row: dict,
+    cwd: str,
+    sessions: list[Session],
+    exclude_keys: frozenset[str] = frozenset(),
 ) -> Session | None:
-    """The live Claude session a saved group row refers to, if launched.
+    """The live session a saved group row refers to, if launched.
 
-    Checked two ways, in order:
+    Checked in order:
     1. `row["session_key"]` - the native key discover_sessions last saw this row
        matched to, kept alive across a /clear or manual relink because the active
        session's `linked_keys` (from metadata["links"]) still contains it. This is
        what lets a row survive a restart that has no agent-name record at all.
     2. `--name` (Session.agent_name, parsed from the transcript's own agent-name
        record - see _scan_claude_file) plus cwd - the bootstrap match, used before
-       any session_key has been recorded (a row's first launch).
+       any session_key has been recorded (a row's first launch). Claude-only:
+       Codex has no equivalent flag to tag a name onto a fresh launch.
+    3. Codex only, and only for a row this session itself just launched
+       (`row["codex_pending_since"]`, stamped by launch_group_row): the
+       newest live Codex session in this cwd updated since then, not already
+       claimed by a sibling row this same pass (`exclude_keys`). Codex has no
+       exact identity for a brand-new session the way --name/--resume give
+       Claude one, so this is a scoped guess - same risk class
+       adopt_untracked_sessions already accepts for the analogous
+       no-identifying-flags Claude case, narrowed here to only ever fire for
+       a row this session actually just launched, and only until it matches
+       once (session_key then sticks).
     """
+    provider = row.get("provider", "Claude")
     session_key = row.get("session_key")
     if session_key:
         match = next(
             (
                 session
                 for session in sessions
-                if session.provider == "Claude"
+                if session.provider == provider
                 and session.cwd == cwd
                 and (
                     session.native_key == session_key
@@ -1621,16 +1636,33 @@ def find_group_member_session(
         )
         if match:
             return match
-    return next(
-        (
+    if provider == "Claude":
+        return next(
+            (
+                session
+                for session in sessions
+                if session.provider == "Claude"
+                and session.cwd == cwd
+                and session.agent_name == row.get("name")
+            ),
+            None,
+        )
+    if provider == "Codex":
+        pending_since = row.get("codex_pending_since")
+        if not pending_since:
+            return None
+        candidates = [
             session
             for session in sessions
-            if session.provider == "Claude"
+            if session.provider == "Codex"
             and session.cwd == cwd
-            and session.agent_name == row.get("name")
-        ),
-        None,
-    )
+            and session.updated_ms >= pending_since
+            and session.native_key not in exclude_keys
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda session: session.updated_ms)
+    return None
 
 
 def discover_sessions(metadata: dict) -> list[Session]:
@@ -1688,8 +1720,12 @@ def discover_sessions(metadata: dict) -> list[Session]:
     groups_changed = False
     for cwd, group in metadata.setdefault("groups", {}).items():
         max_updated = 0
+        provider_counts: dict[str, int] = {}
         for row in group.get("rows", []):
-            match = find_group_member_session(row, cwd, visible)
+            provider_counts[row.get("provider", "Claude")] = (
+                provider_counts.get(row.get("provider", "Claude"), 0) + 1
+            )
+            match = find_group_member_session(row, cwd, visible, frozenset(group_hidden))
             if match:
                 group_hidden.add(match.native_key)
                 max_updated = max(max_updated, match.updated_ms)
@@ -1697,8 +1733,12 @@ def discover_sessions(metadata: dict) -> list[Session]:
                     row["session_key"] = match.native_key
                     groups_changed = True
         display_name = group.get("display_name") or Path(cwd).name or cwd
+        # The pseudo-session's own provider is cosmetic only (Agent-column
+        # color for the group's summary row) - every real launch/match
+        # already goes through each row's own provider, not this one.
+        pseudo_provider = max(provider_counts, key=provider_counts.get) if provider_counts else "Claude"
         group_pseudo_sessions.append(
-            Session("Claude", f"group:{cwd}", display_name, cwd, cwd, max_updated, Path(cwd))
+            Session(pseudo_provider, f"group:{cwd}", display_name, cwd, cwd, max_updated, Path(cwd))
         )
     if groups_changed:
         write_metadata(metadata)
@@ -2716,11 +2756,18 @@ class NewSessionDialog(QDialog):
         form.addRow("Location:", self.location)
 
         self.model_combo: QComboBox | None = None
+        self.model_edit: QLineEdit | None = None
         if provider == "Claude":
             self.model_combo = QComboBox()
             for label, alias in CLAUDE_MODELS:
                 self.model_combo.addItem(label, alias)
             form.addRow("Model:", self.model_combo)
+        elif provider == "Codex":
+            # No fixed alias list exists for Codex model ids (gpt-5, o3, ...)
+            # the way CLAUDE_MODELS does for Claude, so this is free text.
+            self.model_edit = QLineEdit()
+            self.model_edit.setPlaceholderText("Default (leave blank), or a model id")
+            form.addRow("Model:", self.model_edit)
 
         self.project_name = QLineEdit()
         self.project_name.setPlaceholderText("project-name")
@@ -2828,15 +2875,19 @@ class NewSessionDialog(QDialog):
         self.directory = directory
         if self.model_combo is not None:
             self.model = self.model_combo.currentData()
+        elif self.model_edit is not None:
+            self.model = self.model_edit.text().strip() or None
         super().accept()
 
 
 class LaunchNewGroupSessionsDialog(QDialog):
-    """Define new named Claude sessions to launch into an already-known group directory.
+    """Define new named sessions to launch into an already-known group directory.
 
     Row-table UI only - no directory picker, since the caller (ManageGroupDialog)
-    already knows the group's cwd. Each row picks a model and a session name
-    (`--name`), auto-suggested but always editable.
+    already knows the group's cwd. Each row independently picks a provider
+    (Claude or Codex), a model, and a session name, auto-suggested but always
+    editable. Model is a dropdown for Claude (CLAUDE_MODELS) and free text for
+    Codex - there's no fixed alias list for Codex model ids here.
     """
 
     def __init__(
@@ -2867,13 +2918,16 @@ class LaunchNewGroupSessionsDialog(QDialog):
         layout.addWidget(self.tmux_checkbox)
 
         layout.addWidget(QLabel("Sessions to launch:"))
-        self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["Model", "Name"])
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Provider", "Model", "Name"])
         self.table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents
         )
         self.table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setMinimumHeight(160)
@@ -2904,18 +2958,38 @@ class LaunchNewGroupSessionsDialog(QDialog):
     def add_row(self) -> None:
         row = self.table.rowCount()
         self.table.insertRow(row)
-        model_combo = QComboBox()
-        for label, alias in CLAUDE_MODELS:
-            model_combo.addItem(label, alias)
-        model_combo.setCurrentIndex(1)
+        provider_combo = QComboBox()
+        provider_combo.addItem("Claude", "Claude")
+        provider_combo.addItem("Codex", "Codex")
+        provider_combo.currentIndexChanged.connect(lambda _i, r=row: self.on_provider_changed(r))
+        self.table.setCellWidget(row, 0, provider_combo)
         name_edit = QLineEdit()
         name_edit.auto_suggested = True
         name_edit.textEdited.connect(
             lambda _text, edit=name_edit: setattr(edit, "auto_suggested", False)
         )
-        model_combo.currentIndexChanged.connect(lambda _i, r=row: self.suggest_name(r))
-        self.table.setCellWidget(row, 0, model_combo)
-        self.table.setCellWidget(row, 1, name_edit)
+        self.table.setCellWidget(row, 2, name_edit)
+        self.set_model_widget(row, "Claude")
+        self.suggest_name(row)
+
+    def set_model_widget(self, row: int, provider: str) -> None:
+        if provider == "Claude":
+            model_widget: QComboBox | QLineEdit = QComboBox()
+            for label, alias in CLAUDE_MODELS:
+                model_widget.addItem(label, alias)
+            model_widget.setCurrentIndex(1)
+            model_widget.currentIndexChanged.connect(lambda _i, r=row: self.suggest_name(r))
+        else:
+            # No fixed alias list exists for Codex model ids the way
+            # CLAUDE_MODELS does for Claude, so this is free text.
+            model_widget = QLineEdit()
+            model_widget.setPlaceholderText("Default (leave blank), or a model id")
+        self.table.setCellWidget(row, 1, model_widget)
+
+    def on_provider_changed(self, row: int) -> None:
+        provider_combo = self.table.cellWidget(row, 0)
+        provider = provider_combo.currentData() if provider_combo else "Claude"
+        self.set_model_widget(row, provider)
         self.suggest_name(row)
 
     def remove_selected_rows(self) -> None:
@@ -2930,7 +3004,7 @@ class LaunchNewGroupSessionsDialog(QDialog):
         for row in range(self.table.rowCount()):
             if row == exclude_row:
                 continue
-            edit = self.table.cellWidget(row, 1)
+            edit = self.table.cellWidget(row, 2)
             if edit is not None and edit.text().strip():
                 names.add(edit.text().strip())
         return names
@@ -2938,11 +3012,11 @@ class LaunchNewGroupSessionsDialog(QDialog):
     def suggest_name(self, row: int) -> None:
         if row < 0 or row >= self.table.rowCount():
             return
-        name_edit = self.table.cellWidget(row, 1)
+        name_edit = self.table.cellWidget(row, 2)
         if name_edit is None or not getattr(name_edit, "auto_suggested", True):
             return
-        model_combo = self.table.cellWidget(row, 0)
-        alias = model_combo.currentData() if model_combo else None
+        model_widget = self.table.cellWidget(row, 1)
+        alias = model_widget.currentData() if isinstance(model_widget, QComboBox) else None
         suggested = suggest_session_name(
             Path(self.cwd), alias, self.existing_row_names(exclude_row=row)
         )
@@ -2954,13 +3028,22 @@ class LaunchNewGroupSessionsDialog(QDialog):
     def rows(self) -> list[dict]:
         result = []
         for row in range(self.table.rowCount()):
-            model_combo = self.table.cellWidget(row, 0)
-            name_edit = self.table.cellWidget(row, 1)
+            provider_combo = self.table.cellWidget(row, 0)
+            model_widget = self.table.cellWidget(row, 1)
+            name_edit = self.table.cellWidget(row, 2)
             name = name_edit.text().strip() if name_edit else ""
             if not name:
                 continue
+            if isinstance(model_widget, QComboBox):
+                model = model_widget.currentData()
+            else:
+                model = model_widget.text().strip() or None if model_widget else None
             result.append(
-                {"name": name, "model": model_combo.currentData() if model_combo else None}
+                {
+                    "name": name,
+                    "provider": provider_combo.currentData() if provider_combo else "Claude",
+                    "model": model,
+                }
             )
         return result
 
@@ -3238,9 +3321,9 @@ class ManageGroupDialog(QDialog):
             restore_column_widths(self.table, saved_columns)
         else:
             # Default order: launch status up front (the thing you actually
-            # act on), Agent moved to just before Session ID since every row
-            # here is already known to be Claude. Only applied when there's
-            # no saved order yet - once the user drags one, that wins.
+            # act on), Agent moved to just before Session ID since most
+            # groups are single-provider in practice. Only applied when
+            # there's no saved order yet - once the user drags one, that wins.
             set_default_column_order(
                 self.table,
                 [
@@ -3291,15 +3374,15 @@ class ManageGroupDialog(QDialog):
         controls.addWidget(launch_all)
         add_session_button = QPushButton("Add session…")
         add_session_button.setToolTip(
-            "File an already-running Claude session into this group - no "
-            "new session gets launched."
+            "File an already-running session into this group - no new "
+            "session gets launched."
         )
         add_session_button.clicked.connect(self.add_existing_session)
         controls.addWidget(add_session_button)
         launch_new_button = QPushButton("Launch new…")
         launch_new_button.setToolTip(
-            "Define one or more brand-new named Claude sessions and launch "
-            "them into this group."
+            "Define one or more brand-new named sessions (Claude or Codex) "
+            "and launch them into this group."
         )
         launch_new_button.clicked.connect(self.launch_new_rows)
         controls.addWidget(launch_new_button)
@@ -3355,20 +3438,25 @@ class ManageGroupDialog(QDialog):
         return group
 
     def _migrate_rows(self, group: dict) -> None:
-        """Upgrade rows saved before override_key/live-status existed.
+        """Upgrade rows saved before override_key/live-status/provider existed.
 
         Drops the old sticky `launched` flag (status is now always derived
-        live) and mints an `override_key` for any row that predates it,
-        carrying its old `model` choice into the same env-override mechanism
-        a fresh row uses (see SessionHub.register_group_row).
+        live), mints an `override_key` for any row that predates it (carrying
+        its old `model` choice into the same override mechanism a fresh row
+        uses - see SessionHub.register_group_row), and backfills `provider`
+        as `"Claude"` for any row saved before groups could hold Codex rows
+        too.
         """
         changed = False
         for row in group.get("rows", []):
             if row.pop("launched", None) is not None:
                 changed = True
+            if "provider" not in row:
+                row["provider"] = "Claude"
+                changed = True
             if "override_key" not in row:
                 registered = self.hub.register_group_row(
-                    self.cwd, row["name"], row.pop("model", None)
+                    self.cwd, row["name"], row["provider"], row.pop("model", None)
                 )
                 row["override_key"] = registered["override_key"]
                 changed = True
@@ -3380,8 +3468,9 @@ class ManageGroupDialog(QDialog):
 
         Applies the same per-session title/cwd overrides discover_sessions
         applies - group members are hidden from self.hub.sessions (that's
-        the point of the group-collapsing pass), so this re-derives from raw
-        claude_sessions() rather than reusing that already-filtered list.
+        the point of the group-collapsing pass), so this re-derives from the
+        raw per-provider session lists rather than reusing that already-
+        filtered list.
 
         Checked by override_key first, native key second: "Rename" in this
         dialog's own context menu writes through row_session(), whose .key
@@ -3394,13 +3483,22 @@ class ManageGroupDialog(QDialog):
         group = self.group()
         if not group:
             return []
-        live = claude_sessions()
+        settings = self.hub.settings()
+        live: list[Session] = []
+        if settings.get("enable_claude", True):
+            live += claude_sessions()
+        if settings.get("enable_codex", True):
+            live += codex_sessions()
+        if settings.get("enable_antigravity", True):
+            live += antigravity_sessions()
         overrides = self.hub.metadata.get("sessions", {})
         links = self.hub.metadata.get("links", {})
         pairs = []
+        claimed: set[str] = set()
         for row in group.get("rows", []):
-            match = find_group_member_session(row, self.cwd, live)
+            match = find_group_member_session(row, self.cwd, live, frozenset(claimed))
             if match:
+                claimed.add(match.native_key)
                 row_custom = overrides.get(row["override_key"], {})
                 native_custom = overrides.get(match.key, {})
                 match.title = (
@@ -3429,7 +3527,9 @@ class ManageGroupDialog(QDialog):
 
     def row_session(self, row: dict, match: Session | None) -> Session:
         base = match or Session(
-            "Claude", f"pending:{row['override_key']}", row["name"], self.cwd, self.cwd, 0,
+            row.get("provider", "Claude"),
+            f"pending:{row['override_key']}",
+            row["name"], self.cwd, self.cwd, 0,
             Path(self.cwd),
         )
         return replace(base, logical_key=row["override_key"])
@@ -3702,7 +3802,9 @@ class ManageGroupDialog(QDialog):
             # removed, nothing looks in that bucket anymore - so without this,
             # the session silently reverts to defaults (e.g. loses "launch as
             # opus") the moment it leaves the group.
-            match = find_group_member_session(row, self.cwd, claude_sessions())
+            provider = row.get("provider", "Claude")
+            candidates = claude_sessions() if provider == "Claude" else codex_sessions()
+            match = find_group_member_session(row, self.cwd, candidates)
             if match:
                 overrides = self.hub.metadata.setdefault("sessions", {})
                 row_overrides = overrides.get(row["override_key"], {})
@@ -4528,14 +4630,23 @@ class SessionHub(QMainWindow):
         group = self.metadata.get("groups", {}).get(cwd) or {}
         return group.get("env") or {}, group.get("flags") or {}
 
-    def effective_model(self, session_key: str | None) -> str | None:
-        """The ANTHROPIC_MODEL a session would (re)launch with, if any is set.
+    def effective_model(self, session_key: str | None, provider: str = "Claude") -> str | None:
+        """The model a session would (re)launch with, if any is set.
 
-        Same global-then-group-then-session-override precedence as
-        launch_env, just surfacing the one value rather than merging a whole
-        environment - this is what the Model column (main listview and group
-        dialog alike) displays.
+        Claude resolves through ANTHROPIC_MODEL with the same global-then-
+        group-then-session-override precedence as launch_env - this is what
+        the Model column (main listview and group dialog alike) displays.
+        Other providers have no such env-var mechanism: Codex takes a plain
+        per-row/session "model" override instead (see register_group_row);
+        without a `provider` this used to assume Claude for every row,
+        leaking a Claude-scoped global default onto Codex/Antigravity rows
+        that never asked for one.
         """
+        if provider != "Claude":
+            overrides: dict = {}
+            if session_key:
+                overrides = (self.metadata.get("sessions") or {}).get(session_key) or {}
+            return overrides.get("model") if provider == "Codex" else None
         global_env = self.settings().get("global_env") or {}
         group_env, _ = self.group_launch_options(session_key)
         overrides: dict = {}
@@ -4568,7 +4679,9 @@ class SessionHub(QMainWindow):
                     item = QTableWidgetItem(session.provider)
                     item.setForeground(QColor(colors.get(session.provider, "#ffffff")))
                 elif column == "Model":
-                    item = QTableWidgetItem(self.effective_model(session.key) or "Default")
+                    item = QTableWidgetItem(
+                        self.effective_model(session.key, session.provider) or "Default"
+                    )
                 elif column == "Name":
                     item = QTableWidgetItem(session.title)
                 elif column == "Working directory":
@@ -4876,6 +4989,8 @@ class SessionHub(QMainWindow):
             command += [executable("codex")]
             if self.settings().get("codex_danger_mode", False):
                 command += ["--dangerously-bypass-approvals-and-sandbox"]
+            if model:
+                command += ["-m", model]
             if session_id:
                 command += ["resume", "-C", cwd, session_id]
             else:
@@ -4977,6 +5092,8 @@ class SessionHub(QMainWindow):
                     claude_args = [executable("codex")]
                     if self.settings().get("codex_danger_mode", False):
                         claude_args += ["--dangerously-bypass-approvals-and-sandbox"]
+                    if model:
+                        claude_args += ["-m", model]
                     if session_id:
                         claude_args += ["resume", "-C", cwd, session_id]
                     else:
@@ -5200,7 +5317,14 @@ class SessionHub(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        live_sessions = claude_sessions()
+        settings = self.settings()
+        live_sessions: list[Session] = []
+        if settings.get("enable_claude", True):
+            live_sessions += claude_sessions()
+        if settings.get("enable_codex", True):
+            live_sessions += codex_sessions()
+        if settings.get("enable_antigravity", True):
+            live_sessions += antigravity_sessions()
         failures = []
         for row in group.get("rows", []):
             live = find_group_member_session(row, cwd, live_sessions)
@@ -5606,7 +5730,7 @@ class SessionHub(QMainWindow):
     def launch_new_rows_into_group(
         self, cwd: str, rows: list[dict], use_tmux: bool
     ) -> None:
-        """Register and launch each row (`{"name", "model"}`) into the group at `cwd`.
+        """Register and launch each row (`{"name", "provider", "model"}`) into the group at `cwd`.
 
         Skips any name already present in the group - the same merge
         behavior the removed top-level "New session group…" button had
@@ -5623,11 +5747,15 @@ class SessionHub(QMainWindow):
         for row in rows:
             if row["name"] in existing_names:
                 continue
-            registered = self.register_group_row(cwd, row["name"], row.get("model"))
+            provider = row.get("provider", "Claude")
+            registered = self.register_group_row(cwd, row["name"], provider, row.get("model"))
+            if provider == "Codex":
+                registered["codex_pending_since"] = int(time.time() * 1000)
             self.launch(
-                "Claude",
+                provider,
                 None,
                 cwd,
+                model=row.get("model") if provider == "Codex" else None,
                 session_key=registered["override_key"],
                 flag_overrides={"--name": registered["name"]},
                 focus=False,
@@ -5638,7 +5766,9 @@ class SessionHub(QMainWindow):
         write_metadata(self.metadata)
         self.refresh()
 
-    def register_group_row(self, cwd: str, name: str, model_alias: str | None) -> dict:
+    def register_group_row(
+        self, cwd: str, name: str, provider: str, model_alias: str | None
+    ) -> dict:
         """Build a saved group row, minting its durable override key.
 
         `override_key` is a synthetic session key that exists purely so a
@@ -5650,8 +5780,11 @@ class SessionHub(QMainWindow):
         override_key = f"group:{cwd}#{name}"
         if model_alias:
             entry = self.metadata.setdefault("sessions", {}).setdefault(override_key, {})
-            entry.setdefault("env", {})["ANTHROPIC_MODEL"] = model_alias
-        return {"name": name, "override_key": override_key}
+            if provider == "Claude":
+                entry.setdefault("env", {})["ANTHROPIC_MODEL"] = model_alias
+            elif provider == "Codex":
+                entry["model"] = model_alias
+        return {"name": name, "provider": provider, "override_key": override_key}
 
     def launch_group_row(
         self, cwd: str, name: str, *, wait_for_tracking: bool = False
@@ -5670,6 +5803,7 @@ class SessionHub(QMainWindow):
         row = next((r for r in group.get("rows", []) if r["name"] == name), None)
         if not row:
             return {"status": "error", "message": f"No row named {name!r} in this group"}
+        provider = row.get("provider", "Claude")
         # No session_is_tracked_alive gate here: that "Running" read is only
         # ever as good as PID tracking (untrustworthy for anything not
         # launched directly through Session Hub - a tmux group member's own
@@ -5679,12 +5813,23 @@ class SessionHub(QMainWindow):
         # "Resume in new terminal"/double-click has never gated on this
         # either - always trust the click.
         strip_env = (
-            ["CLAUDE_CODE_CHILD_SESSION"] if row.get("transcripts", True) else None
+            ["CLAUDE_CODE_CHILD_SESSION"]
+            if provider == "Claude" and row.get("transcripts", True)
+            else None
         )
+        if provider == "Codex":
+            # Every launch here starts a fresh (non-resume) process - see
+            # find_group_member_session's third branch - so this needs
+            # re-arming on every launch, not just the first, or a stale
+            # timestamp could let the guess latch onto an old dead session
+            # instead of the one just started.
+            row["codex_pending_since"] = int(time.time() * 1000)
+            write_metadata(self.metadata)
         self.launch(
-            "Claude",
+            provider,
             None,
             cwd,
+            model=self.effective_model(row["override_key"], provider) if provider == "Codex" else None,
             session_key=row["override_key"],
             flag_overrides={"--name": row["name"]},
             strip_env=strip_env,
@@ -5719,13 +5864,15 @@ class SessionHub(QMainWindow):
         row = next((r for r in group.get("rows", []) if r["name"] == name), None)
         if not row:
             return {"status": "error", "message": f"No row named {name!r} in this group"}
-        live = find_group_member_session(row, cwd, claude_sessions())
+        provider = row.get("provider", "Claude")
+        candidates = claude_sessions() if provider == "Claude" else codex_sessions()
+        live = find_group_member_session(row, cwd, candidates)
         if not live:
             return {"status": "error", "message": f"{name!r} has no history to resume"}
         # No session_is_tracked_alive gate: see the matching comment in
         # launch_group_row.
         self.launch(
-            "Claude",
+            provider,
             live.session_id,
             cwd,
             live.source_cwd,

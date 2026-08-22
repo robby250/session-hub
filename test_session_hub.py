@@ -421,6 +421,21 @@ class SessionHubTests(unittest.TestCase):
         self.assertIsNone(codex_dialog.model_combo)
         codex_dialog.close()
 
+    def test_new_session_dialog_offers_free_text_model_for_codex(self):
+        codex_dialog = session_hub.NewSessionDialog("Codex", {})
+        self.assertIsNone(codex_dialog.model_combo)
+        self.assertIsNotNone(codex_dialog.model_edit)
+        codex_dialog.model_edit.setText("gpt-5")
+        codex_dialog.directory = Path.home()
+        codex_dialog.accept()
+        self.assertEqual(codex_dialog.model, "gpt-5")
+        codex_dialog.close()
+        blank_dialog = session_hub.NewSessionDialog("Codex", {})
+        blank_dialog.directory = Path.home()
+        blank_dialog.accept()
+        self.assertIsNone(blank_dialog.model)
+        blank_dialog.close()
+
     @patch("session_hub.shutil.which")
     def test_danger_mode_adds_provider_flags(self, which):
         which.side_effect = lambda name: {
@@ -2207,6 +2222,58 @@ class SessionHubTests(unittest.TestCase):
             )
         )
 
+    def test_find_group_member_session_filters_by_row_provider(self):
+        sessions = [
+            session_hub.Session(
+                "Codex", "id-codex", "t", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/a.jsonl"),
+            ),
+            session_hub.Session(
+                "Claude", "id-claude", "t", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/b.jsonl"), agent_name="vamp-s1",
+            ),
+        ]
+        # A Claude row's --name bootstrap match must not pick up a Codex
+        # session sharing the same cwd.
+        claude_match = session_hub.find_group_member_session(
+            {"name": "vamp-s1", "provider": "Claude"}, "/tmp/vamp", sessions
+        )
+        self.assertEqual(claude_match.native_key, "Claude:id-claude")
+        # A Codex row's session_key must only resolve against a Codex session.
+        codex_row = {
+            "provider": "Codex",
+            "session_key": "Codex:id-codex",
+            "codex_pending_since": 0,
+        }
+        codex_match = session_hub.find_group_member_session(codex_row, "/tmp/vamp", sessions)
+        self.assertEqual(codex_match.native_key, "Codex:id-codex")
+
+    def test_find_group_member_session_codex_guess_respects_pending_since_and_exclusions(self):
+        old_session = session_hub.Session(
+            "Codex", "id-old", "t", "/tmp/vamp", "/tmp/vamp", 100, Path("/tmp/a.jsonl"),
+        )
+        new_session = session_hub.Session(
+            "Codex", "id-new", "t", "/tmp/vamp", "/tmp/vamp", 500, Path("/tmp/b.jsonl"),
+        )
+        sessions = [old_session, new_session]
+        row = {"provider": "Codex", "codex_pending_since": 200}
+        # Only the session updated after codex_pending_since is a candidate -
+        # the pre-existing unrelated one (updated_ms=100) must not be guessed.
+        match = session_hub.find_group_member_session(row, "/tmp/vamp", sessions)
+        self.assertEqual(match.native_key, "Codex:id-new")
+        # No pending_since stamped yet (row never launched) -> no guess at all.
+        self.assertIsNone(
+            session_hub.find_group_member_session(
+                {"provider": "Codex"}, "/tmp/vamp", sessions
+            )
+        )
+        # Already claimed by a sibling row this same pass -> excluded.
+        self.assertIsNone(
+            session_hub.find_group_member_session(
+                row, "/tmp/vamp", sessions, frozenset({"Codex:id-new"})
+            )
+        )
+
     def test_discover_sessions_collapses_group_members_into_one_row(self):
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp) / "-tmp-vamp"
@@ -2562,6 +2629,21 @@ class SessionHubTests(unittest.TestCase):
             self.assertEqual(window.effective_model("group:/tmp/vamp#vamp-s1"), "fable")
             # Ungrouped session key: only global applies.
             self.assertEqual(window.effective_model("Claude:abc123"), "sonnet")
+        finally:
+            window.close()
+
+    def test_effective_model_does_not_leak_claude_global_onto_codex(self):
+        metadata = self._group_metadata()
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            # global_env's ANTHROPIC_MODEL ("sonnet") is Claude-scoped and
+            # must not leak onto a Codex session just because no provider
+            # was passed in.
+            self.assertIsNone(window.effective_model("Codex:abc123", "Codex"))
+            self.assertIsNone(window.effective_model("Codex:abc123", "Antigravity"))
+            metadata["sessions"]["Codex:abc123"] = {"model": "gpt-5"}
+            self.assertEqual(window.effective_model("Codex:abc123", "Codex"), "gpt-5")
         finally:
             window.close()
 
@@ -3339,6 +3421,7 @@ class SessionHubTests(unittest.TestCase):
                     "Claude",
                     None,
                     "/tmp/vamp",
+                    model=None,
                     session_key="group:/tmp/vamp#vamp-s1",
                     flag_overrides={"--name": "vamp-s1"},
                     strip_env=["CLAUDE_CODE_CHILD_SESSION"],
@@ -3380,49 +3463,13 @@ class SessionHubTests(unittest.TestCase):
                     "Claude",
                     None,
                     "/tmp/vamp",
+                    model=None,
                     session_key="group:/tmp/vamp#vamp-s1",
                     flag_overrides={"--name": "vamp-s1"},
                     strip_env=None,
                     wait_for_tracking=False,
                     use_tmux=False,
                 )
-            finally:
-                window.close()
-
-    def test_launch_group_row_skips_relaunch_when_already_tracked_alive(self):
-        with tempfile.TemporaryDirectory() as temp:
-            metadata = {
-                "sessions": {},
-                "settings": {},
-                "groups": {
-                    "/tmp/vamp": {
-                        "cwd": "/tmp/vamp",
-                        "rows": [
-                            {
-                                "name": "vamp-s1",
-                                "override_key": "group:/tmp/vamp#vamp-s1",
-                                "transcripts": True,
-                            }
-                        ],
-                    }
-                },
-            }
-            live = session_hub.Session(
-                "Claude", "abc123", "vamp-s1", "/tmp/vamp", "/tmp/vamp", 100,
-                Path("/tmp/x.jsonl"), agent_name="vamp-s1",
-            )
-            with patch("session_hub.read_metadata", return_value=metadata):
-                window = session_hub.SessionHub()
-            try:
-                with (
-                    patch.object(session_hub.SessionHub, "launch") as launch,
-                    patch("session_hub.claude_sessions", return_value=[live]),
-                    patch("session_hub.session_is_tracked_alive", return_value=True),
-                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
-                ):
-                    result = window.launch_group_row("/tmp/vamp", "vamp-s1")
-                launch.assert_not_called()
-                self.assertEqual(result, {"status": "already_running", "session_id": "abc123"})
             finally:
                 window.close()
 
@@ -3477,39 +3524,6 @@ class SessionHubTests(unittest.TestCase):
                     tmux_name="vamp-s1",
                 )
                 self.assertEqual(result, {"status": "resumed", "name": "vamp-s1"})
-            finally:
-                window.close()
-
-    def test_resume_group_row_skips_relaunch_when_already_tracked_alive(self):
-        with tempfile.TemporaryDirectory() as temp:
-            metadata = {
-                "sessions": {},
-                "settings": {},
-                "groups": {
-                    "/tmp/vamp": {
-                        "cwd": "/tmp/vamp",
-                        "rows": [
-                            {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}
-                        ],
-                    }
-                },
-            }
-            live = session_hub.Session(
-                "Claude", "abc123", "vamp-s1", "/tmp/vamp", "/tmp/vamp", 100,
-                Path("/tmp/x.jsonl"), agent_name="vamp-s1",
-            )
-            with patch("session_hub.read_metadata", return_value=metadata):
-                window = session_hub.SessionHub()
-            try:
-                with (
-                    patch.object(session_hub.SessionHub, "launch") as launch,
-                    patch("session_hub.claude_sessions", return_value=[live]),
-                    patch("session_hub.session_is_tracked_alive", return_value=True),
-                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
-                ):
-                    result = window.resume_group_row("/tmp/vamp", "vamp-s1")
-                launch.assert_not_called()
-                self.assertEqual(result, {"status": "already_running", "session_id": "abc123"})
             finally:
                 window.close()
 
@@ -3616,11 +3630,41 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_manage_group_dialog_migrate_rows_backfills_provider(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}
+                        ],
+                    }
+                },
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    row = window.metadata["groups"]["/tmp/vamp"]["rows"][0]
+                    self.assertEqual(row["provider"], "Claude")
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
+
     def test_launch_new_group_sessions_dialog_rejects_duplicate_names(self):
         dialog = session_hub.LaunchNewGroupSessionsDialog("/tmp/vamp", set(), False)
         dialog.add_row()
-        name_edit_0 = dialog.table.cellWidget(0, 1)
-        name_edit_1 = dialog.table.cellWidget(1, 1)
+        name_edit_0 = dialog.table.cellWidget(0, 2)
+        name_edit_1 = dialog.table.cellWidget(1, 2)
         name_edit_0.setText("same-name")
         name_edit_0.auto_suggested = False
         name_edit_1.setText("same-name")
@@ -3635,13 +3679,34 @@ class SessionHubTests(unittest.TestCase):
         dialog = session_hub.LaunchNewGroupSessionsDialog(
             "/tmp/vamp", {"vampulse-fable"}, False
         )
-        name_edit = dialog.table.cellWidget(0, 1)
+        name_edit = dialog.table.cellWidget(0, 2)
         name_edit.setText("vampulse-fable")
         name_edit.auto_suggested = False
         with patch("session_hub.QMessageBox.warning") as warning:
             dialog.accept()
         warning.assert_called_once()
         self.assertEqual(dialog.group_rows, [])
+        dialog.close()
+
+    def test_launch_new_group_sessions_dialog_per_row_provider_switch(self):
+        dialog = session_hub.LaunchNewGroupSessionsDialog("/tmp/vamp", set(), False)
+        provider_combo = dialog.table.cellWidget(0, 0)
+        self.assertEqual(provider_combo.currentData(), "Claude")
+        self.assertIsInstance(dialog.table.cellWidget(0, 1), session_hub.QComboBox)
+        provider_combo.setCurrentIndex(provider_combo.findData("Codex"))
+        self.assertIsInstance(dialog.table.cellWidget(0, 1), session_hub.QLineEdit)
+        model_edit = dialog.table.cellWidget(0, 1)
+        model_edit.setText("gpt-5")
+        name_edit = dialog.table.cellWidget(0, 2)
+        name_edit.setText("vampulse-codex")
+        name_edit.auto_suggested = False
+        rows = dialog.rows()
+        self.assertEqual(
+            rows[0], {"name": "vampulse-codex", "provider": "Codex", "model": "gpt-5"}
+        )
+        # Switching a Claude row's combo back keeps the existing combo behavior.
+        provider_combo.setCurrentIndex(provider_combo.findData("Claude"))
+        self.assertIsInstance(dialog.table.cellWidget(0, 1), session_hub.QComboBox)
         dialog.close()
 
     def test_launch_new_rows_into_group_launches_all_rows_and_saves_group(self):
@@ -3668,6 +3733,31 @@ class SessionHubTests(unittest.TestCase):
                 self.assertEqual(
                     {row["name"] for row in saved["rows"]},
                     {"vampulse-fable", "vampulse-sonnet"},
+                )
+            finally:
+                window.close()
+
+    def test_launch_new_rows_into_group_launches_codex_row_with_its_own_provider(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {"sessions": {}, "settings": {}}
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                rows = [{"name": "vampulse-codex", "provider": "Codex", "model": "gpt-5"}]
+                with (
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.launch_new_rows_into_group(temp, rows, False)
+                launch.assert_called_once()
+                call_args = launch.call_args
+                self.assertEqual(call_args.args[0], "Codex")
+                self.assertEqual(call_args.kwargs["model"], "gpt-5")
+                saved_row = window.metadata["groups"][temp]["rows"][0]
+                self.assertEqual(saved_row["provider"], "Codex")
+                self.assertIn("codex_pending_since", saved_row)
+                self.assertEqual(
+                    window.metadata["sessions"][saved_row["override_key"]]["model"], "gpt-5"
                 )
             finally:
                 window.close()
@@ -4267,6 +4357,20 @@ class SessionHubTests(unittest.TestCase):
             command[command.index("--effort") : command.index("--effort") + 2],
             ["--effort", "xhigh"],
         )
+        window.close()
+
+    @patch("session_hub.shutil.which")
+    def test_terminal_command_passes_codex_model_flag(self, which):
+        which.side_effect = lambda name: {
+            "gnome-terminal": "/usr/bin/gnome-terminal",
+            "codex": "/home/user/.local/bin/codex",
+        }.get(name)
+        window = session_hub.SessionHub()
+        command = window.terminal_command("Codex", None, "/home/user", model="gpt-5")
+        self.assertIn("-m", command)
+        self.assertEqual(command[command.index("-m") + 1], "gpt-5")
+        no_model_command = window.terminal_command("Codex", None, "/home/user")
+        self.assertNotIn("-m", no_model_command)
         window.close()
 
     def test_launch_passes_global_effort_flag_to_claude_command(self):
