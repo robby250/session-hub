@@ -4959,7 +4959,7 @@ class SessionHub(QMainWindow):
                 if provider == "Claude"
                 else []
             )
-            if use_tmux and provider == "Claude":
+            if use_tmux and provider in ("Claude", "Codex"):
                 # tmux_name, not flag_overrides["--name"]: resuming a group
                 # row (session_id set) never passes --name at all - Claude
                 # already knows which conversation to continue via --resume,
@@ -4968,14 +4968,28 @@ class SessionHub(QMainWindow):
                 name = tmux_name or (flag_overrides or {}).get("--name")
                 if not name:
                     raise RuntimeError("Launching into tmux requires a session name.")
-                claude_args = [executable("claude")]
-                if self.settings().get("claude_danger_mode", False):
-                    claude_args += ["--dangerously-skip-permissions"]
-                if model:
-                    claude_args += ["--model", model]
-                claude_args += flags
-                if session_id:
-                    claude_args += ["--resume", session_id]
+                if provider == "Codex":
+                    # Codex has no --name; the tmux session name IS its address
+                    # (VAMPULSE peers reach it with `session_ctl.py send <name>`).
+                    # Before 2026-08-23 this branch was Claude-only, so a Codex
+                    # row with "Launch in tmux" checked silently fell through to a
+                    # plain gnome-terminal and tmux could not see it.
+                    claude_args = [executable("codex")]
+                    if self.settings().get("codex_danger_mode", False):
+                        claude_args += ["--dangerously-bypass-approvals-and-sandbox"]
+                    if session_id:
+                        claude_args += ["resume", "-C", cwd, session_id]
+                    else:
+                        claude_args += ["-C", cwd]
+                else:
+                    claude_args = [executable("claude")]
+                    if self.settings().get("claude_danger_mode", False):
+                        claude_args += ["--dangerously-skip-permissions"]
+                    if model:
+                        claude_args += ["--model", model]
+                    claude_args += flags
+                    if session_id:
+                        claude_args += ["--resume", session_id]
                 claude_args = prefix_env_command(
                     claude_args, self.group_env_overrides(session_key), strip_env
                 )
@@ -5029,7 +5043,11 @@ class SessionHub(QMainWindow):
             strip_env=["CLAUDE_CODE_CHILD_SESSION"],
             wait_for_tracking=wait_for_tracking,
             use_tmux=bool(overrides.get("tmux")),
-            tmux_name=(overrides.get("flags") or {}).get("--name"),
+            # --name is Claude-only; a Codex row's address is its display name
+            # (the Hub rename, e.g. VAMP-worker4), else the session title.
+            tmux_name=(overrides.get("flags") or {}).get("--name")
+            or overrides.get("name")
+            or session.title,
         )
 
     def resume_session_by_name(
