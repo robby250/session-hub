@@ -1396,7 +1396,15 @@ def codex_sessions() -> list[Session]:
             with sqlite3.connect(uri, uri=True) as db:
                 rows = db.execute(
                     "SELECT id, title, cwd, updated_at_ms, rollout_path "
-                    "FROM threads ORDER BY updated_at_ms DESC"
+                    # A subagent thread (thread_source='subagent') is spawned
+                    # BY another Codex session's own turn, not launchable or
+                    # resumable on its own - `codex resume <id>` on one exits
+                    # immediately. Excluding it here is the only place that
+                    # matters: every session picker/linker in the app reads
+                    # from this list, so a subagent thread never looks like
+                    # an ordinary standalone session to link or launch.
+                    "FROM threads WHERE thread_source IS NOT 'subagent' "
+                    "ORDER BY updated_at_ms DESC"
                 ).fetchall()
             for session_id, title, cwd, updated_ms, rollout_path in rows:
                 path = Path(rollout_path)
@@ -1422,6 +1430,11 @@ def codex_sessions() -> list[Session]:
         try:
             first = json.loads(path.open(encoding="utf-8", errors="replace").readline())
             payload = first.get("payload", {})
+            # Same subagent-thread exclusion as the sqlite path above, for
+            # when CODEX_STATE is missing/unreadable and this raw-rollout
+            # scan is the only source of Codex sessions.
+            if isinstance(payload.get("source"), dict) and "subagent" in payload["source"]:
+                continue
             session_id = payload.get("id") or path.stem.rsplit("-", 5)[-1]
             sessions.append(
                 Session(
