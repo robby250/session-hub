@@ -5575,7 +5575,7 @@ class SessionHub(QMainWindow):
         initial_prompt: str | None = None,
     ) -> list[str]:
         title = f"{provider} — {Path(cwd).name or cwd}"
-        launch_cwd = source_cwd if provider == "Claude" and session_id else cwd
+        launch_cwd = source_cwd if provider in ("Claude", "Codex") and session_id else cwd
         launch_cwd = launch_cwd or cwd
         terminal = shutil.which("gnome-terminal")
         if not terminal:
@@ -5603,7 +5603,14 @@ class SessionHub(QMainWindow):
             if reasoning_effort:
                 command += ["-c", f"model_reasoning_effort={reasoning_effort}"]
             if session_id:
-                command += ["resume", "-C", cwd, session_id]
+                # launch_cwd (the session's own source_cwd when known), not
+                # cwd: `codex resume -C <dir>` silently FORKS into a new
+                # near-empty thread rather than erroring when <dir> differs
+                # from the session's actual root - see the matching comment
+                # in launch()'s tmux branch, which hits the identical issue.
+                command += ["resume", "-C", launch_cwd, session_id]
+                if Path(launch_cwd) != Path(cwd):
+                    command += [f"/cd {cwd}"]
             else:
                 command += ["-C", cwd]
             if initial_prompt:
@@ -5716,7 +5723,18 @@ class SessionHub(QMainWindow):
                     if reasoning_effort:
                         claude_args += ["-c", f"model_reasoning_effort={reasoning_effort}"]
                     if session_id:
-                        claude_args += ["resume", "-C", cwd, session_id]
+                        # source_cwd, not cwd: `codex resume -C <dir>` silently
+                        # FORKS into a brand-new near-empty thread instead of
+                        # erroring when <dir> differs from the session's own
+                        # root (observed directly - a cwd-drifted group row,
+                        # e.g. one that cd'd into a worktree, forked twice and
+                        # died with no visible output under tmux). Resuming in
+                        # the session's actual directory avoids triggering
+                        # that fork at all - same reasoning terminal_command's
+                        # Claude branch already applies via its own launch_cwd.
+                        claude_args += ["resume", "-C", source_cwd or cwd, session_id]
+                        if source_cwd and Path(source_cwd) != Path(cwd):
+                            claude_args += [f"/cd {cwd}"]
                     else:
                         claude_args += ["-C", cwd]
                     if initial_prompt:
