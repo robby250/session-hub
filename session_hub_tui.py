@@ -18,9 +18,19 @@ from pathlib import Path
 
 from textual import work
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label, TabbedContent, TabPane
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    ProgressBar,
+    TabbedContent,
+    TabPane,
+)
 
 SESSION_HUB = Path(__file__).resolve().parent / "session_hub.py"
 
@@ -43,6 +53,10 @@ def run_cli(args: list[str], *, offscreen: bool = False) -> dict:
 
 def sessions_json() -> dict:
     return run_cli(["--sessions-json"])
+
+
+def usage_json() -> dict:
+    return run_cli(["--usage-json"])
 
 
 def launch_group_row(cwd: str, name: str) -> dict:
@@ -296,9 +310,74 @@ class RunningPane(Vertical):
         self.refresh_data()
 
 
-class SessionHubTUI(App):
-    """Two tabs: All Sessions (mirrors the GUI main table) and Running (mirrors the GUI's new tab)."""
+class UsagePane(VerticalScroll):
+    """Per-provider usage bars - same data and layout logic as the GUI's usage
+    panel (SessionHub.usage_loaded), stacked in one column instead of the
+    GUI's side-by-side columns: there's plenty of vertical room on a phone
+    and none to spare horizontally.
+    """
 
+    BINDINGS = [("r", "refresh", "Refresh")]
+    PROVIDERS = ("Codex", "Claude", "Antigravity")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.data: dict = {}
+
+    def compose(self) -> ComposeResult:
+        yield Label("Loading usage…", id="usage-status")
+
+    def on_mount(self) -> None:
+        self.refresh_data()
+
+    def action_refresh(self) -> None:
+        self.refresh_data()
+
+    @work(exclusive=True)
+    async def refresh_data(self) -> None:
+        await self.remove_children()
+        await self.mount(Label("Loading usage…", id="usage-status"))
+        self.data = await asyncio.to_thread(usage_json)
+        await self.rebuild()
+
+    async def rebuild(self) -> None:
+        await self.remove_children()
+        mounted_any = False
+        for provider in self.PROVIDERS:
+            info = self.data.get(provider)
+            if not info:
+                continue
+            mounted_any = True
+            banked = info.get("banked")
+            title = f"[b]{provider} usage[/b]"
+            if banked:
+                title += f" · {banked} banked reset{'' if banked == 1 else 's'} available"
+            await self.mount(Label(title, classes="usage-header"))
+            if info.get("error"):
+                await self.mount(Label(f"Unavailable: {info['error']}", classes="usage-detail"))
+                continue
+            for window in info.get("windows", []):
+                remaining = 100 - window["used_percent"]
+                await self.mount(Label(f"{window['name']} — {remaining}% left ({window['used_percent']}% used)"))
+                bar = ProgressBar(total=100, show_eta=False)
+                await self.mount(bar)
+                bar.progress = remaining
+                detail = window["resets"]
+                if window.get("pace"):
+                    detail += f"\n{window['pace']}"
+                await self.mount(Label(detail, classes="usage-detail"))
+        if not mounted_any:
+            await self.mount(Label("No usage data (all providers disabled in Settings?)"))
+
+
+class SessionHubTUI(App):
+    """Three tabs: All Sessions and Running (mirroring the GUI's two tabs),
+    plus Usage (mirroring the GUI's usage panel)."""
+
+    CSS = """
+    .usage-header { margin-top: 1; }
+    .usage-detail { color: $text-muted; margin-bottom: 1; }
+    """
     TITLE = "Session Hub"
     BINDINGS = [("q", "quit", "Quit")]
 
@@ -309,6 +388,8 @@ class SessionHubTUI(App):
                 yield MainPane()
             with TabPane("Running", id="running"):
                 yield RunningPane()
+            with TabPane("Usage", id="usage"):
+                yield UsagePane()
         yield Footer()
 
 

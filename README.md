@@ -59,9 +59,10 @@ available for use over SSH — e.g. from a phone via [Terminus](https://termius.
 session-hub-tui
 ```
 
-It mirrors the desktop app's main session list plus a flat "Running" tab (tmux-launched rows only),
-each session with Attach/Launch/Stop. Selecting a running session hands off to `tmux attach` directly
-— detaching (`Ctrl-b d`) ends the SSH connection; reconnect to see the menu again.
+It mirrors the desktop app: a main session list, a flat "Running" tab (tmux-launched rows only) with
+Attach/Launch/Stop, and a "Usage" tab with the same Codex/Claude/Antigravity usage bars as the desktop
+panel, stacked in one column. Selecting a running session hands off to `tmux attach` directly —
+detaching (`Ctrl-b d`) ends the SSH connection; reconnect to see the menu again.
 
 Session Hub metadata and recoverable trash are stored in
 `~/.local/share/session-hub/`.

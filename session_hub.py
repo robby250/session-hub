@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import concurrent.futures
 import hashlib
 import fcntl
 import os
@@ -6788,6 +6789,67 @@ def sessions_json_cli() -> int:
     return 0
 
 
+def usage_json_cli() -> int:
+    """Headless `--usage-json`: the same per-provider usage the GUI's usage
+    panel shows, fetched with the same three reader functions
+    (UsageWorker.run's providers), run concurrently so the whole call takes
+    as long as the slowest single provider, not the sum of all three.
+    """
+    metadata = read_metadata()
+    settings = metadata.get("settings", {})
+    readers = {
+        "Codex": read_codex_usage,
+        "Claude": read_claude_usage,
+        "Antigravity": read_antigravity_usage,
+    }
+    enabled = {
+        provider: reader
+        for provider, reader in readers.items()
+        if settings.get(f"enable_{provider.lower()}", True)
+    }
+    fetched: dict[str, tuple[list, str]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(enabled) or 1) as pool:
+        futures = {pool.submit(reader): provider for provider, reader in enabled.items()}
+        for future in concurrent.futures.as_completed(futures):
+            provider = futures[future]
+            try:
+                fetched[provider] = (future.result(), "")
+            except Exception as error:
+                fetched[provider] = ([], str(error))
+
+    result = {}
+    for provider, (windows, error) in fetched.items():
+        if error:
+            result[provider] = {"error": error}
+            continue
+        if windows and isinstance(windows[0], UsageActivity):
+            result[provider] = {
+                "activity": [
+                    {"label": item.label, "requests": item.requests, "sessions": item.sessions}
+                    for item in windows
+                ]
+            }
+            continue
+        banked = next(
+            (w for w in windows if w is not None and w.count is not None), None
+        )
+        result[provider] = {
+            "banked": banked.count if banked else None,
+            "windows": [
+                {
+                    "name": w.name,
+                    "used_percent": w.used_percent,
+                    "resets": w.resets,
+                    "pace": usage_pace_text(w),
+                }
+                for w in windows
+                if w is not None and w.count is None
+            ],
+        }
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def stop_group_row_cli(argv: list[str]) -> int:
     """Headless `--stop-group-row <cwd> <name>`, the TUI's Stop action.
 
@@ -6870,6 +6932,8 @@ def main() -> int:
         return diagnostic()
     if "--sessions-json" in sys.argv:
         return sessions_json_cli()
+    if "--usage-json" in sys.argv:
+        return usage_json_cli()
     if "--stop-group-row" in sys.argv:
         return stop_group_row_cli(sys.argv)
     if "--launch-group-row" in sys.argv:
