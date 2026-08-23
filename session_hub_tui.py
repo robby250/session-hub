@@ -69,6 +69,10 @@ def stop_group_row(cwd: str, name: str) -> dict:
     return run_cli(["--stop-group-row", cwd, name])
 
 
+def stop_session(key: str) -> dict:
+    return run_cli(["--stop-session", key])
+
+
 class ConfirmScreen(ModalScreen[bool]):
     """Minimal y/n confirm modal - stop is destructive, per the grilled decision."""
 
@@ -248,7 +252,10 @@ class MainPane(Vertical):
 
 
 class RunningPane(Vertical):
-    """Flat list of every currently-running tmux row, across every project."""
+    """Flat list of every currently-running tmux session, across every
+    project - both group rows and independent (non-group) sessions launched
+    with "Launch in tmux" on.
+    """
 
     # DataTable claims Enter itself (RowSelected) - see on_data_table_row_selected.
     BINDINGS = [
@@ -258,7 +265,7 @@ class RunningPane(Vertical):
 
     def __init__(self) -> None:
         super().__init__()
-        self.rows: list[tuple[str, str, dict]] = []
+        self.rows: list[dict] = []
 
     def compose(self) -> ComposeResult:
         yield DataTable(id="running")
@@ -269,19 +276,23 @@ class RunningPane(Vertical):
     def refresh_data(self) -> None:
         data = sessions_json()
         self.rows = [
-            (cwd, group["display_name"], row)
+            {"kind": "group", "cwd": cwd, "name": row["name"], "provider": row["provider"], "display": group["display_name"]}
             for cwd, group in data.get("groups", {}).items()
             for row in group["rows"]
             if row["status"] == "Running"
+        ] + [
+            {"kind": "standalone", "key": s["key"], "name": s["tmux_name"], "provider": s["provider"], "display": s["title"]}
+            for s in data.get("sessions", [])
+            if not s["is_group"] and s["status"] == "Running"
         ]
         table = self.query_one("#running", DataTable)
         table.clear(columns=True)
         table.add_columns("Project", "Name", "Provider")
         table.cursor_type = "row"
-        for cwd, display_name, row in self.rows:
-            table.add_row(display_name, row["name"], row["provider"])
+        for row in self.rows:
+            table.add_row(row["display"], row["name"], row["provider"])
 
-    def selected(self) -> tuple[str, str, dict] | None:
+    def selected(self) -> dict | None:
         table = self.query_one("#running", DataTable)
         if table.cursor_row is None or not self.rows:
             return None
@@ -291,19 +302,20 @@ class RunningPane(Vertical):
         picked = self.selected()
         if not picked:
             return
-        cwd, _display_name, row = picked
-        self.app.exit((cwd, row["name"]))
+        self.app.exit((picked.get("cwd"), picked["name"]))
 
     @work
     async def action_stop(self) -> None:
         picked = self.selected()
         if not picked:
             return
-        cwd, _display_name, row = picked
-        confirmed = await self.app.push_screen_wait(ConfirmScreen(f"Stop {row['name']!r}?"))
+        confirmed = await self.app.push_screen_wait(ConfirmScreen(f"Stop {picked['name']!r}?"))
         if not confirmed:
             return
-        await asyncio.to_thread(stop_group_row, cwd, row["name"])
+        if picked["kind"] == "group":
+            await asyncio.to_thread(stop_group_row, picked["cwd"], picked["name"])
+        else:
+            await asyncio.to_thread(stop_session, picked["key"])
         self.refresh_data()
 
     def action_refresh(self) -> None:

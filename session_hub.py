@@ -2233,6 +2233,23 @@ def group_row_status(row: dict, match: "Session | None", tmux_enabled: bool) -> 
     return "Running" if match and session_is_tracked_alive(match) else "Stopped"
 
 
+def standalone_tmux_status(session: "Session", overrides: dict, settings: dict) -> tuple[bool, str | None, str | None]:
+    """(tmux_enabled, tmux_name, status) for one non-group session.
+
+    Mirrors SessionHub.resume_session's own tmux_name computation
+    ((--name flag override) or (Hub rename) or (transcript title)) so
+    tmux_session_alive sees the exact session a resume would attach to.
+    status is None when tmux launching isn't enabled for this session -
+    there is no tmux session to check.
+    """
+    explicit = overrides.get("tmux")
+    tmux_enabled = explicit if explicit is not None else settings.get("launch_in_tmux", False)
+    if not tmux_enabled:
+        return False, None, None
+    name = (overrides.get("flags") or {}).get("--name") or overrides.get("name") or session.title
+    return True, name, ("Running" if tmux_session_alive(name) else "Stopped")
+
+
 def parse_claude_cmdline_identity(cmdline: str) -> tuple[str | None, str | None]:
     """(--resume SESSION_ID, --name NAME) explicitly present in a claude argv, if any.
 
@@ -5143,6 +5160,16 @@ class SessionHub(QMainWindow):
                 if group_row_status(row, match, tmux_enabled) == "Running":
                     running.append((display_name, cwd, row))
 
+        session_overrides = self.metadata.get("sessions", {}) or {}
+        for session in self.sessions:
+            if session.session_id.startswith("group:"):
+                continue
+            tmux_enabled, name, status = standalone_tmux_status(
+                session, session_overrides.get(session.key, {}), settings
+            )
+            if tmux_enabled and status == "Running":
+                running.append((session.title, session.cwd, {"name": name, "provider": session.provider}))
+
         self.running_table.setRowCount(len(running))
         for index, (display_name, cwd, row) in enumerate(running):
             project_item = QTableWidgetItem(display_name)
@@ -6766,21 +6793,32 @@ def sessions_json_cli() -> int:
             "rows": rows_out,
         }
 
+    session_overrides = metadata.get("sessions", {}) or {}
+
+    def session_out(item: Session) -> dict:
+        is_group = item.session_id.startswith("group:")
+        tmux_enabled, tmux_name, status = (
+            (False, None, None)
+            if is_group
+            else standalone_tmux_status(item, session_overrides.get(item.key, {}), settings)
+        )
+        return {
+            "provider": item.provider,
+            "key": item.key,
+            "title": item.title,
+            "cwd": item.cwd,
+            "session_id": item.session_id,
+            "is_group": is_group,
+            "updated_ms": item.updated_ms,
+            "tmux": tmux_enabled,
+            "tmux_name": tmux_name,
+            "status": status,
+        }
+
     print(
         json.dumps(
             {
-                "sessions": [
-                    {
-                        "provider": item.provider,
-                        "key": item.key,
-                        "title": item.title,
-                        "cwd": item.cwd,
-                        "session_id": item.session_id,
-                        "is_group": item.session_id.startswith("group:"),
-                        "updated_ms": item.updated_ms,
-                    }
-                    for item in sessions
-                ],
+                "sessions": [session_out(item) for item in sessions],
                 "groups": groups,
             },
             indent=2,
@@ -6877,6 +6915,36 @@ def stop_group_row_cli(argv: list[str]) -> int:
     return 0
 
 
+def stop_session_cli(argv: list[str]) -> int:
+    """Headless `--stop-session <key>`, the TUI/GUI Stop action for a
+    tmux-launched independent (non-group) session.
+
+    Re-derives the tmux name the same way standalone_tmux_status does,
+    rather than trusting a caller-supplied name outright, so this can only
+    ever stop a tmux session session-hub itself would consider "this
+    session's" - not an arbitrary tmux session name.
+    """
+    try:
+        index = argv.index("--stop-session")
+        key = argv[index + 1]
+    except (ValueError, IndexError):
+        print(json.dumps({"status": "error", "message": "usage: session_hub.py --stop-session <key>"}))
+        return 1
+    metadata = read_metadata()
+    session = next((s for s in discover_sessions(metadata) if s.key == key), None)
+    if not session or session.session_id.startswith("group:"):
+        print(json.dumps({"status": "error", "message": f"No independent session with key {key!r}."}))
+        return 1
+    overrides = (metadata.get("sessions") or {}).get(key, {})
+    tmux_enabled, name, _status = standalone_tmux_status(session, overrides, metadata.get("settings", {}))
+    if not tmux_enabled:
+        print(json.dumps({"status": "error", "message": f"{key!r} is not launched in tmux."}))
+        return 1
+    stop_tmux_session(name)
+    print(json.dumps({"status": "ok"}))
+    return 0
+
+
 def launch_group_row_cli(argv: list[str]) -> int:
     """Headless `--launch-group-row <cwd> <name>`, for an orchestrator's own Bash tool.
 
@@ -6936,6 +7004,8 @@ def main() -> int:
         return usage_json_cli()
     if "--stop-group-row" in sys.argv:
         return stop_group_row_cli(sys.argv)
+    if "--stop-session" in sys.argv:
+        return stop_session_cli(sys.argv)
     if "--launch-group-row" in sys.argv:
         return launch_group_row_cli(sys.argv)
     if "--resume-session" in sys.argv:
