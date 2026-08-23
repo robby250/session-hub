@@ -3892,6 +3892,28 @@ class ManageGroupDialog(QDialog):
             live += antigravity_sessions()
         overrides = self.hub.metadata.get("sessions", {})
         links = self.hub.metadata.get("links", {})
+        # claude_sessions()/codex_sessions() are raw - unlike discover_sessions(),
+        # they never apply metadata["links"], so linked_keys is always empty
+        # unless filled in by hand. This has to happen *before* matching, not
+        # just backfilled onto whatever matched: find_group_member_session's
+        # cross-link branch (session_key in session.linked_keys) is how a row
+        # whose provider was overtaken by a linked continuation in another
+        # provider (e.g. a Claude row relinked to a Codex session) matches at
+        # all - populating it only after a same-provider native-key match
+        # already succeeded means a cross-provider link never matches here in
+        # the first place, leaving the row's Agent/Last updated blank and its
+        # context menu stuck on the "not launched" set.
+        for session in live:
+            link = next(
+                (
+                    entry
+                    for entry in links.values()
+                    if session.native_key in entry.get("members", [])
+                ),
+                None,
+            )
+            if link:
+                session.linked_keys = tuple(link.get("members", []))
         pairs = []
         claimed: set[str] = set()
         for row in group.get("rows", []):
@@ -3904,23 +3926,6 @@ class ManageGroupDialog(QDialog):
                     row_custom.get("name") or native_custom.get("name") or match.title
                 )
                 match.cwd = row_custom.get("cwd") or native_custom.get("cwd") or match.cwd
-                # claude_sessions() is raw - unlike discover_sessions(), it
-                # never applies metadata["links"], so linked_keys is always
-                # empty here unless filled in by hand. Without this,
-                # "Open linked conversation..." (linked_conversations(),
-                # which reads session.linked_keys) always finds nothing for
-                # a group row, even when the row's session really is linked
-                # to an older conversation.
-                link = next(
-                    (
-                        entry
-                        for entry in links.values()
-                        if match.native_key in entry.get("members", [])
-                    ),
-                    None,
-                )
-                if link:
-                    match.linked_keys = tuple(link.get("members", []))
             pairs.append((row, match))
         return pairs
 
