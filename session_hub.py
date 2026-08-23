@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from PyQt6.QtCore import QByteArray, QObject, QRunnable, QThreadPool, QTimer, QUrl, Qt, pyqtSignal
@@ -1294,8 +1294,29 @@ def read_metadata() -> dict:
         return {"sessions": {}}
 
 
+METADATA_BACKUP_DIR = DATA_DIR / "backups" / "metadata"
+METADATA_BACKUP_RETENTION_DAYS = 30
+
+
+def backup_metadata_once_per_day() -> None:
+    """Copy the current metadata.json into METADATA_BACKUP_DIR, once per
+    calendar day, before it gets overwritten - a bad write (or a bug) then
+    costs at most a day instead of the whole file with no way back."""
+    if not METADATA_PATH.exists():
+        return
+    METADATA_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    dest = METADATA_BACKUP_DIR / f"metadata-{date.today().isoformat()}.json"
+    if not dest.exists():
+        shutil.copy2(METADATA_PATH, dest)
+    cutoff = time.time() - METADATA_BACKUP_RETENTION_DAYS * 86400
+    for old in METADATA_BACKUP_DIR.glob("metadata-*.json"):
+        if old.stat().st_mtime < cutoff:
+            old.unlink()
+
+
 def write_metadata(data: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    backup_metadata_once_per_day()
     temp = METADATA_PATH.with_suffix(".tmp")
     temp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     temp.replace(METADATA_PATH)
@@ -3892,10 +3913,14 @@ class ManageGroupDialog(QDialog):
         self.reload()
 
     def row_context_menu(self, point) -> None:
-        item = self.table.itemAt(point)
-        if item is None:
+        # rowAt(), not itemAt(): the Transcripts column is a checkbox cell
+        # widget with no backing QTableWidgetItem, so itemAt() returns None
+        # over its entire width and the menu silently failed to open at all
+        # for a right-click anywhere on that column.
+        row_index = self.table.rowAt(point.y())
+        if row_index < 0:
             return
-        # pair_at_table_row(), not pairs[item.row()]: table row index is a
+        # pair_at_table_row(), not pairs[row_index]: table row index is a
         # visual position that drifts from matched_sessions()'s own order
         # once the table is sorted, and matched_sessions() (not a fresh
         # find_group_member_session() call) is the one place that resolves
@@ -3903,7 +3928,7 @@ class ManageGroupDialog(QDialog):
         # onto the matched session - recomputing the match independently
         # skipped that, which is why "Open linked conversation..." always
         # came back empty for a group row even when it really was linked.
-        pair = self.pair_at_table_row(item.row())
+        pair = self.pair_at_table_row(row_index)
         if pair is None:
             return
         row, match = pair
