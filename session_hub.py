@@ -3908,32 +3908,36 @@ class ManageGroupDialog(QDialog):
             return
         row, match = pair
         menu = QMenu(self)
-        if match:
-            # row_session(), not the raw match: its .key is the row's own
-            # override_key, so "Launch options..." reads/writes the exact
-            # bucket the Model column already reads from (effective_model)
-            # instead of a native session key that goes stale on every
-            # restart and never matches what the column shows.
-            session = self.row_session(row, match)
-            for label, slot in self.hub.context_menu_actions(session):
-                if label == "Add session to group…":
-                    continue
-                if label == "Resume in new terminal":
-                    # Not the generic bound slot: that calls hub.launch()
-                    # directly with no use_tmux/tmux_name, so a tmux-enabled
-                    # group silently resumed in a plain terminal instead.
-                    # resume_group_row is the same tmux-aware path double-
-                    # click already uses.
-                    slot = lambda n=row["name"]: self.hub.resume_group_row(self.cwd, n)
-                if label == "Rename":
-                    # The ROW is renamed, not a display override layered over
-                    # it -- see rename_group_row_in. One name: table, --name,
-                    # tmux session, terminal title.
-                    slot = lambda n=row["name"]: self.rename_row(n)
-                action = QAction(label, self)
-                action.triggered.connect(slot)
-                menu.addAction(action)
-            menu.addSeparator()
+        # row_session(), not the raw match: its .key is the row's own
+        # override_key, so "Launch options..." reads/writes the exact
+        # bucket the Model column already reads from (effective_model)
+        # instead of a native session key that goes stale on every
+        # restart and never matches what the column shows. row_session()
+        # returns a usable (pending:) Session even with no live match, so
+        # this runs for a never-launched row too -- Rename must work on a
+        # saved row that hasn't started yet, not just a running one.
+        session = self.row_session(row, match)
+        for label, slot in self.hub.context_menu_actions(session):
+            if label == "Add session to group…":
+                continue
+            if not match and label != "Rename":
+                continue
+            if label == "Resume in new terminal":
+                # Not the generic bound slot: that calls hub.launch()
+                # directly with no use_tmux/tmux_name, so a tmux-enabled
+                # group silently resumed in a plain terminal instead.
+                # resume_group_row is the same tmux-aware path double-
+                # click already uses.
+                slot = lambda n=row["name"]: self.hub.resume_group_row(self.cwd, n)
+            if label == "Rename":
+                # The ROW is renamed, not a display override layered over
+                # it -- see rename_group_row_in. One name: table, --name,
+                # tmux session, terminal title.
+                slot = lambda n=row["name"]: self.rename_row(n)
+            action = QAction(label, self)
+            action.triggered.connect(slot)
+            menu.addAction(action)
+        menu.addSeparator()
         remove_action = QAction("Remove from group", self)
         remove_action.triggered.connect(lambda: self.remove_row(row["name"]))
         menu.addAction(remove_action)
