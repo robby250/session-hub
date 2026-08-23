@@ -780,7 +780,7 @@ class SessionLaunchOptionsDialog(QDialog):
         parent=None,
         scope: str = "this session",
         show_tmux: bool = False,
-        tmux_enabled: bool = False,
+        tmux_override: bool | None = None,
         provider: str = "Claude",
         model: str | None = None,
         reasoning_effort: str | None = None,
@@ -838,14 +838,24 @@ class SessionLaunchOptionsDialog(QDialog):
         self.tmux_checkbox: QCheckBox | None = None
         if show_tmux:
             self.tmux_checkbox = QCheckBox("Launch in tmux")
+            self.tmux_checkbox.setTristate(True)
             self.tmux_checkbox.setToolTip(
                 "Relaunches/resumes this session detached inside a tmux "
                 "session (named to match its --name flag, set in the CLI "
                 "flags tab above), with a terminal attached to it. Requires "
                 "tmux and gnome-terminal, and a --name flag set for this "
-                "session."
+                "session.\n\n"
+                "Three states: checked = always tmux, unchecked = never "
+                "tmux, dashed/partial = follow the global \"Launch every "
+                "session in tmux\" setting."
             )
-            self.tmux_checkbox.setChecked(tmux_enabled)
+            self.tmux_checkbox.setCheckState(
+                Qt.CheckState.PartiallyChecked
+                if tmux_override is None
+                else Qt.CheckState.Checked
+                if tmux_override
+                else Qt.CheckState.Unchecked
+            )
             layout.addWidget(self.tmux_checkbox)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
@@ -861,8 +871,13 @@ class SessionLaunchOptionsDialog(QDialog):
     def flags(self) -> dict:
         return self.editor.flags()
 
-    def tmux(self) -> bool:
-        return bool(self.tmux_checkbox and self.tmux_checkbox.isChecked())
+    def tmux(self) -> bool | None:
+        if self.tmux_checkbox is None:
+            return None
+        state = self.tmux_checkbox.checkState()
+        if state == Qt.CheckState.PartiallyChecked:
+            return None
+        return state == Qt.CheckState.Checked
 
     def model(self) -> str | None:
         return codex_combo_value(self.codex_model_combo) if self.codex_model_combo else None
@@ -900,6 +915,7 @@ class UsageWindow:
     resets: str
     window_minutes: int | None = None
     reset_epoch: float | None = None
+    count: int | None = None  # non-percent windows, e.g. banked reset credits
 
 
 @dataclass
@@ -1153,7 +1169,31 @@ def read_antigravity_usage(timeout: float = 15.0) -> list[UsageWindow]:
         os.close(master)
 
 
-def read_codex_usage(timeout: float = 12.0) -> list[UsageWindow]:
+def _codex_window_name(duration: int | None, fallback: str) -> str:
+    return (
+        f"{duration // 60}-hour"
+        if duration and duration < 1440
+        else "Weekly" if duration else fallback
+    )
+
+
+def _codex_build_window(
+    window: dict | None, fallback: str, name_prefix: str = ""
+) -> "UsageWindow | None":
+    if not window:
+        return None
+    duration = window.get("windowDurationMins")
+    name = _codex_window_name(duration, fallback)
+    return UsageWindow(
+        f"{name_prefix} {name}" if name_prefix else name,
+        max(0, min(100, int(window.get("usedPercent", 0)))),
+        format_reset_timestamp(window.get("resetsAt")),
+        window_minutes=duration,
+        reset_epoch=window.get("resetsAt"),
+    )
+
+
+def read_codex_usage(timeout: float = 12.0) -> list[UsageWindow | None]:
     process = subprocess.Popen(
         [executable("codex"), "app-server", "--listen", "stdio://"],
         stdin=subprocess.PIPE,
@@ -1199,29 +1239,49 @@ def read_codex_usage(timeout: float = 12.0) -> list[UsageWindow]:
                 continue
             if response.get("id") != 2:
                 continue
-            snapshot = response.get("result", {}).get("rateLimits", {})
-            windows = []
-            for key, fallback in (("primary", "5-hour"), ("secondary", "Weekly")):
-                window = snapshot.get(key)
-                if not window:
-                    continue
-                duration = window.get("windowDurationMins")
-                name = (
-                    f"{duration // 60}-hour"
-                    if duration and duration < 1440
-                    else "Weekly" if duration else fallback
+            result = response.get("result", {})
+            snapshot = result.get("rateLimits", {})
+            by_limit_id = result.get("rateLimitsByLimitId") or {}
+            credits = result.get("rateLimitResetCredits") or {}
+
+            # Three row slots, matching Claude's row count so the two panels
+            # stay the same height: account weekly, then either the
+            # account's own 5-hour window or (when the plan reports
+            # per-model limits, e.g. GPT-5.3-Codex-Spark) that model's
+            # 5-hour and weekly windows. Banked reset credits aren't a
+            # window — they're folded into the header text instead of
+            # taking a fourth row.
+            windows: list[UsageWindow | None] = [None, None, None]
+            windows[0] = _codex_build_window(snapshot.get("primary"), "5-hour")
+
+            model_entry = next(
+                (
+                    entry
+                    for limit_id, entry in (by_limit_id or {}).items()
+                    if limit_id != "codex" and entry.get("limitName")
+                ),
+                None,
+            )
+            if model_entry:
+                model_name = model_entry["limitName"]
+                windows[1] = _codex_build_window(
+                    model_entry.get("primary"), "5-hour", model_name
                 )
-                windows.append(
-                    UsageWindow(
-                        name,
-                        max(0, min(100, int(window.get("usedPercent", 0)))),
-                        format_reset_timestamp(window.get("resetsAt")),
-                        window_minutes=duration,
-                        reset_epoch=window.get("resetsAt"),
-                    )
+                windows[2] = _codex_build_window(
+                    model_entry.get("secondary"), "Weekly", model_name
                 )
-            if windows:
-                return windows
+            else:
+                windows[1] = _codex_build_window(snapshot.get("secondary"), "Weekly")
+
+            available_count = credits.get("availableCount")
+            banked = (
+                UsageWindow("Banked resets", 0, "", count=available_count)
+                if available_count is not None
+                else None
+            )
+
+            if any(windows) or banked:
+                return windows + ([banked] if banked else [])
             raise RuntimeError("Codex returned no usage windows.")
         raise TimeoutError("Codex usage request timed out.")
     finally:
@@ -2127,6 +2187,51 @@ def session_is_tracked_alive(session: Session) -> bool:
     return False
 
 
+def tmux_session_alive(name: str) -> bool:
+    """Is a tmux session named `name` currently alive.
+
+    Provider-agnostic and correct for any tmux-launched group row - unlike
+    session_is_tracked_alive, which only ever recognizes Claude processes
+    (see adopt_untracked_sessions). A row's tmux session name always equals
+    its own row["name"] (tmux_group_launch_command's own invariant), so this
+    needs no session-id matching at all.
+    """
+    tmux = shutil.which("tmux")
+    if not tmux:
+        return False
+    result = subprocess.run(
+        [tmux, "has-session", "-t", name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def stop_tmux_session(name: str) -> None:
+    """Kill the tmux session named `name`, if any. A no-op if already gone."""
+    tmux = shutil.which("tmux")
+    if not tmux:
+        return
+    subprocess.run(
+        [tmux, "kill-session", "-t", name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def group_row_status(row: dict, match: "Session | None", tmux_enabled: bool) -> str:
+    """"Running" or "Stopped" for one group row - the only two states shown anywhere.
+
+    tmux-enabled rows trust tmux_session_alive outright (provider-agnostic,
+    authoritative). Non-tmux rows fall back to the older PID-tracking signal,
+    which only ever works for Claude - a known, pre-existing limitation this
+    doesn't attempt to fix.
+    """
+    if tmux_enabled:
+        return "Running" if tmux_session_alive(row["name"]) else "Stopped"
+    return "Running" if match and session_is_tracked_alive(match) else "Stopped"
+
+
 def parse_claude_cmdline_identity(cmdline: str) -> tuple[str | None, str | None]:
     """(--resume SESSION_ID, --name NAME) explicitly present in a claude argv, if any.
 
@@ -2773,6 +2878,15 @@ class SettingsDialog(QDialog):
         )
         launch_note.setWordWrap(True)
         launch_layout.addWidget(launch_note)
+        self.launch_in_tmux = QCheckBox("Launch every session in tmux by default")
+        self.launch_in_tmux.setToolTip(
+            "Resumes and new group-row launches run detached inside tmux "
+            "unless a session's own \"Launch in tmux\" checkbox (right-click "
+            "a session → Launch options…, or a group's own checkbox) has "
+            "been explicitly set to override this."
+        )
+        self.launch_in_tmux.setChecked(bool(settings.get("launch_in_tmux", False)))
+        launch_layout.addWidget(self.launch_in_tmux)
         self.launch_options = LaunchOptionsEditor(
             settings.get("global_env") or {}, settings.get("global_flags") or {}
         )
@@ -2827,6 +2941,7 @@ class SettingsDialog(QDialog):
                 ),
                 "global_env": self.env_editor.env(),
                 "global_flags": self.flags_editor.env(),
+                "launch_in_tmux": self.launch_in_tmux.isChecked(),
             }
         )
         return values
@@ -3581,7 +3696,9 @@ class ManageGroupDialog(QDialog):
             "are unaffected until relaunched."
         )
         group = self.group()
-        self.tmux_checkbox.setChecked(bool(group.get("tmux")) if group else False)
+        self.tmux_checkbox.setChecked(
+            self.hub.effective_tmux(group.get("tmux") if group else None)
+        )
         self.tmux_checkbox.toggled.connect(self.set_tmux)
         controls.addWidget(self.tmux_checkbox)
         controls.addStretch(1)
@@ -3775,12 +3892,9 @@ class ManageGroupDialog(QDialog):
             )
             self.table.setCellWidget(index, self.TRANSCRIPTS_COLUMN, checkbox)
 
-            if match and session_is_tracked_alive(match):
-                status = "Running"
-            elif match:
-                status = "Idle"
-            else:
-                status = "Not started"
+            status = group_row_status(
+                row, match, self.hub.effective_tmux(group.get("tmux"))
+            )
             self.table.setItem(index, self.STATUS_COLUMN, QTableWidgetItem(status))
         if select_override_keys:
             for row_index in range(self.table.rowCount()):
@@ -4406,6 +4520,8 @@ class SessionHub(QMainWindow):
                 if provider == "Antigravity"
                 else ("5-hour", "Weekly", "Weekly (Fable)")
                 if provider == "Claude"
+                else ("Weekly", "5-hour", "Weekly")
+                if provider == "Codex"
                 else ("5-hour", "Weekly")
             )
             for index, window_name in enumerate(default_names):
@@ -4461,7 +4577,11 @@ class SessionHub(QMainWindow):
             shortcut.activated.connect(self.resume_selected)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.context_menu)
-        layout.addWidget(self.table, 1)
+
+        all_sessions_page = QWidget()
+        all_sessions_layout = QVBoxLayout(all_sessions_page)
+        all_sessions_layout.setContentsMargins(0, 0, 0, 0)
+        all_sessions_layout.addWidget(self.table, 1)
 
         actions = QHBoxLayout()
         self.status = QLabel()
@@ -4483,7 +4603,31 @@ class SessionHub(QMainWindow):
             elif label == "Prepare handoff summary":
                 self.prepare_handoff_button = button
             actions.addWidget(button)
-        layout.addLayout(actions)
+        all_sessions_layout.addLayout(actions)
+
+        running_page = QWidget()
+        running_layout = QVBoxLayout(running_page)
+        running_layout.setContentsMargins(0, 0, 0, 0)
+        self.running_table = QTableWidget(0, 3)
+        self.running_table.setHorizontalHeaderLabels(["Project", "Name", "Provider"])
+        self.running_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.running_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.running_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.running_table.setAlternatingRowColors(True)
+        self.running_table.verticalHeader().setVisible(False)
+        self.running_table.horizontalHeader().setStretchLastSection(True)
+        running_layout.addWidget(self.running_table, 1)
+        running_actions = QHBoxLayout()
+        running_actions.addStretch(1)
+        stop_button = QPushButton("Stop")
+        stop_button.clicked.connect(self.stop_selected_running)
+        running_actions.addWidget(stop_button)
+        running_layout.addLayout(running_actions)
+
+        tabs = QTabWidget()
+        tabs.addTab(all_sessions_page, "All Sessions")
+        tabs.addTab(running_page, "Running")
+        layout.addWidget(tabs, 1)
         self.setCentralWidget(root)
 
         refresh_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F5), self)
@@ -4738,14 +4882,37 @@ class SessionHub(QMainWindow):
     ) -> None:
         self.usage_workers.pop(provider, None)
         rows = self.usage_widgets[provider]
-        # The Claude "Weekly (Fable)" row (index 2) is optional: it only shows
-        # while `/usage` still reports a Fable window. Once Fable becomes
+        # The Claude "Weekly (Fable)" row is optional: it only shows while
+        # `/usage` still reports a Fable window. Once Fable becomes
         # credit-only and drops out of the output, the row hides itself instead
-        # of showing "Unavailable" forever.
-        optional_index = 2 if provider == "Claude" else None
+        # of showing "Unavailable" forever. Codex's rows 2-3 (either the
+        # account's own 5-hour window, or a per-model breakdown) are optional
+        # the same way: not every plan reports them.
+        if provider == "Claude":
+            optional_indices = {2}
+        elif provider == "Codex":
+            optional_indices = {1, 2}
+        else:
+            optional_indices = set()
+        header = self.usage_headers[provider]
+        banked = next(
+            (
+                w
+                for w in windows
+                if isinstance(w, UsageWindow) and w.count is not None
+            ),
+            None,
+        )
+        if banked:
+            plural = "" if banked.count == 1 else "s"
+            header.setText(
+                f"<b>{provider} usage</b> · {banked.count} banked reset{plural} available"
+            )
+        else:
+            header.setText(f"<b>{provider} usage</b>")
         if error:
             for index, (_, bar, detail) in enumerate(rows):
-                if index == optional_index:
+                if index in optional_indices:
                     self.set_usage_row_visible(rows[index], False)
                     continue
                 bar.setFormat("Unavailable")
@@ -4757,7 +4924,7 @@ class SessionHub(QMainWindow):
             # branch below takes over automatically.
             for index, (label, bar, detail) in enumerate(rows):
                 activity = windows[index] if index < len(windows) else None
-                if not activity or index == optional_index:
+                if not activity or index in optional_indices:
                     self.set_usage_row_visible(rows[index], False)
                     continue
                 self.set_usage_row_visible(rows[index], True)
@@ -4770,13 +4937,13 @@ class SessionHub(QMainWindow):
             for index, (label, bar, detail) in enumerate(rows):
                 window = windows[index] if index < len(windows) else None
                 if not window:
-                    if index == optional_index:
+                    if index in optional_indices:
                         self.set_usage_row_visible(rows[index], False)
                         continue
                     bar.setFormat("Unavailable")
                     detail.setText("")
                     continue
-                if index == optional_index:
+                if index in optional_indices:
                     self.set_usage_row_visible(rows[index], True)
                 label.setText(window.name)
                 remaining = 100 - window.used_percent
@@ -4831,6 +4998,18 @@ class SessionHub(QMainWindow):
             return {}, {}
         group = self.metadata.get("groups", {}).get(cwd) or {}
         return group.get("env") or {}, group.get("flags") or {}
+
+    def effective_tmux(self, explicit: bool | None) -> bool:
+        """Resolve a per-session/per-group tmux override against the global default.
+
+        `explicit` is whatever a "tmux" key currently holds: None means the
+        session/group has never been toggled and should follow the global
+        "launch_in_tmux" setting; True/False means it was explicitly set and
+        wins outright, per-item, over the global default.
+        """
+        if explicit is None:
+            return bool(self.settings().get("launch_in_tmux", False))
+        return explicit
 
     def effective_model(self, session_key: str | None, provider: str = "Claude") -> str | None:
         """The model a session would (re)launch with, if any is set.
@@ -4931,6 +5110,64 @@ class SessionHub(QMainWindow):
             self.SESSION_TABLE_COLUMNS.index("Last updated"), Qt.SortOrder.DescendingOrder
         )
         self.apply_filter()
+        self.refresh_running_tab()
+
+    def refresh_running_tab(self) -> None:
+        """Flat list of every currently-running tmux group row, across every project.
+
+        Reuses group_row_status/tmux_session_alive - the exact same signal
+        ManageGroupDialog now shows per-group, just flattened across all of
+        them here.
+        """
+        settings = self.metadata.get("settings", {})
+        live: list[Session] = []
+        if settings.get("enable_codex", True):
+            live += codex_sessions()
+        if settings.get("enable_claude", True):
+            live += claude_sessions()
+        if settings.get("enable_antigravity", True):
+            live += antigravity_sessions()
+
+        running: list[tuple[str, str, dict]] = []
+        claimed: set[str] = set()
+        for cwd, group in self.metadata.get("groups", {}).items():
+            tmux_enabled = self.effective_tmux(group.get("tmux"))
+            if not tmux_enabled:
+                continue
+            display_name = group.get("display_name") or Path(cwd).name or cwd
+            for row in group.get("rows", []):
+                match = find_group_member_session(row, cwd, live, frozenset(claimed))
+                if match:
+                    claimed.add(match.native_key)
+                if group_row_status(row, match, tmux_enabled) == "Running":
+                    running.append((display_name, cwd, row))
+
+        self.running_table.setRowCount(len(running))
+        for index, (display_name, cwd, row) in enumerate(running):
+            project_item = QTableWidgetItem(display_name)
+            project_item.setData(Qt.ItemDataRole.UserRole, (cwd, row["name"]))
+            self.running_table.setItem(index, 0, project_item)
+            self.running_table.setItem(index, 1, QTableWidgetItem(row["name"]))
+            self.running_table.setItem(
+                index, 2, QTableWidgetItem(row.get("provider", "Claude"))
+            )
+
+    def stop_selected_running(self) -> None:
+        row = self.running_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "Session Hub", "Select a running session first.")
+            return
+        item = self.running_table.item(row, 0)
+        cwd, name = item.data(Qt.ItemDataRole.UserRole)
+        confirm = QMessageBox.question(
+            self,
+            "Stop session",
+            f"Stop {name!r}? This ends its tmux session; unsaved terminal state is lost.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        stop_tmux_session(name)
+        self.refresh_running_tab()
 
     def apply_filter(self) -> None:
         query = self.search.text().strip().lower()
@@ -5095,7 +5332,7 @@ class SessionHub(QMainWindow):
             flag_overrides,
             self,
             show_tmux=not self.is_group_session(session),
-            tmux_enabled=bool(existing.get("tmux")),
+            tmux_override=existing.get("tmux"),
             provider=session.provider,
             model=existing.get("model"),
             reasoning_effort=existing.get("reasoning_effort"),
@@ -5125,10 +5362,11 @@ class SessionHub(QMainWindow):
                     entry["reasoning_effort"] = effort
                 else:
                     entry.pop("reasoning_effort", None)
-            if dialog.tmux():
-                entry["tmux"] = True
-            else:
+            tmux = dialog.tmux()
+            if tmux is None:
                 entry.pop("tmux", None)
+            else:
+                entry["tmux"] = tmux
             write_metadata(self.metadata)
             self.refresh()
 
@@ -5413,7 +5651,7 @@ class SessionHub(QMainWindow):
             # transcript saving off.
             strip_env=["CLAUDE_CODE_CHILD_SESSION"],
             wait_for_tracking=wait_for_tracking,
-            use_tmux=bool(overrides.get("tmux")),
+            use_tmux=self.effective_tmux(overrides.get("tmux")),
             # --name is Claude-only; a Codex row's address is its display name
             # (the Hub rename, e.g. VAMP-worker4), else the session title.
             tmux_name=(overrides.get("flags") or {}).get("--name")
@@ -6105,7 +6343,7 @@ class SessionHub(QMainWindow):
             flag_overrides={"--name": row["name"]},
             strip_env=strip_env,
             wait_for_tracking=wait_for_tracking,
-            use_tmux=group.get("tmux", False),
+            use_tmux=self.effective_tmux(group.get("tmux")),
         )
         return {"status": "launched", "name": name}
 
@@ -6154,7 +6392,7 @@ class SessionHub(QMainWindow):
             if provider == "Codex"
             else None,
             session_key=row["override_key"],
-            use_tmux=group.get("tmux", False),
+            use_tmux=self.effective_tmux(group.get("tmux")),
             tmux_name=row["name"],
         )
         return {"status": "resumed", "name": name}
@@ -6484,6 +6722,99 @@ def diagnostic() -> int:
     return 0
 
 
+def sessions_json_cli() -> int:
+    """Headless `--sessions-json`: everything the TUI needs, in one call.
+
+    Mirrors the GUI main table exactly (discover_sessions - standalone
+    sessions plus one collapsed summary row per group), plus, for every
+    saved group, its member rows with the same group_row_status the GUI's
+    ManageGroupDialog now shows. Never constructs a QApplication, same as
+    diagnostic().
+    """
+    metadata = read_metadata()
+    sessions = discover_sessions(metadata)
+    settings = metadata.get("settings", {})
+    live: list[Session] = []
+    if settings.get("enable_codex", True):
+        live += codex_sessions()
+    if settings.get("enable_claude", True):
+        live += claude_sessions()
+    if settings.get("enable_antigravity", True):
+        live += antigravity_sessions()
+
+    claimed: set[str] = set()
+    groups = {}
+    for cwd, group in metadata.get("groups", {}).items():
+        explicit = group.get("tmux")
+        tmux_enabled = explicit if explicit is not None else settings.get("launch_in_tmux", False)
+        rows_out = []
+        for row in group.get("rows", []):
+            match = find_group_member_session(row, cwd, live, frozenset(claimed))
+            if match:
+                claimed.add(match.native_key)
+            rows_out.append(
+                {
+                    "name": row["name"],
+                    "provider": row.get("provider", "Claude"),
+                    "status": group_row_status(row, match, tmux_enabled),
+                }
+            )
+        groups[cwd] = {
+            "display_name": group.get("display_name") or Path(cwd).name or cwd,
+            "tmux": tmux_enabled,
+            "rows": rows_out,
+        }
+
+    print(
+        json.dumps(
+            {
+                "sessions": [
+                    {
+                        "provider": item.provider,
+                        "key": item.key,
+                        "title": item.title,
+                        "cwd": item.cwd,
+                        "session_id": item.session_id,
+                        "is_group": item.session_id.startswith("group:"),
+                        "updated_ms": item.updated_ms,
+                    }
+                    for item in sessions
+                ],
+                "groups": groups,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def stop_group_row_cli(argv: list[str]) -> int:
+    """Headless `--stop-group-row <cwd> <name>`, the TUI's Stop action.
+
+    Kills the row's tmux session outright (stop_tmux_session already treats
+    "no such session" as success - the end state, "not running", either way
+    already holds).
+    """
+    try:
+        index = argv.index("--stop-group-row")
+        cwd, name = argv[index + 1], argv[index + 2]
+    except (ValueError, IndexError):
+        print(json.dumps({
+            "status": "error",
+            "message": "usage: session_hub.py --stop-group-row <cwd> <name>",
+        }))
+        return 1
+    metadata = read_metadata()
+    group = metadata.get("groups", {}).get(cwd)
+    row = next((r for r in group.get("rows", []) if r["name"] == name), None) if group else None
+    if not row:
+        print(json.dumps({"status": "error", "message": f"No row named {name!r} in group {cwd!r}."}))
+        return 1
+    stop_tmux_session(name)
+    print(json.dumps({"status": "ok"}))
+    return 0
+
+
 def launch_group_row_cli(argv: list[str]) -> int:
     """Headless `--launch-group-row <cwd> <name>`, for an orchestrator's own Bash tool.
 
@@ -6537,6 +6868,10 @@ def resume_session_cli(argv: list[str]) -> int:
 def main() -> int:
     if "--diagnose" in sys.argv:
         return diagnostic()
+    if "--sessions-json" in sys.argv:
+        return sessions_json_cli()
+    if "--stop-group-row" in sys.argv:
+        return stop_group_row_cli(sys.argv)
     if "--launch-group-row" in sys.argv:
         return launch_group_row_cli(sys.argv)
     if "--resume-session" in sys.argv:

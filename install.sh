@@ -8,6 +8,7 @@ BIN_DIR="$HOME/.local/bin"
 
 mkdir -p "$APPLICATIONS_DIR" "$ICON_DIR" "$BIN_DIR"
 ln -sfn "$PROJECT_DIR/session_hub.py" "$BIN_DIR/session-hub"
+ln -sfn "$PROJECT_DIR/session_hub_tui.py" "$BIN_DIR/session-hub-tui"
 cp "$PROJECT_DIR/assets/session-hub.svg" "$ICON_DIR/session-hub.svg"
 
 sed "s|@PROJECT_DIR@|$PROJECT_DIR|g" \
@@ -16,7 +17,9 @@ sed "s|@PROJECT_DIR@|$PROJECT_DIR|g" \
 
 chmod +x \
   "$PROJECT_DIR/session_hub.py" \
+  "$PROJECT_DIR/session_hub_tui.py" \
   "$BIN_DIR/session-hub" \
+  "$BIN_DIR/session-hub-tui" \
   "$APPLICATIONS_DIR/session-hub.desktop"
 gio set "$APPLICATIONS_DIR/session-hub.desktop" metadata::trusted true 2>/dev/null || true
 update-desktop-database "$APPLICATIONS_DIR" 2>/dev/null || true
