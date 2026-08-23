@@ -1995,6 +1995,23 @@ def native_session_index() -> dict[str, Session]:
     return {session.native_key: session for session in sessions}
 
 
+def window_titled(title: str) -> bool:
+    """True if any currently open window's title contains `title` right now.
+
+    A single wmctrl -l snapshot, not the poll loop focus_window_by_title runs
+    - callers use this to decide whether a window to reveal already exists
+    versus needs to be opened first.
+    """
+    wmctrl = shutil.which("wmctrl")
+    if not wmctrl:
+        return False
+    try:
+        result = subprocess.run([wmctrl, "-l"], capture_output=True, text=True, timeout=1)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return any(title in line for line in result.stdout.splitlines())
+
+
 def focus_window_by_title(title: str, timeout: float = 3.0) -> None:
     """Raise and focus the terminal window we just launched.
 
@@ -4740,6 +4757,7 @@ class SessionHub(QMainWindow):
         self.running_table.setAlternatingRowColors(True)
         self.running_table.verticalHeader().setVisible(False)
         self.running_table.horizontalHeader().setStretchLastSection(True)
+        self.running_table.cellDoubleClicked.connect(self.reveal_running_row)
         running_layout.addWidget(self.running_table, 1)
         running_actions = QHBoxLayout()
         running_actions.addStretch(1)
@@ -5301,6 +5319,30 @@ class SessionHub(QMainWindow):
             return
         stop_tmux_session(name)
         self.refresh_running_tab()
+
+    def reveal_running_row(self, row: int, _column: int = 0) -> None:
+        """Double-click a Running row: bring its terminal to the front.
+
+        wmctrl -a already unminimizes as well as raising, so a window that's
+        merely minimized in the taskbar is covered for free. If no window is
+        currently titled for this tmux session at all - closed by the user,
+        or launched outside Session Hub - has-session succeeds and the
+        launch command's new-session branch is skipped, so this only ever
+        opens a fresh terminal attached to the existing session, never a
+        second copy of it.
+        """
+        item = self.running_table.item(row, 0)
+        if not item:
+            return
+        cwd, name = item.data(Qt.ItemDataRole.UserRole)
+        if not window_titled(name):
+            try:
+                command = tmux_group_launch_command(name, cwd, [])
+            except RuntimeError as error:
+                QMessageBox.critical(self, "Could not open session", str(error))
+                return
+            self.spawn(command, cwd=cwd)
+        threading.Thread(target=focus_window_by_title, args=(name,), daemon=True).start()
 
     def apply_filter(self) -> None:
         query = self.search.text().strip().lower()
