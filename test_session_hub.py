@@ -421,20 +421,64 @@ class SessionHubTests(unittest.TestCase):
         self.assertIsNone(codex_dialog.model_combo)
         codex_dialog.close()
 
-    def test_new_session_dialog_offers_free_text_model_for_codex(self):
-        codex_dialog = session_hub.NewSessionDialog("Codex", {})
-        self.assertIsNone(codex_dialog.model_combo)
-        self.assertIsNotNone(codex_dialog.model_edit)
-        codex_dialog.model_edit.setText("gpt-5")
-        codex_dialog.directory = Path.home()
-        codex_dialog.accept()
-        self.assertEqual(codex_dialog.model, "gpt-5")
-        codex_dialog.close()
-        blank_dialog = session_hub.NewSessionDialog("Codex", {})
-        blank_dialog.directory = Path.home()
-        blank_dialog.accept()
-        self.assertIsNone(blank_dialog.model)
-        blank_dialog.close()
+    def _codex_models_fixture(self):
+        return [
+            {
+                "slug": "gpt-5.6-sol",
+                "display_name": "GPT-5.6-Sol",
+                "priority": 1,
+                "visibility": "list",
+                "supported_reasoning_levels": [
+                    {"effort": "low"}, {"effort": "medium"}, {"effort": "high"},
+                ],
+            },
+            {
+                "slug": "gpt-5.5",
+                "display_name": "GPT-5.5",
+                "priority": 2,
+                "visibility": "list",
+                "supported_reasoning_levels": [{"effort": "medium"}],
+            },
+        ]
+
+    def test_new_session_dialog_offers_model_and_effort_dropdowns_for_codex(self):
+        with patch("session_hub.codex_models", return_value=self._codex_models_fixture()):
+            codex_dialog = session_hub.NewSessionDialog("Codex", {})
+            self.assertIsNone(codex_dialog.model_combo)
+            self.assertIsInstance(codex_dialog.codex_model_combo, session_hub.QComboBox)
+            self.assertIsInstance(codex_dialog.codex_effort_combo, session_hub.QComboBox)
+            aliases = [
+                codex_dialog.codex_model_combo.itemData(i)
+                for i in range(codex_dialog.codex_model_combo.count())
+            ]
+            self.assertEqual(aliases, [None, "gpt-5.6-sol", "gpt-5.5"])
+            codex_dialog.codex_model_combo.setCurrentIndex(aliases.index("gpt-5.6-sol"))
+            efforts = [
+                codex_dialog.codex_effort_combo.itemData(i)
+                for i in range(codex_dialog.codex_effort_combo.count())
+            ]
+            self.assertEqual(efforts, [None, "low", "medium", "high"])
+            codex_dialog.codex_effort_combo.setCurrentIndex(efforts.index("high"))
+            codex_dialog.directory = Path.home()
+            codex_dialog.accept()
+            self.assertEqual(codex_dialog.model, "gpt-5.6-sol")
+            self.assertEqual(codex_dialog.reasoning_effort, "high")
+            codex_dialog.close()
+
+            blank_dialog = session_hub.NewSessionDialog("Codex", {})
+            blank_dialog.directory = Path.home()
+            blank_dialog.accept()
+            self.assertIsNone(blank_dialog.model)
+            self.assertIsNone(blank_dialog.reasoning_effort)
+            blank_dialog.close()
+
+            # A custom slug this machine's cache doesn't know is still typeable.
+            custom_dialog = session_hub.NewSessionDialog("Codex", {})
+            custom_dialog.codex_model_combo.setCurrentText("gpt-6-preview")
+            custom_dialog.directory = Path.home()
+            custom_dialog.accept()
+            self.assertEqual(custom_dialog.model, "gpt-6-preview")
+            custom_dialog.close()
 
     @patch("session_hub.shutil.which")
     def test_danger_mode_adds_provider_flags(self, which):
@@ -2762,6 +2806,7 @@ class SessionHubTests(unittest.TestCase):
                 dialog_instance.flags = MagicMock(return_value={})
                 dialog_instance.tmux = MagicMock(return_value=False)
                 dialog_instance.model = MagicMock(return_value="gpt-5")
+                dialog_instance.reasoning_effort = MagicMock(return_value="high")
                 with (
                     patch(
                         "session_hub.SessionLaunchOptionsDialog",
@@ -2775,6 +2820,9 @@ class SessionHubTests(unittest.TestCase):
                 self.assertEqual(dialog_cls.call_args.kwargs["model"], "o3")
                 self.assertEqual(
                     window.metadata["sessions"]["Codex:id-1"]["model"], "gpt-5"
+                )
+                self.assertEqual(
+                    window.metadata["sessions"]["Codex:id-1"]["reasoning_effort"], "high"
                 )
             finally:
                 window.close()
@@ -3482,6 +3530,7 @@ class SessionHubTests(unittest.TestCase):
                     None,
                     "/tmp/vamp",
                     model=None,
+                    reasoning_effort=None,
                     session_key="group:/tmp/vamp#vamp-s1",
                     flag_overrides={"--name": "vamp-s1"},
                     strip_env=["CLAUDE_CODE_CHILD_SESSION"],
@@ -3524,6 +3573,7 @@ class SessionHubTests(unittest.TestCase):
                     None,
                     "/tmp/vamp",
                     model=None,
+                    reasoning_effort=None,
                     session_key="group:/tmp/vamp#vamp-s1",
                     flag_overrides={"--name": "vamp-s1"},
                     strip_env=None,
@@ -3580,6 +3630,7 @@ class SessionHubTests(unittest.TestCase):
                     "/tmp/vamp",
                     "/tmp/vamp",
                     model=None,
+                    reasoning_effort=None,
                     session_key="group:/tmp/vamp#vamp-s1",
                     use_tmux=True,
                     tmux_name="vamp-s1",
@@ -3761,8 +3812,8 @@ class SessionHubTests(unittest.TestCase):
     def test_launch_new_group_sessions_dialog_rejects_duplicate_names(self):
         dialog = session_hub.LaunchNewGroupSessionsDialog("/tmp/vamp", set(), False)
         dialog.add_row()
-        name_edit_0 = dialog.table.cellWidget(0, 2)
-        name_edit_1 = dialog.table.cellWidget(1, 2)
+        name_edit_0 = dialog.table.cellWidget(0, 3)
+        name_edit_1 = dialog.table.cellWidget(1, 3)
         name_edit_0.setText("same-name")
         name_edit_0.auto_suggested = False
         name_edit_1.setText("same-name")
@@ -3777,7 +3828,7 @@ class SessionHubTests(unittest.TestCase):
         dialog = session_hub.LaunchNewGroupSessionsDialog(
             "/tmp/vamp", {"vampulse-fable"}, False
         )
-        name_edit = dialog.table.cellWidget(0, 2)
+        name_edit = dialog.table.cellWidget(0, 3)
         name_edit.setText("vampulse-fable")
         name_edit.auto_suggested = False
         with patch("session_hub.QMessageBox.warning") as warning:
@@ -3787,25 +3838,41 @@ class SessionHubTests(unittest.TestCase):
         dialog.close()
 
     def test_launch_new_group_sessions_dialog_per_row_provider_switch(self):
-        dialog = session_hub.LaunchNewGroupSessionsDialog("/tmp/vamp", set(), False)
-        provider_combo = dialog.table.cellWidget(0, 0)
-        self.assertEqual(provider_combo.currentData(), "Claude")
-        self.assertIsInstance(dialog.table.cellWidget(0, 1), session_hub.QComboBox)
-        provider_combo.setCurrentIndex(provider_combo.findData("Codex"))
-        self.assertIsInstance(dialog.table.cellWidget(0, 1), session_hub.QLineEdit)
-        model_edit = dialog.table.cellWidget(0, 1)
-        model_edit.setText("gpt-5")
-        name_edit = dialog.table.cellWidget(0, 2)
-        name_edit.setText("vampulse-codex")
-        name_edit.auto_suggested = False
-        rows = dialog.rows()
-        self.assertEqual(
-            rows[0], {"name": "vampulse-codex", "provider": "Codex", "model": "gpt-5"}
-        )
-        # Switching a Claude row's combo back keeps the existing combo behavior.
-        provider_combo.setCurrentIndex(provider_combo.findData("Claude"))
-        self.assertIsInstance(dialog.table.cellWidget(0, 1), session_hub.QComboBox)
-        dialog.close()
+        with patch("session_hub.codex_models", return_value=self._codex_models_fixture()):
+            dialog = session_hub.LaunchNewGroupSessionsDialog("/tmp/vamp", set(), False)
+            provider_combo = dialog.table.cellWidget(0, 0)
+            self.assertEqual(provider_combo.currentData(), "Claude")
+            self.assertIsInstance(dialog.table.cellWidget(0, 1), session_hub.QComboBox)
+            self.assertIsInstance(dialog.table.cellWidget(0, 2), session_hub.QLabel)
+            provider_combo.setCurrentIndex(provider_combo.findData("Codex"))
+            self.assertIsInstance(dialog.table.cellWidget(0, 1), session_hub.QComboBox)
+            self.assertIsInstance(dialog.table.cellWidget(0, 2), session_hub.QComboBox)
+            model_combo = dialog.table.cellWidget(0, 1)
+            model_combo.setCurrentIndex(model_combo.findData("gpt-5.6-sol"))
+            effort_combo = dialog.table.cellWidget(0, 2)
+            self.assertEqual(
+                [effort_combo.itemData(i) for i in range(effort_combo.count())],
+                [None, "low", "medium", "high"],
+            )
+            effort_combo.setCurrentIndex(effort_combo.findData("medium"))
+            name_edit = dialog.table.cellWidget(0, 3)
+            name_edit.setText("vampulse-codex")
+            name_edit.auto_suggested = False
+            rows = dialog.rows()
+            self.assertEqual(
+                rows[0],
+                {
+                    "name": "vampulse-codex",
+                    "provider": "Codex",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "medium",
+                },
+            )
+            # Switching a Claude row's combo back keeps the existing combo behavior.
+            provider_combo.setCurrentIndex(provider_combo.findData("Claude"))
+            self.assertIsInstance(dialog.table.cellWidget(0, 1), session_hub.QComboBox)
+            self.assertIsInstance(dialog.table.cellWidget(0, 2), session_hub.QLabel)
+            dialog.close()
 
     def test_launch_new_rows_into_group_launches_all_rows_and_saves_group(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4505,6 +4572,24 @@ class SessionHubTests(unittest.TestCase):
         self.assertEqual(command[command.index("-m") + 1], "gpt-5")
         no_model_command = window.terminal_command("Codex", None, "/home/user")
         self.assertNotIn("-m", no_model_command)
+        window.close()
+
+    @patch("session_hub.shutil.which")
+    def test_terminal_command_passes_codex_reasoning_effort(self, which):
+        which.side_effect = lambda name: {
+            "gnome-terminal": "/usr/bin/gnome-terminal",
+            "codex": "/home/user/.local/bin/codex",
+        }.get(name)
+        window = session_hub.SessionHub()
+        command = window.terminal_command(
+            "Codex", None, "/home/user", model="gpt-5", reasoning_effort="high"
+        )
+        self.assertIn("-c", command)
+        self.assertEqual(
+            command[command.index("-c") + 1], "model_reasoning_effort=high"
+        )
+        no_effort_command = window.terminal_command("Codex", None, "/home/user")
+        self.assertNotIn("-c", no_effort_command)
         window.close()
 
     def test_launch_passes_global_effort_flag_to_claude_command(self):

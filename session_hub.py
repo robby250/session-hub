@@ -68,6 +68,7 @@ from PyQt6.QtWidgets import (
 HOME = Path.home()
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
 CODEX_STATE = HOME / ".codex" / "state_5.sqlite"
+CODEX_MODELS_CACHE = HOME / ".codex" / "models_cache.json"
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
 CLAUDE_HISTORY = HOME / ".claude" / "history.jsonl"
 ANTIGRAVITY_HOME = HOME / ".gemini" / "antigravity-cli"
@@ -128,6 +129,93 @@ CLAUDE_MODELS = (
     ("Haiku", "haiku"),
     ("Fable", "fable"),
 )
+
+
+def codex_models() -> list[dict]:
+    """Codex's own model roster, from the CLI's local cache of the models it can see.
+
+    Unlike CLAUDE_MODELS, there's no small stable alias list for Codex - model
+    slugs (and their supported reasoning-effort levels) are just whatever the
+    Codex CLI itself last fetched and cached, refreshed independently of
+    Session Hub. Returns [] if the cache is missing or unreadable (a fresh
+    Codex install, or one that's never been run) - callers fall back to a
+    plain "Default" choice plus free-text entry.
+    """
+    try:
+        data = json.loads(CODEX_MODELS_CACHE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    models = [
+        model
+        for model in data.get("models", [])
+        if model.get("visibility") != "hide" and model.get("slug")
+    ]
+    models.sort(key=lambda model: model.get("priority", 999))
+    return models
+
+
+def populate_codex_model_combo(combo: QComboBox, current: str | None) -> None:
+    """Fill an editable model combo from codex_models(), preselecting `current`.
+
+    Editable + NoInsert (not the default InsertAtBottom): a slug this
+    machine's cache doesn't know yet (a brand-new release, or another
+    machine's cache) must still be typeable and preserved, without
+    permanently polluting the dropdown with one-off entries.
+    """
+    combo.setEditable(True)
+    combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+    combo.addItem("Default", None)
+    for model in codex_models():
+        combo.addItem(model.get("display_name") or model["slug"], model["slug"])
+    index = combo.findData(current) if current else -1
+    if index >= 0:
+        combo.setCurrentIndex(index)
+    elif current:
+        combo.setCurrentText(current)
+
+
+def populate_codex_effort_combo(
+    combo: QComboBox, model_slug: str | None, current: str | None
+) -> None:
+    """Fill an editable effort combo with the levels the given model slug supports."""
+    combo.clear()
+    combo.setEditable(True)
+    combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+    combo.addItem("Default", None)
+    levels = next(
+        (
+            model.get("supported_reasoning_levels", [])
+            for model in codex_models()
+            if model["slug"] == model_slug
+        ),
+        [],
+    )
+    for level in levels:
+        effort = level.get("effort")
+        if effort:
+            combo.addItem(effort.capitalize(), effort)
+    index = combo.findData(current) if current else -1
+    if index >= 0:
+        combo.setCurrentIndex(index)
+    elif current:
+        combo.setCurrentText(current)
+
+
+def codex_combo_value(combo: QComboBox) -> str | None:
+    """The selected item's data, or freely-typed text when nothing matches.
+
+    Checked by comparing displayed text to the selected item's own text, not
+    just currentIndex() >= 0: setCurrentText() (used by tests, and Qt itself
+    on some code paths) leaves currentIndex() pointing at whatever it was
+    before when the text doesn't match any item, unlike interactively typing
+    into the field and tabbing away (which resets it to -1 under NoInsert).
+    """
+    index = combo.currentIndex()
+    if index >= 0 and combo.itemText(index) == combo.currentText():
+        return combo.currentData()
+    return combo.currentText().strip() or None
+
+
 # Shared session-table column set: SessionHub's main listview and
 # ManageGroupDialog both render from this (see SessionHub.populate_session_table)
 # so their common columns are defined once, in one order.
@@ -695,6 +783,7 @@ class SessionLaunchOptionsDialog(QDialog):
         tmux_enabled: bool = False,
         provider: str = "Claude",
         model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Session launch options")
@@ -721,17 +810,29 @@ class SessionLaunchOptionsDialog(QDialog):
             inherited.setWordWrap(True)
             inherited.setStyleSheet("color: #888;")
             layout.addWidget(inherited)
-        self.model_edit: QLineEdit | None = None
+        self.codex_model_combo: QComboBox | None = None
+        self.codex_effort_combo: QComboBox | None = None
         if provider == "Codex":
             # Codex has no ANTHROPIC_MODEL-equivalent env var (its model is a
             # plain -m/--model argv, see effective_model/terminal_command),
-            # so it gets its own field here instead of living in the env tab.
+            # so it gets its own fields here instead of living in the env tab.
             model_row = QHBoxLayout()
             model_row.addWidget(QLabel("Model:"))
-            self.model_edit = QLineEdit(model or "")
-            self.model_edit.setPlaceholderText("Default (leave blank), or a model id")
-            model_row.addWidget(self.model_edit)
+            self.codex_model_combo = QComboBox()
+            populate_codex_model_combo(self.codex_model_combo, model)
+            model_row.addWidget(self.codex_model_combo)
             layout.addLayout(model_row)
+            effort_row = QHBoxLayout()
+            effort_row.addWidget(QLabel("Effort:"))
+            self.codex_effort_combo = QComboBox()
+            populate_codex_effort_combo(self.codex_effort_combo, model, reasoning_effort)
+            effort_row.addWidget(self.codex_effort_combo)
+            layout.addLayout(effort_row)
+            self.codex_model_combo.currentIndexChanged.connect(
+                lambda: populate_codex_effort_combo(
+                    self.codex_effort_combo, codex_combo_value(self.codex_model_combo), None
+                )
+            )
         self.editor = LaunchOptionsEditor(env_overrides, flag_overrides)
         layout.addWidget(self.editor)
         self.tmux_checkbox: QCheckBox | None = None
@@ -764,7 +865,10 @@ class SessionLaunchOptionsDialog(QDialog):
         return bool(self.tmux_checkbox and self.tmux_checkbox.isChecked())
 
     def model(self) -> str | None:
-        return self.model_edit.text().strip() or None if self.model_edit else None
+        return codex_combo_value(self.codex_model_combo) if self.codex_model_combo else None
+
+    def reasoning_effort(self) -> str | None:
+        return codex_combo_value(self.codex_effort_combo) if self.codex_effort_combo else None
 
 
 @dataclass
@@ -2746,6 +2850,7 @@ class NewSessionDialog(QDialog):
         }
         self.directory: Path | None = None
         self.model: str | None = None
+        self.reasoning_effort: str | None = None
         self.setWindowTitle(f"New {provider} Session")
         self.setMinimumWidth(600)
         layout = QVBoxLayout(self)
@@ -2772,18 +2877,25 @@ class NewSessionDialog(QDialog):
         form.addRow("Location:", self.location)
 
         self.model_combo: QComboBox | None = None
-        self.model_edit: QLineEdit | None = None
+        self.codex_model_combo: QComboBox | None = None
+        self.codex_effort_combo: QComboBox | None = None
         if provider == "Claude":
             self.model_combo = QComboBox()
             for label, alias in CLAUDE_MODELS:
                 self.model_combo.addItem(label, alias)
             form.addRow("Model:", self.model_combo)
         elif provider == "Codex":
-            # No fixed alias list exists for Codex model ids (gpt-5, o3, ...)
-            # the way CLAUDE_MODELS does for Claude, so this is free text.
-            self.model_edit = QLineEdit()
-            self.model_edit.setPlaceholderText("Default (leave blank), or a model id")
-            form.addRow("Model:", self.model_edit)
+            self.codex_model_combo = QComboBox()
+            populate_codex_model_combo(self.codex_model_combo, None)
+            form.addRow("Model:", self.codex_model_combo)
+            self.codex_effort_combo = QComboBox()
+            populate_codex_effort_combo(self.codex_effort_combo, None, None)
+            form.addRow("Effort:", self.codex_effort_combo)
+            self.codex_model_combo.currentIndexChanged.connect(
+                lambda: populate_codex_effort_combo(
+                    self.codex_effort_combo, codex_combo_value(self.codex_model_combo), None
+                )
+            )
 
         self.project_name = QLineEdit()
         self.project_name.setPlaceholderText("project-name")
@@ -2891,8 +3003,9 @@ class NewSessionDialog(QDialog):
         self.directory = directory
         if self.model_combo is not None:
             self.model = self.model_combo.currentData()
-        elif self.model_edit is not None:
-            self.model = self.model_edit.text().strip() or None
+        elif self.codex_model_combo is not None:
+            self.model = codex_combo_value(self.codex_model_combo)
+            self.reasoning_effort = codex_combo_value(self.codex_effort_combo)
         super().accept()
 
 
@@ -2902,8 +3015,12 @@ class LaunchNewGroupSessionsDialog(QDialog):
     Row-table UI only - no directory picker, since the caller (ManageGroupDialog)
     already knows the group's cwd. Each row independently picks a provider
     (Claude or Codex), a model, and a session name, auto-suggested but always
-    editable. Model is a dropdown for Claude (CLAUDE_MODELS) and free text for
-    Codex - there's no fixed alias list for Codex model ids here.
+    editable. Model is a dropdown for both providers - CLAUDE_MODELS' fixed
+    aliases for Claude, codex_models()'s live-fetched roster for Codex (still
+    editable, since that cache can be stale or incomplete). Codex rows also
+    get an Effort dropdown, populated from the selected model's own supported
+    reasoning levels; Claude rows have no per-row equivalent here (its effort
+    is the existing global "--effort" CLI flag, edited via Launch options).
     """
 
     def __init__(
@@ -2934,8 +3051,8 @@ class LaunchNewGroupSessionsDialog(QDialog):
         layout.addWidget(self.tmux_checkbox)
 
         layout.addWidget(QLabel("Sessions to launch:"))
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Provider", "Model", "Name"])
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Provider", "Model", "Effort", "Name"])
         self.table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents
         )
@@ -2943,7 +3060,10 @@ class LaunchNewGroupSessionsDialog(QDialog):
             1, QHeaderView.ResizeMode.ResizeToContents
         )
         self.table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.Stretch
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Stretch
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setMinimumHeight(160)
@@ -2984,23 +3104,37 @@ class LaunchNewGroupSessionsDialog(QDialog):
         name_edit.textEdited.connect(
             lambda _text, edit=name_edit: setattr(edit, "auto_suggested", False)
         )
-        self.table.setCellWidget(row, 2, name_edit)
+        self.table.setCellWidget(row, 3, name_edit)
         self.set_model_widget(row, "Claude")
         self.suggest_name(row)
 
     def set_model_widget(self, row: int, provider: str) -> None:
         if provider == "Claude":
-            model_widget: QComboBox | QLineEdit = QComboBox()
+            model_widget = QComboBox()
             for label, alias in CLAUDE_MODELS:
                 model_widget.addItem(label, alias)
             model_widget.setCurrentIndex(1)
             model_widget.currentIndexChanged.connect(lambda _i, r=row: self.suggest_name(r))
+            # Claude's effort is the existing global "--effort" CLI flag
+            # (edited via Launch options), not a per-row concept here.
+            effort_widget: QComboBox | QLabel = QLabel("—")
         else:
-            # No fixed alias list exists for Codex model ids the way
-            # CLAUDE_MODELS does for Claude, so this is free text.
-            model_widget = QLineEdit()
-            model_widget.setPlaceholderText("Default (leave blank), or a model id")
+            model_widget = QComboBox()
+            populate_codex_model_combo(model_widget, None)
+            effort_widget = QComboBox()
+            populate_codex_effort_combo(effort_widget, None, None)
+            model_widget.currentIndexChanged.connect(
+                lambda _i, r=row: self.on_codex_model_changed(r)
+            )
         self.table.setCellWidget(row, 1, model_widget)
+        self.table.setCellWidget(row, 2, effort_widget)
+
+    def on_codex_model_changed(self, row: int) -> None:
+        model_widget = self.table.cellWidget(row, 1)
+        effort_widget = self.table.cellWidget(row, 2)
+        if isinstance(model_widget, QComboBox) and isinstance(effort_widget, QComboBox):
+            populate_codex_effort_combo(effort_widget, codex_combo_value(model_widget), None)
+        self.suggest_name(row)
 
     def on_provider_changed(self, row: int) -> None:
         provider_combo = self.table.cellWidget(row, 0)
@@ -3020,7 +3154,7 @@ class LaunchNewGroupSessionsDialog(QDialog):
         for row in range(self.table.rowCount()):
             if row == exclude_row:
                 continue
-            edit = self.table.cellWidget(row, 2)
+            edit = self.table.cellWidget(row, 3)
             if edit is not None and edit.text().strip():
                 names.add(edit.text().strip())
         return names
@@ -3028,7 +3162,7 @@ class LaunchNewGroupSessionsDialog(QDialog):
     def suggest_name(self, row: int) -> None:
         if row < 0 or row >= self.table.rowCount():
             return
-        name_edit = self.table.cellWidget(row, 2)
+        name_edit = self.table.cellWidget(row, 3)
         if name_edit is None or not getattr(name_edit, "auto_suggested", True):
             return
         model_widget = self.table.cellWidget(row, 1)
@@ -3046,19 +3180,28 @@ class LaunchNewGroupSessionsDialog(QDialog):
         for row in range(self.table.rowCount()):
             provider_combo = self.table.cellWidget(row, 0)
             model_widget = self.table.cellWidget(row, 1)
-            name_edit = self.table.cellWidget(row, 2)
+            effort_widget = self.table.cellWidget(row, 2)
+            name_edit = self.table.cellWidget(row, 3)
             name = name_edit.text().strip() if name_edit else ""
             if not name:
                 continue
-            if isinstance(model_widget, QComboBox):
-                model = model_widget.currentData()
+            provider = provider_combo.currentData() if provider_combo else "Claude"
+            if provider == "Codex":
+                model = codex_combo_value(model_widget) if model_widget else None
+                effort = (
+                    codex_combo_value(effort_widget)
+                    if isinstance(effort_widget, QComboBox)
+                    else None
+                )
             else:
-                model = model_widget.text().strip() or None if model_widget else None
+                model = model_widget.currentData() if model_widget else None
+                effort = None
             result.append(
                 {
                     "name": name,
-                    "provider": provider_combo.currentData() if provider_combo else "Claude",
+                    "provider": provider,
                     "model": model,
+                    "reasoning_effort": effort,
                 }
             )
         return result
@@ -4677,6 +4820,17 @@ class SessionHub(QMainWindow):
             or None
         )
 
+    def effective_codex_reasoning_effort(self, session_key: str | None) -> str | None:
+        """The reasoning-effort level a Codex session would (re)launch with, if set.
+
+        Session-only, same as effective_model's Codex path - Codex has no
+        global/group env-var tier to fall back through.
+        """
+        overrides: dict = {}
+        if session_key:
+            overrides = (self.metadata.get("sessions") or {}).get(session_key) or {}
+        return overrides.get("reasoning_effort")
+
     def populate_session_table(
         self, table: QTableWidget, sessions: list[Session], columns: tuple[str, ...]
     ) -> None:
@@ -4892,6 +5046,7 @@ class SessionHub(QMainWindow):
             tmux_enabled=bool(existing.get("tmux")),
             provider=session.provider,
             model=existing.get("model"),
+            reasoning_effort=existing.get("reasoning_effort"),
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             entry = self.metadata.setdefault("sessions", {}).setdefault(
@@ -4913,6 +5068,11 @@ class SessionHub(QMainWindow):
                     entry["model"] = model
                 else:
                     entry.pop("model", None)
+                effort = dialog.reasoning_effort()
+                if effort:
+                    entry["reasoning_effort"] = effort
+                else:
+                    entry.pop("reasoning_effort", None)
             if dialog.tmux():
                 entry["tmux"] = True
             else:
@@ -4988,6 +5148,7 @@ class SessionHub(QMainWindow):
         model: str | None = None,
         flags: list[str] | None = None,
         pidfile: Path | None = None,
+        reasoning_effort: str | None = None,
     ) -> list[str]:
         title = f"{provider} — {Path(cwd).name or cwd}"
         launch_cwd = source_cwd if provider == "Claude" and session_id else cwd
@@ -5015,6 +5176,8 @@ class SessionHub(QMainWindow):
                 command += ["--dangerously-bypass-approvals-and-sandbox"]
             if model:
                 command += ["-m", model]
+            if reasoning_effort:
+                command += ["-c", f"model_reasoning_effort={reasoning_effort}"]
             if session_id:
                 command += ["resume", "-C", cwd, session_id]
             else:
@@ -5081,6 +5244,7 @@ class SessionHub(QMainWindow):
         wait_for_tracking: bool = False,
         use_tmux: bool = False,
         tmux_name: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         if not Path(cwd).is_dir():
             QMessageBox.warning(self, "Missing directory", f"This directory does not exist:\n{cwd}")
@@ -5118,6 +5282,8 @@ class SessionHub(QMainWindow):
                         claude_args += ["--dangerously-bypass-approvals-and-sandbox"]
                     if model:
                         claude_args += ["-m", model]
+                    if reasoning_effort:
+                        claude_args += ["-c", f"model_reasoning_effort={reasoning_effort}"]
                     if session_id:
                         claude_args += ["resume", "-C", cwd, session_id]
                     else:
@@ -5142,7 +5308,8 @@ class SessionHub(QMainWindow):
             pidfile = new_pid_capture_file() if provider == "Claude" else None
             self.spawn(
                 self.terminal_command(
-                    provider, session_id, cwd, source_cwd, model, flags, pidfile
+                    provider, session_id, cwd, source_cwd, model, flags, pidfile,
+                    reasoning_effort=reasoning_effort,
                 ),
                 session_key,
                 pidfile=pidfile,
@@ -5180,6 +5347,9 @@ class SessionHub(QMainWindow):
             # here explicitly, unlike Claude's (which rides launch_env's
             # os.environ merge with no extra wiring).
             model=self.effective_model(session.key, session.provider)
+            if session.provider == "Codex"
+            else None,
+            reasoning_effort=self.effective_codex_reasoning_effort(session.key)
             if session.provider == "Codex"
             else None,
             session_key=session.key,
@@ -5754,6 +5924,7 @@ class SessionHub(QMainWindow):
                 None,
                 str(dialog.directory),
                 model=dialog.model,
+                reasoning_effort=dialog.reasoning_effort,
             )
 
     def launch_selected_provider(self) -> None:
@@ -5762,7 +5933,8 @@ class SessionHub(QMainWindow):
     def launch_new_rows_into_group(
         self, cwd: str, rows: list[dict], use_tmux: bool
     ) -> None:
-        """Register and launch each row (`{"name", "provider", "model"}`) into the group at `cwd`.
+        """Register and launch each row (`{"name", "provider", "model", "reasoning_effort"}`)
+        into the group at `cwd`.
 
         Skips any name already present in the group - the same merge
         behavior the removed top-level "New session group…" button had
@@ -5780,7 +5952,9 @@ class SessionHub(QMainWindow):
             if row["name"] in existing_names:
                 continue
             provider = row.get("provider", "Claude")
-            registered = self.register_group_row(cwd, row["name"], provider, row.get("model"))
+            registered = self.register_group_row(
+                cwd, row["name"], provider, row.get("model"), row.get("reasoning_effort")
+            )
             if provider == "Codex":
                 registered["codex_pending_since"] = int(time.time() * 1000)
             self.launch(
@@ -5788,6 +5962,7 @@ class SessionHub(QMainWindow):
                 None,
                 cwd,
                 model=row.get("model") if provider == "Codex" else None,
+                reasoning_effort=row.get("reasoning_effort") if provider == "Codex" else None,
                 session_key=registered["override_key"],
                 flag_overrides={"--name": registered["name"]},
                 focus=False,
@@ -5799,7 +5974,12 @@ class SessionHub(QMainWindow):
         self.refresh()
 
     def register_group_row(
-        self, cwd: str, name: str, provider: str, model_alias: str | None
+        self,
+        cwd: str,
+        name: str,
+        provider: str,
+        model_alias: str | None,
+        reasoning_effort: str | None = None,
     ) -> dict:
         """Build a saved group row, minting its durable override key.
 
@@ -5810,12 +5990,16 @@ class SessionHub(QMainWindow):
         matched to a live session (see find_group_member_session, ManageGroupDialog).
         """
         override_key = f"group:{cwd}#{name}"
-        if model_alias:
+        if model_alias or reasoning_effort:
             entry = self.metadata.setdefault("sessions", {}).setdefault(override_key, {})
             if provider == "Claude":
-                entry.setdefault("env", {})["ANTHROPIC_MODEL"] = model_alias
+                if model_alias:
+                    entry.setdefault("env", {})["ANTHROPIC_MODEL"] = model_alias
             elif provider == "Codex":
-                entry["model"] = model_alias
+                if model_alias:
+                    entry["model"] = model_alias
+                if reasoning_effort:
+                    entry["reasoning_effort"] = reasoning_effort
         return {"name": name, "provider": provider, "override_key": override_key}
 
     def launch_group_row(
@@ -5862,6 +6046,9 @@ class SessionHub(QMainWindow):
             None,
             cwd,
             model=self.effective_model(row["override_key"], provider) if provider == "Codex" else None,
+            reasoning_effort=self.effective_codex_reasoning_effort(row["override_key"])
+            if provider == "Codex"
+            else None,
             session_key=row["override_key"],
             flag_overrides={"--name": row["name"]},
             strip_env=strip_env,
@@ -5909,6 +6096,9 @@ class SessionHub(QMainWindow):
             cwd,
             live.source_cwd,
             model=self.effective_model(row["override_key"], provider)
+            if provider == "Codex"
+            else None,
+            reasoning_effort=self.effective_codex_reasoning_effort(row["override_key"])
             if provider == "Codex"
             else None,
             session_key=row["override_key"],
