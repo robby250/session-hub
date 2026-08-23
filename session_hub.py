@@ -3960,12 +3960,19 @@ class ManageGroupDialog(QDialog):
                 # group silently resumed in a plain terminal instead.
                 # resume_group_row is the same tmux-aware path double-
                 # click already uses.
-                slot = lambda n=row["name"]: self.hub.resume_group_row(self.cwd, n)
+                # 0-arg closure over `row` (fixed for this whole menu, not a
+                # loop variable here), NOT a `lambda n=row["name"]: ...`
+                # default-arg capture: QAction.triggered always emits a
+                # `checked` bool, and PyQt fills a 1-parameter slot's sole
+                # parameter with that bool instead of leaving its default -
+                # silently replacing the row name with `False` and making
+                # the action a no-op.
+                slot = lambda: self.hub.resume_group_row(self.cwd, row["name"])
             if label == "Rename":
                 # The ROW is renamed, not a display override layered over
                 # it -- see rename_group_row_in. One name: table, --name,
                 # tmux session, terminal title.
-                slot = lambda n=row["name"]: self.rename_row(n)
+                slot = lambda: self.rename_row(row["name"])
             action = QAction(label, self)
             action.triggered.connect(slot)
             menu.addAction(action)
