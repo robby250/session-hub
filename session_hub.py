@@ -3712,7 +3712,14 @@ class ManageGroupDialog(QDialog):
             row["name"], self.cwd, self.cwd, 0,
             Path(self.cwd),
         )
-        return replace(base, logical_key=row["override_key"])
+        # title=row["name"], not just logical_key: rename_group_row_in makes
+        # row["name"] the row's one authoritative label and deliberately
+        # drops any separate override["name"] once it moves the bucket - a
+        # matched (already-running) row's own base.title is still whatever
+        # the live process was launched with, so without this a rename kept
+        # writing the new name to metadata/tmux correctly but the table went
+        # on showing the pre-rename name forever.
+        return replace(base, logical_key=row["override_key"], title=row["name"])
 
     def pair_at_table_row(self, table_row: int) -> tuple[dict, Session | None] | None:
         """Resolve a clicked/double-clicked table row to its (row, match) pair.
@@ -4875,11 +4882,20 @@ class SessionHub(QMainWindow):
         for row, session in enumerate(sessions):
             for col, column in enumerate(columns):
                 if column == "Agent":
-                    item = QTableWidgetItem(session.provider)
-                    item.setForeground(QColor(colors.get(session.provider, "#ffffff")))
+                    # A collapsed group's own summary row spans every member's
+                    # provider (see pseudo_provider in discover_sessions) -
+                    # showing one of them as if the whole group were that
+                    # agent is misleading, so it gets its own label instead.
+                    if self.is_group_session(session):
+                        item = QTableWidgetItem("Group")
+                    else:
+                        item = QTableWidgetItem(session.provider)
+                        item.setForeground(QColor(colors.get(session.provider, "#ffffff")))
                 elif column == "Model":
                     item = QTableWidgetItem(
-                        self.effective_model(session.key, session.provider) or "Default"
+                        ""
+                        if self.is_group_session(session)
+                        else self.effective_model(session.key, session.provider) or "Default"
                     )
                 elif column == "Name":
                     item = QTableWidgetItem(session.title)
