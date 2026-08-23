@@ -5324,25 +5324,28 @@ class SessionHub(QMainWindow):
         """Double-click a Running row: bring its terminal to the front.
 
         wmctrl -a already unminimizes as well as raising, so a window that's
-        merely minimized in the taskbar is covered for free. If no window is
-        currently titled for this tmux session at all - closed by the user,
-        or launched outside Session Hub - has-session succeeds and the
-        launch command's new-session branch is skipped, so this only ever
-        opens a fresh terminal attached to the existing session, never a
-        second copy of it.
+        merely minimized in the taskbar is covered for free. wmctrl can only
+        raise a window that already exists, though - it can't materialize
+        one that was never opened (session launched outside Session Hub, or
+        its terminal was closed while tmux kept running headless). For that
+        case, reuse the exact same launch_group_row/resume_session_by_name
+        calls the "All Sessions" double-click already uses successfully -
+        has-session gates their tmux attach, so this only ever opens a
+        terminal onto the existing session, never a second copy of it.
         """
         item = self.running_table.item(row, 0)
         if not item:
             return
         cwd, name = item.data(Qt.ItemDataRole.UserRole)
-        if not window_titled(name):
-            try:
-                command = tmux_group_launch_command(name, cwd, [])
-            except RuntimeError as error:
-                QMessageBox.critical(self, "Could not open session", str(error))
-                return
-            self.spawn(command, cwd=cwd)
-        threading.Thread(target=focus_window_by_title, args=(name,), daemon=True).start()
+        if window_titled(name):
+            threading.Thread(target=focus_window_by_title, args=(name,), daemon=True).start()
+            return
+        if self.metadata.get("groups", {}).get(cwd):
+            result = self.launch_group_row(cwd, name)
+        else:
+            result = self.resume_session_by_name(name)
+        if result.get("status") == "error":
+            QMessageBox.critical(self, "Could not open session", result["message"])
 
     def apply_filter(self) -> None:
         query = self.search.text().strip().lower()
