@@ -693,6 +693,8 @@ class SessionLaunchOptionsDialog(QDialog):
         scope: str = "this session",
         show_tmux: bool = False,
         tmux_enabled: bool = False,
+        provider: str = "Claude",
+        model: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Session launch options")
@@ -719,6 +721,17 @@ class SessionLaunchOptionsDialog(QDialog):
             inherited.setWordWrap(True)
             inherited.setStyleSheet("color: #888;")
             layout.addWidget(inherited)
+        self.model_edit: QLineEdit | None = None
+        if provider == "Codex":
+            # Codex has no ANTHROPIC_MODEL-equivalent env var (its model is a
+            # plain -m/--model argv, see effective_model/terminal_command),
+            # so it gets its own field here instead of living in the env tab.
+            model_row = QHBoxLayout()
+            model_row.addWidget(QLabel("Model:"))
+            self.model_edit = QLineEdit(model or "")
+            self.model_edit.setPlaceholderText("Default (leave blank), or a model id")
+            model_row.addWidget(self.model_edit)
+            layout.addLayout(model_row)
         self.editor = LaunchOptionsEditor(env_overrides, flag_overrides)
         layout.addWidget(self.editor)
         self.tmux_checkbox: QCheckBox | None = None
@@ -749,6 +762,9 @@ class SessionLaunchOptionsDialog(QDialog):
 
     def tmux(self) -> bool:
         return bool(self.tmux_checkbox and self.tmux_checkbox.isChecked())
+
+    def model(self) -> str | None:
+        return self.model_edit.text().strip() or None if self.model_edit else None
 
 
 @dataclass
@@ -4874,6 +4890,8 @@ class SessionHub(QMainWindow):
             self,
             show_tmux=not self.is_group_session(session),
             tmux_enabled=bool(existing.get("tmux")),
+            provider=session.provider,
+            model=existing.get("model"),
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             entry = self.metadata.setdefault("sessions", {}).setdefault(
@@ -4889,6 +4907,12 @@ class SessionHub(QMainWindow):
                 entry["flags"] = flags
             else:
                 entry.pop("flags", None)
+            if session.provider == "Codex":
+                model = dialog.model()
+                if model:
+                    entry["model"] = model
+                else:
+                    entry.pop("model", None)
             if dialog.tmux():
                 entry["tmux"] = True
             else:
@@ -5150,6 +5174,14 @@ class SessionHub(QMainWindow):
             session.session_id,
             session.cwd,
             session.source_cwd,
+            # Codex has no persistent env-var equivalent to ANTHROPIC_MODEL -
+            # its model override only takes effect if threaded through as an
+            # explicit -m/--model argv, so it has to be looked up and passed
+            # here explicitly, unlike Claude's (which rides launch_env's
+            # os.environ merge with no extra wiring).
+            model=self.effective_model(session.key, session.provider)
+            if session.provider == "Codex"
+            else None,
             session_key=session.key,
             # Strip the inherited child-session marker, as launch_group_row already
             # does. A single session has no `transcripts` toggle, so it is always on
@@ -5876,6 +5908,9 @@ class SessionHub(QMainWindow):
             live.session_id,
             cwd,
             live.source_cwd,
+            model=self.effective_model(row["override_key"], provider)
+            if provider == "Codex"
+            else None,
             session_key=row["override_key"],
             use_tmux=group.get("tmux", False),
             tmux_name=row["name"],
@@ -5957,14 +5992,19 @@ class SessionHub(QMainWindow):
         # would silently bleed that unrelated session's old name/env/flags
         # into this one instead of the session actually being moved here.
         row_overrides = {}
-        for field in ("env", "flags", "name"):
+        for field in ("env", "flags", "name", "model"):
             if field in native_overrides:
                 row_overrides[field] = native_overrides[field]
         overrides[override_key] = row_overrides
         if session.cwd != cwd:
             overrides.setdefault(session.native_key, {})["cwd"] = cwd
         group["rows"].append(
-            {"name": name, "override_key": override_key, "session_key": session.native_key}
+            {
+                "name": name,
+                "provider": session.provider,
+                "override_key": override_key,
+                "session_key": session.native_key,
+            }
         )
         write_metadata(self.metadata)
         self.refresh()

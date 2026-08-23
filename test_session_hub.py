@@ -2738,6 +2738,47 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_edit_session_launch_options_for_codex_reads_and_writes_model(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {"Codex:id-1": {"model": "o3"}},
+                "settings": {},
+                "groups": {},
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                session = session_hub.Session(
+                    "Codex", "id-1", "Independent", "/tmp/vamp", "/tmp/vamp",
+                    100, Path("/tmp/a.jsonl"),
+                )
+                dialog_instance = session_hub.SessionLaunchOptionsDialog.__new__(
+                    session_hub.SessionLaunchOptionsDialog
+                )
+                dialog_instance.exec = MagicMock(
+                    return_value=session_hub.QDialog.DialogCode.Accepted
+                )
+                dialog_instance.env = MagicMock(return_value={})
+                dialog_instance.flags = MagicMock(return_value={})
+                dialog_instance.tmux = MagicMock(return_value=False)
+                dialog_instance.model = MagicMock(return_value="gpt-5")
+                with (
+                    patch(
+                        "session_hub.SessionLaunchOptionsDialog",
+                        return_value=dialog_instance,
+                    ) as dialog_cls,
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.edit_session_launch_options_for(session)
+                # Constructed with the session's existing model as the seed.
+                self.assertEqual(dialog_cls.call_args.kwargs["provider"], "Codex")
+                self.assertEqual(dialog_cls.call_args.kwargs["model"], "o3")
+                self.assertEqual(
+                    window.metadata["sessions"]["Codex:id-1"]["model"], "gpt-5"
+                )
+            finally:
+                window.close()
+
     def test_resume_session_launches_via_tmux_when_session_opted_in(self):
         metadata = {
             "sessions": {
@@ -2757,6 +2798,25 @@ class SessionHubTests(unittest.TestCase):
                 window.resume_session(session)
             self.assertTrue(launch.call_args.kwargs["use_tmux"])
             self.assertEqual(launch.call_args.kwargs["tmux_name"], "indie")
+        finally:
+            window.close()
+
+    def test_resume_session_passes_stored_codex_model(self):
+        metadata = {
+            "sessions": {"Codex:id-1": {"model": "gpt-5"}},
+            "settings": {},
+            "groups": {},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            session = session_hub.Session(
+                "Codex", "id-1", "Independent", "/tmp/vamp", "/tmp/vamp",
+                100, Path("/tmp/a.jsonl"),
+            )
+            with patch.object(window, "launch") as launch:
+                window.resume_session(session)
+            self.assertEqual(launch.call_args.kwargs["model"], "gpt-5")
         finally:
             window.close()
 
@@ -3519,11 +3579,49 @@ class SessionHubTests(unittest.TestCase):
                     "abc123",
                     "/tmp/vamp",
                     "/tmp/vamp",
+                    model=None,
                     session_key="group:/tmp/vamp#vamp-s1",
                     use_tmux=True,
                     tmux_name="vamp-s1",
                 )
                 self.assertEqual(result, {"status": "resumed", "name": "vamp-s1"})
+            finally:
+                window.close()
+
+    def test_resume_group_row_passes_stored_codex_model(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {"group:/tmp/vamp#vamp-codex": {"model": "gpt-5"}},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {
+                                "name": "vamp-codex",
+                                "provider": "Codex",
+                                "override_key": "group:/tmp/vamp#vamp-codex",
+                                "session_key": "Codex:abc123",
+                            }
+                        ],
+                    }
+                },
+            }
+            live = session_hub.Session(
+                "Codex", "abc123", "vamp-codex", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/x.jsonl"),
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.codex_sessions", return_value=[live]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.resume_group_row("/tmp/vamp", "vamp-codex")
+                self.assertEqual(launch.call_args.args[0], "Codex")
+                self.assertEqual(launch.call_args.kwargs["model"], "gpt-5")
             finally:
                 window.close()
 
@@ -3867,6 +3965,42 @@ class SessionHubTests(unittest.TestCase):
                 self.assertEqual(group["display_name"], "My New Group")
                 self.assertEqual(len(group["rows"]), 1)
                 self.assertEqual(group["rows"][0]["name"], "vampulse-orchestrator")
+            finally:
+                window.close()
+
+    def test_file_session_into_group_stamps_provider_and_hides_codex_session(self):
+        # Regression: file_session_into_group used to omit "provider" from
+        # the saved row, so find_group_member_session (default "Claude")
+        # never matched a filed Codex session back on the next refresh - it
+        # stayed visible as a duplicate ungrouped row in the main list
+        # forever instead of collapsing into the group.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {"/tmp/vamp": {"cwd": "/tmp/vamp", "rows": []}},
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                session = session_hub.Session(
+                    "Codex", "id-1", "vamp-codex", "/tmp/vamp", "/tmp/vamp",
+                    100, Path("/tmp/x.jsonl"),
+                )
+                with (
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.codex_sessions", return_value=[session]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.file_session_into_group(session, "/tmp/vamp")
+                row = window.metadata["groups"]["/tmp/vamp"]["rows"][0]
+                self.assertEqual(row["provider"], "Codex")
+                self.assertFalse(
+                    any(s.session_id == "id-1" for s in window.sessions),
+                    "Codex session should collapse into its group, not stay a duplicate row",
+                )
+                self.assertTrue(any(s.session_id == "group:/tmp/vamp" for s in window.sessions))
             finally:
                 window.close()
 
