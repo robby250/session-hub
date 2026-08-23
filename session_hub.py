@@ -1828,6 +1828,10 @@ def find_group_member_session(
        matched to, kept alive across a /clear or manual relink because the active
        session's `linked_keys` (from metadata["links"]) still contains it. This is
        what lets a row survive a restart that has no agent-name record at all.
+       Not cwd-gated: an exact session_key match (or linked_keys membership) is
+       already unambiguous identity, and a long-running agent's own cwd can
+       legitimately drift (cd into a worktree, a subdirectory, etc.) without
+       that meaning the row now belongs to a different session.
     2. `--name` (Session.agent_name, parsed from the transcript's own agent-name
        record - see _scan_claude_file) plus cwd - the bootstrap match, used before
        any session_key has been recorded (a row's first launch). Claude-only:
@@ -1850,16 +1854,13 @@ def find_group_member_session(
             (
                 session
                 for session in sessions
-                if session.cwd == cwd
-                and (
-                    (session.provider == provider and session.native_key == session_key)
-                    # A cross-provider link (e.g. Claude row linked to a Codex
-                    # continuation) makes the merged session's own .provider
-                    # differ from the row's original provider - linked_keys
-                    # membership is already a strong identity match, so it
-                    # must not also require the provider to still agree.
-                    or session_key in session.linked_keys
-                )
+                if (session.provider == provider and session.native_key == session_key)
+                # A cross-provider link (e.g. Claude row linked to a Codex
+                # continuation) makes the merged session's own .provider
+                # differ from the row's original provider - linked_keys
+                # membership is already a strong identity match, so it
+                # must not also require the provider to still agree.
+                or session_key in session.linked_keys
             ),
             None,
         )
