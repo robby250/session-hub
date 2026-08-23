@@ -5609,8 +5609,6 @@ class SessionHub(QMainWindow):
                 # from the session's actual root - see the matching comment
                 # in launch()'s tmux branch, which hits the identical issue.
                 command += ["resume", "-C", launch_cwd, session_id]
-                if Path(launch_cwd) != Path(cwd):
-                    command += [f"/cd {cwd}"]
             else:
                 command += ["-C", cwd]
             if initial_prompt:
@@ -5733,8 +5731,6 @@ class SessionHub(QMainWindow):
                         # that fork at all - same reasoning terminal_command's
                         # Claude branch already applies via its own launch_cwd.
                         claude_args += ["resume", "-C", source_cwd or cwd, session_id]
-                        if source_cwd and Path(source_cwd) != Path(cwd):
-                            claude_args += [f"/cd {cwd}"]
                     else:
                         claude_args += ["-C", cwd]
                     if initial_prompt:
