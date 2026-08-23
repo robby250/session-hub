@@ -3904,11 +3904,17 @@ class ManageGroupDialog(QDialog):
         # the first place, leaving the row's Agent/Last updated blank and its
         # context menu stuck on the "not launched" set.
         for session in live:
+            # Only the link's designated *active* member gets linked_keys,
+            # mirroring discover_sessions - setting it on every member let
+            # find_group_member_session's next() match whichever member
+            # happens to sort first in `live` (Claude before Codex), so a
+            # cross-provider link matched the stale non-active session
+            # instead of the one the link actually points at.
             link = next(
                 (
                     entry
                     for entry in links.values()
-                    if session.native_key in entry.get("members", [])
+                    if entry.get("active") == session.native_key
                 ),
                 None,
             )
