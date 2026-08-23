@@ -1403,11 +1403,32 @@ class SessionHubTests(unittest.TestCase):
     @patch("session_hub.shutil.which", return_value="/usr/bin/wmctrl")
     @patch("session_hub.subprocess.run")
     def test_focus_window_by_title_activates_matching_window(self, run, which):
-        run.return_value = MagicMock(stdout="0x01 0 host Claude — session-hub\n")
+        run.return_value = MagicMock(
+            stdout="0x01 0 gnome-terminal-server.Gnome-terminal host Claude — session-hub\n"
+        )
         session_hub.focus_window_by_title("Claude — session-hub")
         self.assertEqual(
             run.call_args.args[0],
-            ["/usr/bin/wmctrl", "-a", "Claude — session-hub"],
+            ["/usr/bin/wmctrl", "-i", "-a", "0x01"],
+        )
+
+    @patch("session_hub.shutil.which", return_value="/usr/bin/wmctrl")
+    @patch("session_hub.subprocess.run")
+    def test_focus_window_by_title_ignores_non_terminal_window_with_same_title(self, run, which):
+        """A Claude session renamed to match Session Hub's own window title
+        ("Session Hub" - exactly what happened for this project's own dev
+        session) must not cause the launcher's own window to be treated as
+        the terminal to reveal."""
+        run.return_value = MagicMock(
+            stdout=(
+                "0x01 0 session_hub.py.Session Hub host Session Hub\n"
+                "0x02 0 gnome-terminal-server.Gnome-terminal host Session Hub\n"
+            )
+        )
+        session_hub.focus_window_by_title("Session Hub")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/usr/bin/wmctrl", "-i", "-a", "0x02"],
         )
 
     @patch("session_hub.shutil.which", return_value=None)

@@ -1995,21 +1995,43 @@ def native_session_index() -> dict[str, Session]:
     return {session.native_key: session for session in sessions}
 
 
-def window_titled(title: str) -> bool:
-    """True if any currently open window's title contains `title` right now.
+def _terminal_windows() -> list[tuple[str, str]]:
+    """(window_id, title) for every currently open gnome-terminal window.
 
-    A single wmctrl -l snapshot, not the poll loop focus_window_by_title runs
-    - callers use this to decide whether a window to reveal already exists
-    versus needs to be opened first.
+    wmctrl -l's title-only view can't tell a terminal window from Session
+    Hub's own main window - if a Claude/Codex session gets renamed to match
+    the launcher's own "Session Hub" window title (exactly what happened for
+    this project's own dev session), a plain substring-on-title match picks
+    whichever window wmctrl lists first, which may well be the launcher
+    itself rather than the terminal. -lx adds a WM_CLASS column;
+    gnome-terminal's is always "gnome-terminal-server.Gnome-terminal", never
+    the launcher's own - filtering on it, then activating by window ID
+    rather than by title, is the only way to guarantee the right window.
     """
     wmctrl = shutil.which("wmctrl")
     if not wmctrl:
-        return False
+        return []
     try:
-        result = subprocess.run([wmctrl, "-l"], capture_output=True, text=True, timeout=1)
+        result = subprocess.run([wmctrl, "-lx"], capture_output=True, text=True, timeout=1)
     except (OSError, subprocess.TimeoutExpired):
-        return False
-    return any(title in line for line in result.stdout.splitlines())
+        return []
+    windows = []
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) == 5 and "gnome-terminal" in parts[2].lower():
+            windows.append((parts[0], parts[4]))
+    return windows
+
+
+def window_titled(title: str) -> bool:
+    """True if a currently open gnome-terminal window's title contains
+    `title` right now.
+
+    A single wmctrl -lx snapshot, not the poll loop focus_window_by_title
+    runs - callers use this to decide whether a window to reveal already
+    exists versus needs to be opened first.
+    """
+    return any(title in window_title for _, window_title in _terminal_windows())
 
 
 def focus_window_by_title(title: str, timeout: float = 3.0) -> None:
@@ -2027,15 +2049,9 @@ def focus_window_by_title(title: str, timeout: float = 3.0) -> None:
         return
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        try:
-            result = subprocess.run(
-                [wmctrl, "-l"], capture_output=True, text=True, timeout=1
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return
-        for line in result.stdout.splitlines():
-            if title in line:
-                subprocess.run([wmctrl, "-a", title], timeout=1)
+        for window_id, window_title in _terminal_windows():
+            if title in window_title:
+                subprocess.run([wmctrl, "-i", "-a", window_id], timeout=1)
                 return
         time.sleep(0.15)
 
