@@ -6396,8 +6396,10 @@ class SessionHub(QMainWindow):
         return actions
 
     def context_menu(self, point) -> None:
-        if self.table.itemAt(point) is None:
+        item = self.table.itemAt(point)
+        if item is None:
             return
+        self.table.setCurrentCell(item.row(), item.column())
         menu = QMenu(self)
         for label, slot in self.context_menu_actions():
             action = QAction(label, self)
