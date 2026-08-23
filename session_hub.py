@@ -5346,6 +5346,14 @@ class SessionHub(QMainWindow):
             result = self.resume_session_by_name(name)
         if result.get("status") == "error":
             QMessageBox.critical(self, "Could not open session", result["message"])
+            return
+        # tmux_group_launch_command never passes gnome-terminal a --title=,
+        # so spawn()'s own focus branch (which only fires for a --title=
+        # command) never triggers for it - the new window's stacking is
+        # left entirely up to GNOME, which is not reliable enough to count
+        # on with several other windows open. Same wmctrl activation used
+        # above for an already-open window, just given time to appear first.
+        threading.Thread(target=focus_window_by_title, args=(name,), daemon=True).start()
 
     def apply_filter(self) -> None:
         query = self.search.text().strip().lower()
