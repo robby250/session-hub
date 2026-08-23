@@ -861,61 +861,38 @@ class SessionHubTests(unittest.TestCase):
             self.assertIn("I found the bug.", text)
             self.assertNotIn("secret-command", text)
 
-    def test_handoff_includes_prepared_summary_when_available(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            transcript = root / "codex.jsonl"
-            transcript.write_text("", encoding="utf-8")
-            session = session_hub.Session(
-                "Codex",
-                "id",
-                "Project",
-                str(root),
-                str(root),
-                0,
-                transcript,
-            )
-            with (
-                patch("session_hub.HANDOFF_DIR", root / "handoffs"),
-                patch("session_hub.SUMMARY_DIR", root / "summaries"),
-            ):
-                prepared = session_hub.summary_path(session.key)
-                prepared.parent.mkdir(parents=True)
-                prepared.write_text(
-                    "# Agent Handoff Summary\nImportant decision.",
-                    encoding="utf-8",
-                )
-                handoff = session_hub.write_handoff(session, "Claude")
-            text = handoff.read_text(encoding="utf-8")
-            self.assertIn("Prepared full-session summary", text)
-            self.assertIn("Important decision.", text)
-
-    def test_prepared_summary_handoff_keeps_recent_context_compact(self):
+    def test_handoff_includes_full_compact_summary_when_present(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             transcript = root / "claude.jsonl"
             rows = [
                 {
                     "type": "user",
+                    "uuid": "before",
                     "message": {"content": "Earlier context " + "x" * 30000},
                 },
                 {
                     "type": "user",
-                    "message": {
-                        "content": (
-                            "Prepare a handoff summary for another coding agent. "
-                            "This should not be copied."
-                        )
-                    },
+                    "uuid": "compact-1",
+                    "isCompactSummary": True,
+                    "message": {"content": "Older compaction, superseded."},
+                },
+                {
+                    "type": "user",
+                    "uuid": "compact-2",
+                    "isCompactSummary": True,
+                    "message": {"content": "Complete summary " + "y" * 15000},
                 },
                 {
                     "type": "assistant",
+                    "uuid": "noise",
                     "message": {
                         "content": "You've hit your session limit · resets later"
                     },
                 },
                 {
                     "type": "user",
+                    "uuid": "after",
                     "message": {"content": "Latest real request"},
                 },
             ]
@@ -932,23 +909,15 @@ class SessionHubTests(unittest.TestCase):
                 0,
                 transcript,
             )
-            with (
-                patch("session_hub.HANDOFF_DIR", root / "handoffs"),
-                patch("session_hub.SUMMARY_DIR", root / "summaries"),
-            ):
-                prepared = session_hub.summary_path(session.key)
-                prepared.parent.mkdir(parents=True)
-                prepared.write_text(
-                    "# Agent Handoff Summary\nComplete summary.",
-                    encoding="utf-8",
-                )
+            with patch("session_hub.HANDOFF_DIR", root / "handoffs"):
                 handoff = session_hub.write_handoff(session, "Codex")
             text = handoff.read_text(encoding="utf-8")
-            self.assertIn("Complete summary.", text)
+            self.assertIn("Full /compact summary", text)
+            self.assertIn("Complete summary " + "y" * 15000, text)
+            self.assertNotIn("Older compaction, superseded.", text)
+            self.assertNotIn("Earlier context", text)
             self.assertIn("Latest real request", text)
-            self.assertNotIn("This should not be copied.", text)
             self.assertNotIn("You've hit your session limit", text)
-            self.assertLess(len(text), 20000)
 
     def test_long_handoff_message_has_explicit_omission_marker(self):
         compacted = session_hub.compact_message("a" * 20000, 12000)
@@ -1011,43 +980,6 @@ class SessionHubTests(unittest.TestCase):
         self.assertIn("resume", codex)
         self.assertIn("codex-existing", codex)
         self.assertTrue(any("/tmp/handoff.md" in value for value in codex))
-        window.close()
-
-    @patch("session_hub.shutil.which")
-    def test_summary_command_resumes_active_agent(self, which):
-        which.side_effect = lambda name: {
-            "gnome-terminal": "/usr/bin/gnome-terminal",
-            "codex": "/home/user/.local/bin/codex",
-            "claude": "/home/user/.local/bin/claude",
-        }.get(name)
-        window = session_hub.SessionHub()
-        codex_session = session_hub.Session(
-            "Codex",
-            "codex-id",
-            "Linked",
-            "/home/user",
-            "/home/user",
-            0,
-            Path("/tmp/codex.jsonl"),
-        )
-        claude_session = session_hub.Session(
-            "Claude",
-            "claude-id",
-            "Linked",
-            "/home/user/new",
-            "/home/user/original",
-            0,
-            Path("/tmp/claude.jsonl"),
-        )
-        with patch("session_hub.SUMMARY_DIR", Path("/tmp/session-hub-summaries")):
-            codex = window.summary_terminal_command(codex_session)
-            claude = window.summary_terminal_command(claude_session)
-        self.assertIn("resume", codex)
-        self.assertIn("codex-id", codex)
-        self.assertIn("--resume", claude)
-        self.assertIn("claude-id", claude)
-        self.assertIn("--working-directory=/home/user/original", claude)
-        self.assertTrue(any("Agent Handoff Summary" in value for value in codex))
         window.close()
 
     def test_continue_with_other_agent_sets_correct_target_provider(self):
@@ -4672,7 +4604,6 @@ class SessionHubTests(unittest.TestCase):
         with patch("session_hub.read_metadata", return_value=single_agent):
             window = session_hub.SessionHub()
         self.assertTrue(window.continue_with_other_button.isHidden())
-        self.assertTrue(window.prepare_handoff_button.isHidden())
         # context_menu_actions() with no session falls through to selected(),
         # which pops a real (blocking, never auto-dismissed) QMessageBox when
         # nothing is selected in a fresh table - patch it out like every
@@ -4680,7 +4611,6 @@ class SessionHubTests(unittest.TestCase):
         with patch.object(window, "selected", return_value=None):
             labels = [label for label, _ in window.context_menu_actions()]
         self.assertNotIn("Continue with other agent", labels)
-        self.assertNotIn("Prepare handoff summary", labels)
         window.close()
 
     def test_handoff_actions_shown_with_multiple_agents_enabled(self):
@@ -4695,11 +4625,9 @@ class SessionHubTests(unittest.TestCase):
         with patch("session_hub.read_metadata", return_value=multiple_agents):
             window = session_hub.SessionHub()
         self.assertFalse(window.continue_with_other_button.isHidden())
-        self.assertFalse(window.prepare_handoff_button.isHidden())
         with patch.object(window, "selected", return_value=None):
             labels = [label for label, _ in window.context_menu_actions()]
         self.assertIn("Continue with other agent", labels)
-        self.assertIn("Prepare handoff summary", labels)
         window.close()
 
     def test_project_move_works_in_both_directions(self):

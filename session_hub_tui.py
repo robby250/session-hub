@@ -73,6 +73,12 @@ def stop_session(key: str) -> dict:
     return run_cli(["--stop-session", key])
 
 
+def resume_session(wanted: str) -> dict:
+    # Same offscreen-QApplication path as launch_group_row - --resume-session
+    # is the standalone counterpart to --launch-group-row.
+    return run_cli(["--resume-session", wanted], offscreen=True)
+
+
 class ConfirmScreen(ModalScreen[bool]):
     """Minimal y/n confirm modal - stop is destructive, per the grilled decision."""
 
@@ -235,13 +241,13 @@ class MainPane(Vertical):
     def action_refresh(self) -> None:
         self.refresh_data()
 
-    def on_data_table_row_selected(self, _event: DataTable.RowSelected) -> None:
+    async def on_data_table_row_selected(self, _event: DataTable.RowSelected) -> None:
         table = self.query_one("#main", DataTable)
         if table.cursor_row is None or not self.filtered:
             return
         session = self.filtered[table.cursor_row]
         if not session["is_group"]:
-            self.notify(f"{session['title']}: not tmux-controllable from here (use the desktop GUI).")
+            await self.handle_standalone(session)
             return
         cwd = session["cwd"]
         group = self.data.get("groups", {}).get(cwd)
@@ -249,6 +255,27 @@ class MainPane(Vertical):
             self.notify("No group metadata for this session.", severity="error")
             return
         self.app.push_screen(GroupScreen(cwd, group["display_name"], group["rows"]))
+
+    async def handle_standalone(self, session: dict) -> None:
+        if not session["tmux"]:
+            self.notify(f"{session['title']}: not launched in tmux (use the desktop GUI).")
+            return
+        if session["status"] == "Running":
+            self.app.exit((None, session["tmux_name"]))
+            return
+        self.notify(f"Launching {session['title']}…")
+        result = await asyncio.to_thread(resume_session, session["key"])
+        if result.get("status") == "error":
+            self.notify(result.get("message", "Launch failed"), severity="error")
+            return
+        for _ in range(10):
+            await asyncio.sleep(0.5)
+            data = await asyncio.to_thread(sessions_json)
+            fresh = next((s for s in data.get("sessions", []) if s["key"] == session["key"]), None)
+            if fresh and fresh["status"] == "Running":
+                self.app.exit((None, fresh["tmux_name"]))
+                return
+        self.notify(f"{session['title']} did not come up in time", severity="warning")
 
 
 class RunningPane(Vertical):

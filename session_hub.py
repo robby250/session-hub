@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import concurrent.futures
-import hashlib
 import fcntl
 import os
 import pty
@@ -108,7 +107,6 @@ def _cached_file_scan(path: Path, scan) -> dict:
     return result
 TRASH_DIR = DATA_DIR / "trash"
 HANDOFF_DIR = DATA_DIR / "handoffs"
-SUMMARY_DIR = HANDOFF_DIR / "summaries"
 # Tracks Claude processes Session Hub itself launched, so a same-directory
 # /clear inside that same process (new session id, same PID) can be detected
 # and linked to the session it continues - see pid_capture_command and
@@ -1728,6 +1726,18 @@ def resolve_pending_handoffs(metadata: dict, sessions: list[Session]) -> bool:
         if target.native_key not in link["members"]:
             link["members"].append(target.native_key)
         link["active"] = target.native_key
+        model = item.get("model")
+        reasoning_effort = item.get("reasoning_effort")
+        if model or reasoning_effort:
+            entry = metadata.setdefault("sessions", {}).setdefault(target.native_key, {})
+            if target.provider == "Claude":
+                if model:
+                    entry.setdefault("env", {})["ANTHROPIC_MODEL"] = model
+            elif target.provider == "Codex":
+                if model:
+                    entry["model"] = model
+                if reasoning_effort:
+                    entry["reasoning_effort"] = reasoning_effort
         changed = True
     metadata["pending_handoffs"] = remaining
     return changed
@@ -1827,10 +1837,14 @@ def find_group_member_session(
             (
                 session
                 for session in sessions
-                if session.provider == provider
-                and session.cwd == cwd
+                if session.cwd == cwd
                 and (
-                    session.native_key == session_key
+                    (session.provider == provider and session.native_key == session_key)
+                    # A cross-provider link (e.g. Claude row linked to a Codex
+                    # continuation) makes the merged session's own .provider
+                    # differ from the row's original provider - linked_keys
+                    # membership is already a strong identity match, so it
+                    # must not also require the provider to still agree.
                     or session_key in session.linked_keys
                 )
             ),
@@ -2563,8 +2577,7 @@ def text_from_content(content) -> str:
 def handoff_noise(text: str) -> bool:
     normalized = text.strip()
     return (
-        normalized.startswith("Prepare a handoff summary for another coding agent.")
-        or normalized.startswith("You've hit your session limit")
+        normalized.startswith("You've hit your session limit")
         or normalized.startswith("You have ")
         and "weighted tokens left" in normalized
     )
@@ -2580,13 +2593,20 @@ def compact_message(text: str, limit: int) -> str:
     return text[:head] + marker + text[-tail:]
 
 
-def transcript_messages(session: Session, max_chars: int = 50000) -> list[tuple[str, str]]:
+def transcript_messages(
+    session: Session, max_chars: int = 50000, after_uuid: str | None = None
+) -> list[tuple[str, str]]:
+    """`after_uuid` skips every row up to and including the one with that
+    uuid - used to show only what happened since the last /compact instead of
+    re-showing (and truncating) content latest_compact_summary already
+    captured in full."""
     messages = []
     transcript_path = (
         antigravity_transcript_path(session.session_id)
         if session.provider == "Antigravity"
         else session.path
     )
+    seen_after = after_uuid is None
     try:
         with transcript_path.open(encoding="utf-8", errors="replace") as handle:
             for line in handle:
@@ -2595,6 +2615,10 @@ def transcript_messages(session: Session, max_chars: int = 50000) -> list[tuple[
                 try:
                     row = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if not seen_after:
+                    if row.get("uuid") == after_uuid:
+                        seen_after = True
                     continue
                 role = ""
                 text = ""
@@ -2649,6 +2673,43 @@ def transcript_messages(session: Session, max_chars: int = 50000) -> list[tuple[
     return list(reversed(selected))
 
 
+def latest_compact_summary(session: Session) -> tuple[str | None, str | None]:
+    """Full text + row uuid of the most recent /compact summary in a Claude
+    transcript, or (None, None) for any other provider or if there isn't one.
+
+    Claude Code marks a compaction's summary row with "isCompactSummary": true
+    (message.content holds the entire prior-context summary). A session can be
+    compacted more than once - each compaction's summary is written to cover
+    everything up to that point, so only the LAST such row matters; scan
+    forward and keep overwriting.
+    """
+    if session.provider != "Claude":
+        return None, None
+    summary: str | None = None
+    summary_uuid: str | None = None
+    try:
+        with session.path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if len(line) > 2_000_000:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not row.get("isCompactSummary") or row.get("type") != "user":
+                    continue
+                message = row.get("message", {})
+                text = text_from_content(
+                    message.get("content") if isinstance(message, dict) else message
+                )
+                if text:
+                    summary = text
+                    summary_uuid = row.get("uuid")
+    except OSError:
+        return None, None
+    return summary, summary_uuid
+
+
 def project_state(cwd: str) -> str:
     if not (Path(cwd) / ".git").exists():
         return "No Git repository detected at the working directory."
@@ -2664,35 +2725,6 @@ def project_state(cwd: str) -> str:
         return result.stdout.strip() or "Git working tree is clean."
     except (OSError, subprocess.TimeoutExpired):
         return "Git status unavailable."
-
-
-def summary_path(logical_key: str) -> Path:
-    digest = hashlib.sha256(logical_key.encode("utf-8")).hexdigest()[:20]
-    return SUMMARY_DIR / f"{digest}.md"
-
-
-def summary_prompt(session: Session) -> str:
-    path = summary_path(session.key)
-    return (
-        "Prepare a handoff summary for another coding agent. Review this session's "
-        "full conversation and the current project state. Write the summary directly "
-        f"to this exact file: {path}\n\n"
-        "Use these headings:\n"
-        "# Agent Handoff Summary\n"
-        "## Objective\n"
-        "## User Requirements and Preferences\n"
-        "## Important Decisions and Rationale\n"
-        "## Completed Work\n"
-        "## Files Changed\n"
-        "## Current State and Verification\n"
-        "## Remaining Work\n"
-        "## Known Problems and Risks\n"
-        "## Recommended Next Steps\n\n"
-        "Be concrete and concise, but preserve details needed to continue without "
-        "re-reading the entire transcript. Do not include credentials, tokens, API "
-        "keys, private prompt text, or irrelevant tool output. Create parent "
-        "directories if needed. After writing the file, reply with its path."
-    )
 
 
 def write_handoff(session: Session, target_provider: str) -> Path:
@@ -2714,30 +2746,23 @@ def write_handoff(session: Session, target_provider: str) -> Path:
         "```",
         "",
     ]
-    prepared = summary_path(session.key)
-    summary = ""
-    if prepared.is_file():
-        try:
-            summary = prepared.read_text(encoding="utf-8", errors="replace").strip()
-        except OSError:
-            summary = ""
-        if summary:
-            lines.extend(
-                (
-                    "## Prepared full-session summary",
-                    "",
-                    compact_message(summary, 35000),
-                    "",
-                )
+    summary, summary_uuid = latest_compact_summary(session)
+    if summary:
+        lines.extend(
+            (
+                "## Full /compact summary",
+                "",
+                compact_message(summary, 100000),  # safety ceiling only, not a real limit
+                "",
             )
+        )
     lines.extend(
         (
         "## Recent conversation",
         "",
         )
     )
-    recent_limit = 12000 if summary else 50000
-    for role, text in transcript_messages(session, max_chars=recent_limit):
+    for role, text in transcript_messages(session, max_chars=50000, after_uuid=summary_uuid):
         lines.extend((f"### {role.capitalize()}", "", text, ""))
     lines.extend(
         (
@@ -3155,6 +3180,65 @@ class NewSessionDialog(QDialog):
             QMessageBox.warning(self, "Missing folder", f"Folder not found:\n{directory}")
             return
         self.directory = directory
+        if self.model_combo is not None:
+            self.model = self.model_combo.currentData()
+        elif self.codex_model_combo is not None:
+            self.model = codex_combo_value(self.codex_model_combo)
+            self.reasoning_effort = codex_combo_value(self.codex_effort_combo)
+        super().accept()
+
+
+class AgentModelEffortDialog(QDialog):
+    """Model/effort picker for a single already-known provider.
+
+    Used by continue_with_other_agent_for the first time it hands a session
+    to a provider with no existing linked session to swap back into instead
+    (see SessionHub.continue_with_other_agent_for) - same combo widgets
+    NewSessionDialog builds for its own provider-conditioned fields, minus
+    the provider choice itself, since that's already been made by the time
+    this dialog opens.
+    """
+
+    def __init__(self, provider: str, parent=None) -> None:
+        super().__init__(parent)
+        self.provider = provider
+        self.model: str | None = None
+        self.reasoning_effort: str | None = None
+        self.setWindowTitle(f"{provider} model")
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.model_combo: QComboBox | None = None
+        self.codex_model_combo: QComboBox | None = None
+        self.codex_effort_combo: QComboBox | None = None
+        if provider == "Claude":
+            self.model_combo = QComboBox()
+            for label, alias in CLAUDE_MODELS:
+                self.model_combo.addItem(label, alias)
+            form.addRow("Model:", self.model_combo)
+        elif provider == "Codex":
+            self.codex_model_combo = QComboBox()
+            populate_codex_model_combo(self.codex_model_combo, None)
+            form.addRow("Model:", self.codex_model_combo)
+            self.codex_effort_combo = QComboBox()
+            populate_codex_effort_combo(self.codex_effort_combo, None, None)
+            form.addRow("Effort:", self.codex_effort_combo)
+            self.codex_model_combo.currentIndexChanged.connect(
+                lambda: populate_codex_effort_combo(
+                    self.codex_effort_combo, codex_combo_value(self.codex_model_combo), None
+                )
+            )
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def accept(self) -> None:
         if self.model_combo is not None:
             self.model = self.model_combo.currentData()
         elif self.codex_model_combo is not None:
@@ -4608,7 +4692,6 @@ class SessionHub(QMainWindow):
             ("Rename", self.rename_selected),
             ("Change directory", self.change_directory),
             ("Delete", self.delete_selected),
-            ("Prepare handoff summary", self.prepare_handoff_summary),
             ("Continue with other agent", self.continue_with_other_agent),
             ("Resume in new terminal", self.resume_selected),
         ):
@@ -4618,8 +4701,6 @@ class SessionHub(QMainWindow):
                 button.setDefault(True)
             if label == "Continue with other agent":
                 self.continue_with_other_button = button
-            elif label == "Prepare handoff summary":
-                self.prepare_handoff_button = button
             actions.addWidget(button)
         all_sessions_layout.addLayout(actions)
 
@@ -4709,7 +4790,6 @@ class SessionHub(QMainWindow):
         # Handoffs need a second enabled agent to hand off to.
         multiple_agents = len(enabled_providers) > 1
         self.continue_with_other_button.setVisible(multiple_agents)
-        self.prepare_handoff_button.setVisible(multiple_agents)
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.settings(), self)
@@ -5467,6 +5547,7 @@ class SessionHub(QMainWindow):
         flags: list[str] | None = None,
         pidfile: Path | None = None,
         reasoning_effort: str | None = None,
+        initial_prompt: str | None = None,
     ) -> list[str]:
         title = f"{provider} — {Path(cwd).name or cwd}"
         launch_cwd = source_cwd if provider == "Claude" and session_id else cwd
@@ -5500,6 +5581,8 @@ class SessionHub(QMainWindow):
                 command += ["resume", "-C", cwd, session_id]
             else:
                 command += ["-C", cwd]
+            if initial_prompt:
+                command += [initial_prompt]
         elif provider == "Claude":
             claude_args = [executable("claude")]
             if self.settings().get("claude_danger_mode", False):
@@ -5511,6 +5594,8 @@ class SessionHub(QMainWindow):
                 claude_args += ["--resume", session_id]
                 if Path(launch_cwd) != Path(cwd):
                     claude_args += [f"/cd {cwd}"]
+            if initial_prompt:
+                claude_args += [initial_prompt]
             if pidfile is not None:
                 command += pid_capture_command(pidfile, claude_args)
             else:
@@ -5521,6 +5606,8 @@ class SessionHub(QMainWindow):
                 command += ["--dangerously-skip-permissions"]
             if session_id:
                 command += ["--conversation", session_id]
+            if initial_prompt:
+                command += ["--prompt-interactive", initial_prompt]
         return command
 
     def group_env_overrides(self, session_key: str | None) -> dict[str, str]:
@@ -5563,6 +5650,7 @@ class SessionHub(QMainWindow):
         use_tmux: bool = False,
         tmux_name: str | None = None,
         reasoning_effort: str | None = None,
+        initial_prompt: str | None = None,
     ) -> None:
         if not Path(cwd).is_dir():
             QMessageBox.warning(self, "Missing directory", f"This directory does not exist:\n{cwd}")
@@ -5606,6 +5694,8 @@ class SessionHub(QMainWindow):
                         claude_args += ["resume", "-C", cwd, session_id]
                     else:
                         claude_args += ["-C", cwd]
+                    if initial_prompt:
+                        claude_args += [initial_prompt]
                 else:
                     claude_args = [executable("claude")]
                     if self.settings().get("claude_danger_mode", False):
@@ -5615,6 +5705,8 @@ class SessionHub(QMainWindow):
                     claude_args += flags
                     if session_id:
                         claude_args += ["--resume", session_id]
+                    if initial_prompt:
+                        claude_args += [initial_prompt]
                 claude_args = prefix_env_command(
                     claude_args, self.group_env_overrides(session_key), strip_env
                 )
@@ -5627,7 +5719,7 @@ class SessionHub(QMainWindow):
             self.spawn(
                 self.terminal_command(
                     provider, session_id, cwd, source_cwd, model, flags, pidfile,
-                    reasoning_effort=reasoning_effort,
+                    reasoning_effort=reasoning_effort, initial_prompt=initial_prompt,
                 ),
                 session_key,
                 pidfile=pidfile,
@@ -6041,77 +6133,6 @@ class SessionHub(QMainWindow):
             command += ["--prompt-interactive", prompt]
         return command
 
-    def summary_terminal_command(self, session: Session) -> list[str]:
-        terminal = shutil.which("gnome-terminal") or shutil.which(
-            "x-terminal-emulator"
-        )
-        if not terminal:
-            raise RuntimeError("No supported terminal emulator was found.")
-        SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
-        prompt = summary_prompt(session)
-        launch_cwd = session.source_cwd if session.provider == "Claude" else session.cwd
-        command = [terminal]
-        if Path(terminal).name == "gnome-terminal":
-            command += [
-                "--window",
-                f"--working-directory={launch_cwd}",
-                f"--title={session.provider} — Prepare handoff",
-                "--",
-            ]
-        else:
-            command += ["-e"]
-        if session.provider == "Codex":
-            command += [executable("codex")]
-            if self.settings().get("codex_danger_mode", False):
-                command += ["--dangerously-bypass-approvals-and-sandbox"]
-            command += ["resume", "-C", session.cwd, session.session_id, prompt]
-        elif session.provider == "Claude":
-            command += [executable("claude")]
-            if self.settings().get("claude_danger_mode", False):
-                command += ["--dangerously-skip-permissions"]
-            command += self.launch_flags(session.key)
-            command += ["--resume", session.session_id, prompt]
-        else:
-            command += [executable("agy")]
-            if self.settings().get("antigravity_danger_mode", False):
-                command += ["--dangerously-skip-permissions"]
-            command += [
-                "--conversation",
-                session.session_id,
-                "--prompt-interactive",
-                prompt,
-            ]
-        return command
-
-    def prepare_handoff_summary(self) -> None:
-        session = self.selected()
-        if not session:
-            return
-        self.prepare_handoff_summary_for(session)
-
-    def prepare_handoff_summary_for(self, session: Session) -> None:
-        path = summary_path(session.key)
-        existing = path.is_file()
-        answer = QMessageBox.question(
-            self,
-            "Prepare handoff summary?",
-            f"This will resume {session.provider} and use some of its remaining "
-            f"usage to {'replace' if existing else 'create'} a structured handoff "
-            f"summary.\n\nOutput:\n{path}\n\nContinue?",
-            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
-            QMessageBox.StandardButton.Cancel,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        if existing:
-            path.unlink(missing_ok=True)
-        try:
-            self.spawn(self.summary_terminal_command(session), session.key)
-        except (OSError, RuntimeError) as error:
-            QMessageBox.critical(
-                self, "Could not prepare handoff summary", str(error)
-            )
-
     def continue_with_other_agent(self) -> None:
         session = self.selected()
         if not session:
@@ -6153,8 +6174,36 @@ class SessionHub(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+        group_cwd = self.group_cwd_for_session_key(session.key)
+        group_row = None
+        if group_cwd:
+            group_row = next(
+                (
+                    row
+                    for row in self.metadata["groups"][group_cwd]["rows"]
+                    if row.get("override_key") == session.key
+                ),
+                None,
+            )
+        if group_row is not None:
+            use_tmux = self.effective_tmux(self.metadata["groups"][group_cwd].get("tmux"))
+            tmux_name = group_row["name"]
+        else:
+            overrides = (self.metadata.get("sessions") or {}).get(session.key, {})
+            use_tmux = self.effective_tmux(overrides.get("tmux"))
+            tmux_name = (
+                (overrides.get("flags") or {}).get("--name")
+                or overrides.get("name")
+                or session.title
+            )
         try:
             handoff = write_handoff(session, target)
+            prompt = (
+                f"Continue the existing task using the handoff file at {handoff}. "
+                "Read the entire file first, using section ranges or chunks if one "
+                "tool output is truncated. Then inspect the current project state "
+                "and continue naturally."
+            )
             logical_key = session.key
             members = list(session.linked_keys or (session.native_key,))
             link = self.metadata.setdefault("links", {}).setdefault(
@@ -6177,31 +6226,63 @@ class SessionHub(QMainWindow):
             )
 
             if existing_target:
+                # Swapping back to a destination already launched once before -
+                # reuse whatever model/effort it was already launched with
+                # rather than asking again (resume_session's own convention,
+                # session_hub.py:5667-5672).
+                model = (
+                    self.effective_model(existing_target.key, target)
+                    if target != "Claude"
+                    else None
+                )
+                reasoning_effort = (
+                    self.effective_codex_reasoning_effort(existing_target.key)
+                    if target == "Codex"
+                    else None
+                )
+            else:
+                dialog = AgentModelEffortDialog(target, self)
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+                model = dialog.model
+                reasoning_effort = dialog.reasoning_effort
+
+            if use_tmux:
+                stop_tmux_session(tmux_name)
+
+            if existing_target:
                 link["active"] = existing_target.native_key
-                command = self.handoff_terminal_command(
+                self.launch(
                     target,
-                    session.cwd,
-                    handoff,
-                    session.title,
                     existing_target.session_id,
-                    resume_existing=True,
+                    session.cwd,
                     source_cwd=existing_target.source_cwd,
-                    flags=self.launch_flags(existing_target.key)
-                    if target == "Claude"
-                    else None,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    session_key=existing_target.key,
+                    initial_prompt=prompt,
+                    use_tmux=use_tmux,
+                    tmux_name=tmux_name,
                 )
             elif target == "Claude":
                 target_id = str(uuid.uuid4())
                 target_key = f"Claude:{target_id}"
                 link["members"].append(target_key)
                 link["active"] = target_key
-                command = self.handoff_terminal_command(
+                if model:
+                    self.metadata.setdefault("sessions", {}).setdefault(
+                        target_key, {}
+                    ).setdefault("env", {})["ANTHROPIC_MODEL"] = model
+                self.launch(
                     target,
+                    None,
                     session.cwd,
-                    handoff,
-                    session.title,
-                    target_id,
-                    flags=self.launch_flags(target_key),
+                    model=model,
+                    session_key=target_key,
+                    flag_overrides={"--name": session.title, "--session-id": target_id},
+                    initial_prompt=prompt,
+                    use_tmux=use_tmux,
+                    tmux_name=tmux_name,
                 )
             else:
                 provider_sessions = (
@@ -6218,13 +6299,48 @@ class SessionHub(QMainWindow):
                         "started_ms": int(datetime.now().timestamp() * 1000) - 1000,
                         "expires_ms": int(datetime.now().timestamp() * 1000)
                         + 15 * 60 * 1000,
+                        # No session id exists yet to key this model/effort
+                        # choice onto - resolve_pending_handoffs writes it onto
+                        # the real native key once discovered, so a later swap
+                        # back to this provider (now an existing_target) still
+                        # finds it via effective_model/effective_codex_reasoning_effort.
+                        "model": model,
+                        "reasoning_effort": reasoning_effort,
                     }
                 )
-                command = self.handoff_terminal_command(
-                    target, session.cwd, handoff, session.title
+                self.launch(
+                    target,
+                    None,
+                    session.cwd,
+                    model=model,
+                    reasoning_effort=reasoning_effort if target == "Codex" else None,
+                    initial_prompt=prompt,
+                    use_tmux=use_tmux,
+                    tmux_name=tmux_name,
                 )
+
+            if group_row is not None:
+                # The group row's own provider is what find_group_member_session
+                # filters new session matches by - left stale, the merged
+                # (now-target-provider) session can never be folded back into
+                # the group and shows up as a separate standalone row instead.
+                group_row["provider"] = target
+                override_key = group_row["override_key"]
+                if target == "Claude":
+                    if model:
+                        self.metadata.setdefault("sessions", {}).setdefault(
+                            override_key, {}
+                        ).setdefault("env", {})["ANTHROPIC_MODEL"] = model
+                elif target == "Codex":
+                    entry = self.metadata.setdefault("sessions", {}).setdefault(
+                        override_key, {}
+                    )
+                    if model:
+                        entry["model"] = model
+                    if reasoning_effort:
+                        entry["reasoning_effort"] = reasoning_effort
+
             write_metadata(self.metadata)
-            self.spawn(command, session.key)
             QTimer.singleShot(2500, self.poll_handoffs)
         except OSError as error:
             QMessageBox.critical(self, "Could not create handoff", str(error))
@@ -6683,10 +6799,6 @@ class SessionHub(QMainWindow):
                 ),
             ),
             (
-                "Prepare handoff summary",
-                bound(self.prepare_handoff_summary, self.prepare_handoff_summary_for),
-            ),
-            (
                 "Continue with other agent",
                 bound(self.continue_with_other_agent, self.continue_with_other_agent_for),
             ),
@@ -6709,7 +6821,7 @@ class SessionHub(QMainWindow):
             actions = [
                 (label, slot)
                 for label, slot in actions
-                if label not in ("Prepare handoff summary", "Continue with other agent")
+                if label != "Continue with other agent"
             ]
         return actions
 
