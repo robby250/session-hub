@@ -6406,7 +6406,14 @@ class SessionHub(QMainWindow):
                     source_cwd=existing_target.source_cwd,
                     model=model,
                     reasoning_effort=reasoning_effort,
-                    session_key=existing_target.key,
+                    # lookup_key (not existing_target.key): launch_env/
+                    # launch_flags/group_launch_options resolve group-tier
+                    # and session-tier env/flag overrides by override_key
+                    # for a group row - the native key finds neither, so a
+                    # Claude reuse (model=None above, relying entirely on
+                    # the ANTHROPIC_MODEL env var) silently lost its model
+                    # and launched with the CLI's bare default instead.
+                    session_key=lookup_key,
                     initial_prompt=prompt,
                     use_tmux=use_tmux,
                     tmux_name=tmux_name,
