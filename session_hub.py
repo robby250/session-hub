@@ -3243,10 +3243,19 @@ class AgentModelEffortDialog(QDialog):
     (see SessionHub.continue_with_other_agent_for) - same combo widgets
     NewSessionDialog builds for its own provider-conditioned fields, minus
     the provider choice itself, since that's already been made by the time
-    this dialog opens.
+    this dialog opens. default_model/default_reasoning_effort preselect the
+    group's (or session's) already-configured launch options for `provider`,
+    so a first-time handoff doesn't silently fall back to "Default" even
+    though this group has always launched that provider with e.g. Opus.
     """
 
-    def __init__(self, provider: str, parent=None) -> None:
+    def __init__(
+        self,
+        provider: str,
+        parent=None,
+        default_model: str | None = None,
+        default_reasoning_effort: str | None = None,
+    ) -> None:
         super().__init__(parent)
         self.provider = provider
         self.model: str | None = None
@@ -3262,13 +3271,16 @@ class AgentModelEffortDialog(QDialog):
             self.model_combo = QComboBox()
             for label, alias in CLAUDE_MODELS:
                 self.model_combo.addItem(label, alias)
+            index = self.model_combo.findData(default_model) if default_model else -1
+            if index >= 0:
+                self.model_combo.setCurrentIndex(index)
             form.addRow("Model:", self.model_combo)
         elif provider == "Codex":
             self.codex_model_combo = QComboBox()
-            populate_codex_model_combo(self.codex_model_combo, None)
+            populate_codex_model_combo(self.codex_model_combo, default_model)
             form.addRow("Model:", self.codex_model_combo)
             self.codex_effort_combo = QComboBox()
-            populate_codex_effort_combo(self.codex_effort_combo, None, None)
+            populate_codex_effort_combo(self.codex_effort_combo, default_model, default_reasoning_effort)
             form.addRow("Effort:", self.codex_effort_combo)
             self.codex_model_combo.currentIndexChanged.connect(
                 lambda: populate_codex_effort_combo(
@@ -6349,7 +6361,24 @@ class SessionHub(QMainWindow):
                     else None
                 )
             else:
-                dialog = AgentModelEffortDialog(target, self)
+                # No linked session for `target` yet to reuse a model/effort
+                # from - fall back to whatever this group/session is already
+                # configured to launch `target` with (same source
+                # effective_model/effective_codex_reasoning_effort read the
+                # existing_target branch above), so the dialog preselects it
+                # instead of always defaulting to "Default".
+                default_model = self.effective_model(session.key, target)
+                default_reasoning_effort = (
+                    self.effective_codex_reasoning_effort(session.key)
+                    if target == "Codex"
+                    else None
+                )
+                dialog = AgentModelEffortDialog(
+                    target,
+                    self,
+                    default_model=default_model,
+                    default_reasoning_effort=default_reasoning_effort,
+                )
                 if dialog.exec() != QDialog.DialogCode.Accepted:
                     return
                 model = dialog.model
