@@ -6349,14 +6349,24 @@ class SessionHub(QMainWindow):
                 # Swapping back to a destination already launched once before -
                 # reuse whatever model/effort it was already launched with
                 # rather than asking again (resume_session's own convention,
-                # session_hub.py:5667-5672).
+                # session_hub.py:5667-5672). A group row's model/effort is
+                # always written onto its override_key (the group_row sync
+                # write further below, and register_group_row's own
+                # convention elsewhere) - existing_target.key is the raw
+                # native provider key instead, a different identity that
+                # never receives that write, so a group session must be
+                # looked up by override_key or the stored value never
+                # round-trips on the next swap back.
+                lookup_key = (
+                    group_row["override_key"] if group_row is not None else existing_target.key
+                )
                 model = (
-                    self.effective_model(existing_target.key, target)
+                    self.effective_model(lookup_key, target)
                     if target != "Claude"
                     else None
                 )
                 reasoning_effort = (
-                    self.effective_codex_reasoning_effort(existing_target.key)
+                    self.effective_codex_reasoning_effort(lookup_key)
                     if target == "Codex"
                     else None
                 )
