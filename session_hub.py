@@ -2152,6 +2152,10 @@ def tmux_group_launch_command(name: str, cwd: str, claude_args: list[str]) -> li
     # identifies the window, the tmux session and the Claude session.
     # `-g` is a SERVER option, so it does not survive the tmux server dying -- setting it on EVERY
     # launch is deliberate, cheap and idempotent, and beats a ~/.tmux.conf the user has to maintain.
+    # focus-events: off by default, and tmux swallows the outer terminal's focus in/out escapes
+    # without it -- so Claude Code's AskUserQuestion AFK auto-continue timeout (which only starts
+    # once it sees a focus-out) never fires for a tmux-launched session no matter what
+    # askUserQuestionTimeout is set to.
     # `--window`: without it, gnome-terminal's D-Bus server folds a launch that lands while another
     # of its windows is still opening into a TAB of that existing window instead of a new one - hit
     # by ctrl-click-launching two group rows together (VAMPULSE-orchestrator + a worker), where the
@@ -2163,6 +2167,7 @@ def tmux_group_launch_command(name: str, cwd: str, claude_args: list[str]) -> li
         '"$1" has-session -t "$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
         ' "$1" set-option -g set-titles on >/dev/null;'
         ' "$1" set-option -g set-titles-string "#S" >/dev/null;'
+        ' "$1" set-option -g focus-events on >/dev/null;'
         ' exec "$5" --window -- "$1" attach -t "$2"',
         "session-hub",
         tmux,

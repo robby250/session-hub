@@ -1539,6 +1539,7 @@ class SessionHubTests(unittest.TestCase):
                 '"$1" has-session -t "$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
                 ' "$1" set-option -g set-titles on >/dev/null;'
                 ' "$1" set-option -g set-titles-string "#S" >/dev/null;'
+                ' "$1" set-option -g focus-events on >/dev/null;'
                 ' exec "$5" --window -- "$1" attach -t "$2"',
                 "session-hub",
                 "/usr/bin/tmux",
