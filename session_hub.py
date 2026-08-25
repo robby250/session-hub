@@ -3016,6 +3016,17 @@ class SettingsDialog(QDialog):
         launch_layout.addWidget(self.launch_options)
         layout.addWidget(launch_group)
 
+        self.enable_accounts = QCheckBox("Enable multiple Claude accounts")
+        self.enable_accounts.setToolTip(
+            "Adds an Account picker (alongside Model) to New Session, group "
+            "rows, and agent handoffs, for switching which logged-in Claude "
+            "Code account (CLAUDE_CONFIG_DIR) a session launches as. Off by "
+            "default until a second account actually exists - see "
+            "setup_claude_account.sh."
+        )
+        self.enable_accounts.setChecked(bool(settings.get("claude_accounts_enabled", False)))
+        layout.addWidget(self.enable_accounts)
+
         accounts_group = QGroupBox("Claude accounts")
         accounts_layout = QVBoxLayout(accounts_group)
         accounts_note = QLabel(
@@ -3034,6 +3045,8 @@ class SettingsDialog(QDialog):
             custom_description="CLAUDE_CONFIG_DIR for this account.",
         )
         accounts_layout.addWidget(self.accounts_editor)
+        accounts_group.setVisible(self.enable_accounts.isChecked())
+        self.enable_accounts.toggled.connect(accounts_group.setVisible)
         layout.addWidget(accounts_group)
 
         buttons = QDialogButtonBox(
@@ -3082,6 +3095,7 @@ class SettingsDialog(QDialog):
                 ),
                 "global_env": self.env_editor.env(),
                 "global_flags": self.flags_editor.env(),
+                "claude_accounts_enabled": self.enable_accounts.isChecked(),
                 "claude_accounts": self.accounts_editor.env(),
                 "launch_in_tmux": self.launch_in_tmux.isChecked(),
             }
@@ -3165,9 +3179,10 @@ class NewSessionDialog(QDialog):
             for label, alias in CLAUDE_MODELS:
                 self.model_combo.addItem(label, alias)
             form.addRow("Model:", self.model_combo)
-            self.account_combo = QComboBox()
-            populate_claude_account_combo(self.account_combo, self.claude_accounts, None)
-            form.addRow("Account:", self.account_combo)
+            if settings.get("claude_accounts_enabled"):
+                self.account_combo = QComboBox()
+                populate_claude_account_combo(self.account_combo, self.claude_accounts, None)
+                form.addRow("Account:", self.account_combo)
         elif provider == "Codex":
             self.codex_model_combo = QComboBox()
             populate_codex_model_combo(self.codex_model_combo, None)
@@ -3317,6 +3332,7 @@ class AgentModelEffortDialog(QDialog):
         default_reasoning_effort: str | None = None,
         claude_accounts: dict[str, str] | None = None,
         default_account: str | None = None,
+        accounts_enabled: bool = False,
     ) -> None:
         super().__init__(parent)
         self.provider = provider
@@ -3339,11 +3355,12 @@ class AgentModelEffortDialog(QDialog):
             if index >= 0:
                 self.model_combo.setCurrentIndex(index)
             form.addRow("Model:", self.model_combo)
-            self.account_combo = QComboBox()
-            populate_claude_account_combo(
-                self.account_combo, claude_accounts or DEFAULT_CLAUDE_ACCOUNTS, default_account
-            )
-            form.addRow("Account:", self.account_combo)
+            if accounts_enabled:
+                self.account_combo = QComboBox()
+                populate_claude_account_combo(
+                    self.account_combo, claude_accounts or DEFAULT_CLAUDE_ACCOUNTS, default_account
+                )
+                form.addRow("Account:", self.account_combo)
         elif provider == "Codex":
             self.codex_model_combo = QComboBox()
             populate_codex_model_combo(self.codex_model_combo, default_model)
@@ -3398,6 +3415,7 @@ class LaunchNewGroupSessionsDialog(QDialog):
         tmux: bool,
         parent=None,
         claude_accounts: dict[str, str] | None = None,
+        accounts_enabled: bool = False,
     ) -> None:
         super().__init__(parent)
         self.cwd = cwd
@@ -3405,6 +3423,7 @@ class LaunchNewGroupSessionsDialog(QDialog):
         self.group_rows: list[dict] = []
         self.use_tmux: bool = tmux
         self.claude_accounts = claude_accounts or DEFAULT_CLAUDE_ACCOUNTS
+        self.accounts_enabled = accounts_enabled
         self.setWindowTitle("Launch new sessions")
         self.setMinimumWidth(560)
         layout = QVBoxLayout(self)
@@ -3443,6 +3462,7 @@ class LaunchNewGroupSessionsDialog(QDialog):
             4, QHeaderView.ResizeMode.Stretch
         )
         self.table.verticalHeader().setVisible(False)
+        self.table.setColumnHidden(3, not self.accounts_enabled)
         self.table.setMinimumHeight(160)
         layout.addWidget(self.table)
 
@@ -3495,8 +3515,11 @@ class LaunchNewGroupSessionsDialog(QDialog):
             # Claude's effort is the existing global "--effort" CLI flag
             # (edited via Launch options), not a per-row concept here.
             effort_widget: QComboBox | QLabel = QLabel("—")
-            account_widget: QComboBox | QLabel = QComboBox()
-            populate_claude_account_combo(account_widget, self.claude_accounts, None)
+            if self.accounts_enabled:
+                account_widget: QComboBox | QLabel = QComboBox()
+                populate_claude_account_combo(account_widget, self.claude_accounts, None)
+            else:
+                account_widget = QLabel("—")
         else:
             model_widget = QComboBox()
             populate_codex_model_combo(model_widget, None)
@@ -4279,6 +4302,7 @@ class ManageGroupDialog(QDialog):
             self.tmux_checkbox.isChecked(),
             self,
             claude_accounts=self.hub.settings().get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS,
+            accounts_enabled=bool(self.hub.settings().get("claude_accounts_enabled")),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.group_rows:
             return
@@ -6525,6 +6549,7 @@ class SessionHub(QMainWindow):
                     default_reasoning_effort=default_reasoning_effort,
                     claude_accounts=self.settings().get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS,
                     default_account=default_account,
+                    accounts_enabled=bool(self.settings().get("claude_accounts_enabled")),
                 )
                 if dialog.exec() != QDialog.DialogCode.Accepted:
                     return
