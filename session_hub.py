@@ -129,6 +129,23 @@ CLAUDE_MODELS = (
     ("Fable", "fable"),
 )
 
+# Name -> CLAUDE_CONFIG_DIR, edited via SettingsDialog's "Claude accounts"
+# EnvEditor. Falls back to just the account already logged in at ~/.claude
+# until the user adds more (see setup_claude_account.sh for provisioning a
+# second one with everything but credentials symlinked from this).
+DEFAULT_CLAUDE_ACCOUNTS = {"Default": str(HOME / ".claude")}
+
+
+def populate_claude_account_combo(
+    combo: QComboBox, accounts: dict[str, str], current: str | None
+) -> None:
+    combo.addItem("Default account", None)
+    for name, config_dir in accounts.items():
+        combo.addItem(name, config_dir)
+    index = combo.findData(current) if current else -1
+    if index >= 0:
+        combo.setCurrentIndex(index)
+
 
 def codex_models() -> list[dict]:
     """Codex's own model roster, from the CLI's local cache of the models it can see.
@@ -259,6 +276,15 @@ ENV_VAR_SPECS: dict[str, dict] = {
         "suggestions": ["opus", "sonnet", "haiku", "fable"],
         "placeholder": "opus / sonnet / full model id",
         "description": "Override the default model. A family alias or a full model id.",
+    },
+    "CLAUDE_CONFIG_DIR": {
+        "kind": "text",
+        "placeholder": "~/.claude-2",
+        "description": (
+            "Which Claude Code account this launches as (its own credentials, "
+            "usage limits, login). See Settings → Claude accounts and "
+            "setup_claude_account.sh for provisioning a second one."
+        ),
     },
     "BASH_DEFAULT_TIMEOUT_MS": {
         "kind": "int", "min": 1000, "max": 1800000, "step": 1000,
@@ -2990,6 +3016,26 @@ class SettingsDialog(QDialog):
         launch_layout.addWidget(self.launch_options)
         layout.addWidget(launch_group)
 
+        accounts_group = QGroupBox("Claude accounts")
+        accounts_layout = QVBoxLayout(accounts_group)
+        accounts_note = QLabel(
+            "Name each Claude Code account you're logged into and its "
+            "CLAUDE_CONFIG_DIR (e.g. ~/.claude-2, provisioned with "
+            "setup_claude_account.sh). Pick one per session/group row from "
+            "its launch options or the New Session dialog."
+        )
+        accounts_note.setWordWrap(True)
+        accounts_layout.addWidget(accounts_note)
+        self.accounts_editor = EnvEditor(
+            settings.get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS,
+            specs={},
+            name_label="Account name",
+            item_noun="account",
+            custom_description="CLAUDE_CONFIG_DIR for this account.",
+        )
+        accounts_layout.addWidget(self.accounts_editor)
+        layout.addWidget(accounts_group)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Cancel
@@ -3036,6 +3082,7 @@ class SettingsDialog(QDialog):
                 ),
                 "global_env": self.env_editor.env(),
                 "global_flags": self.flags_editor.env(),
+                "claude_accounts": self.accounts_editor.env(),
                 "launch_in_tmux": self.launch_in_tmux.isChecked(),
             }
         )
@@ -3082,6 +3129,8 @@ class NewSessionDialog(QDialog):
         self.directory: Path | None = None
         self.model: str | None = None
         self.reasoning_effort: str | None = None
+        self.account_config_dir: str | None = None
+        self.claude_accounts = settings.get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS
         self.setWindowTitle(f"New {provider} Session")
         self.setMinimumWidth(600)
         layout = QVBoxLayout(self)
@@ -3108,6 +3157,7 @@ class NewSessionDialog(QDialog):
         form.addRow("Location:", self.location)
 
         self.model_combo: QComboBox | None = None
+        self.account_combo: QComboBox | None = None
         self.codex_model_combo: QComboBox | None = None
         self.codex_effort_combo: QComboBox | None = None
         if provider == "Claude":
@@ -3115,6 +3165,9 @@ class NewSessionDialog(QDialog):
             for label, alias in CLAUDE_MODELS:
                 self.model_combo.addItem(label, alias)
             form.addRow("Model:", self.model_combo)
+            self.account_combo = QComboBox()
+            populate_claude_account_combo(self.account_combo, self.claude_accounts, None)
+            form.addRow("Account:", self.account_combo)
         elif provider == "Codex":
             self.codex_model_combo = QComboBox()
             populate_codex_model_combo(self.codex_model_combo, None)
@@ -3234,6 +3287,8 @@ class NewSessionDialog(QDialog):
         self.directory = directory
         if self.model_combo is not None:
             self.model = self.model_combo.currentData()
+            if self.account_combo is not None:
+                self.account_config_dir = self.account_combo.currentData()
         elif self.codex_model_combo is not None:
             self.model = codex_combo_value(self.codex_model_combo)
             self.reasoning_effort = codex_combo_value(self.codex_effort_combo)
@@ -3260,16 +3315,20 @@ class AgentModelEffortDialog(QDialog):
         parent=None,
         default_model: str | None = None,
         default_reasoning_effort: str | None = None,
+        claude_accounts: dict[str, str] | None = None,
+        default_account: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.provider = provider
         self.model: str | None = None
         self.reasoning_effort: str | None = None
+        self.account_config_dir: str | None = None
         self.setWindowTitle(f"{provider} model")
         layout = QVBoxLayout(self)
         form = QFormLayout()
 
         self.model_combo: QComboBox | None = None
+        self.account_combo: QComboBox | None = None
         self.codex_model_combo: QComboBox | None = None
         self.codex_effort_combo: QComboBox | None = None
         if provider == "Claude":
@@ -3280,6 +3339,11 @@ class AgentModelEffortDialog(QDialog):
             if index >= 0:
                 self.model_combo.setCurrentIndex(index)
             form.addRow("Model:", self.model_combo)
+            self.account_combo = QComboBox()
+            populate_claude_account_combo(
+                self.account_combo, claude_accounts or DEFAULT_CLAUDE_ACCOUNTS, default_account
+            )
+            form.addRow("Account:", self.account_combo)
         elif provider == "Codex":
             self.codex_model_combo = QComboBox()
             populate_codex_model_combo(self.codex_model_combo, default_model)
@@ -3305,6 +3369,8 @@ class AgentModelEffortDialog(QDialog):
     def accept(self) -> None:
         if self.model_combo is not None:
             self.model = self.model_combo.currentData()
+            if self.account_combo is not None:
+                self.account_config_dir = self.account_combo.currentData()
         elif self.codex_model_combo is not None:
             self.model = codex_combo_value(self.codex_model_combo)
             self.reasoning_effort = codex_combo_value(self.codex_effort_combo)
@@ -3326,13 +3392,19 @@ class LaunchNewGroupSessionsDialog(QDialog):
     """
 
     def __init__(
-        self, cwd: str, existing_names: set[str], tmux: bool, parent=None
+        self,
+        cwd: str,
+        existing_names: set[str],
+        tmux: bool,
+        parent=None,
+        claude_accounts: dict[str, str] | None = None,
     ) -> None:
         super().__init__(parent)
         self.cwd = cwd
         self.existing_names = existing_names
         self.group_rows: list[dict] = []
         self.use_tmux: bool = tmux
+        self.claude_accounts = claude_accounts or DEFAULT_CLAUDE_ACCOUNTS
         self.setWindowTitle("Launch new sessions")
         self.setMinimumWidth(560)
         layout = QVBoxLayout(self)
@@ -3353,8 +3425,8 @@ class LaunchNewGroupSessionsDialog(QDialog):
         layout.addWidget(self.tmux_checkbox)
 
         layout.addWidget(QLabel("Sessions to launch:"))
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Provider", "Model", "Effort", "Name"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Provider", "Model", "Effort", "Account", "Name"])
         self.table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.ResizeToContents
         )
@@ -3365,7 +3437,10 @@ class LaunchNewGroupSessionsDialog(QDialog):
             2, QHeaderView.ResizeMode.ResizeToContents
         )
         self.table.horizontalHeader().setSectionResizeMode(
-            3, QHeaderView.ResizeMode.Stretch
+            3, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.Stretch
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setMinimumHeight(160)
@@ -3406,7 +3481,7 @@ class LaunchNewGroupSessionsDialog(QDialog):
         name_edit.textEdited.connect(
             lambda _text, edit=name_edit: setattr(edit, "auto_suggested", False)
         )
-        self.table.setCellWidget(row, 3, name_edit)
+        self.table.setCellWidget(row, 4, name_edit)
         self.set_model_widget(row, "Claude")
         self.suggest_name(row)
 
@@ -3420,6 +3495,8 @@ class LaunchNewGroupSessionsDialog(QDialog):
             # Claude's effort is the existing global "--effort" CLI flag
             # (edited via Launch options), not a per-row concept here.
             effort_widget: QComboBox | QLabel = QLabel("—")
+            account_widget: QComboBox | QLabel = QComboBox()
+            populate_claude_account_combo(account_widget, self.claude_accounts, None)
         else:
             model_widget = QComboBox()
             populate_codex_model_combo(model_widget, None)
@@ -3428,8 +3505,12 @@ class LaunchNewGroupSessionsDialog(QDialog):
             model_widget.currentIndexChanged.connect(
                 lambda _i, r=row: self.on_codex_model_changed(r)
             )
+            # Account is a Claude-only concept - Codex/Antigravity have no
+            # equivalent CLAUDE_CONFIG_DIR-style multi-login mechanism here.
+            account_widget = QLabel("—")
         self.table.setCellWidget(row, 1, model_widget)
         self.table.setCellWidget(row, 2, effort_widget)
+        self.table.setCellWidget(row, 3, account_widget)
 
     def on_codex_model_changed(self, row: int) -> None:
         model_widget = self.table.cellWidget(row, 1)
@@ -3456,7 +3537,7 @@ class LaunchNewGroupSessionsDialog(QDialog):
         for row in range(self.table.rowCount()):
             if row == exclude_row:
                 continue
-            edit = self.table.cellWidget(row, 3)
+            edit = self.table.cellWidget(row, 4)
             if edit is not None and edit.text().strip():
                 names.add(edit.text().strip())
         return names
@@ -3464,7 +3545,7 @@ class LaunchNewGroupSessionsDialog(QDialog):
     def suggest_name(self, row: int) -> None:
         if row < 0 or row >= self.table.rowCount():
             return
-        name_edit = self.table.cellWidget(row, 3)
+        name_edit = self.table.cellWidget(row, 4)
         if name_edit is None or not getattr(name_edit, "auto_suggested", True):
             return
         model_widget = self.table.cellWidget(row, 1)
@@ -3483,7 +3564,8 @@ class LaunchNewGroupSessionsDialog(QDialog):
             provider_combo = self.table.cellWidget(row, 0)
             model_widget = self.table.cellWidget(row, 1)
             effort_widget = self.table.cellWidget(row, 2)
-            name_edit = self.table.cellWidget(row, 3)
+            account_widget = self.table.cellWidget(row, 3)
+            name_edit = self.table.cellWidget(row, 4)
             name = name_edit.text().strip() if name_edit else ""
             if not name:
                 continue
@@ -3495,15 +3577,22 @@ class LaunchNewGroupSessionsDialog(QDialog):
                     if isinstance(effort_widget, QComboBox)
                     else None
                 )
+                account_config_dir = None
             else:
                 model = model_widget.currentData() if model_widget else None
                 effort = None
+                account_config_dir = (
+                    account_widget.currentData()
+                    if isinstance(account_widget, QComboBox)
+                    else None
+                )
             result.append(
                 {
                     "name": name,
                     "provider": provider,
                     "model": model,
                     "reasoning_effort": effort,
+                    "account_config_dir": account_config_dir,
                 }
             )
         return result
@@ -4185,7 +4274,11 @@ class ManageGroupDialog(QDialog):
         group = self.group()
         existing_names = {row["name"] for row in group.get("rows", [])} if group else set()
         dialog = LaunchNewGroupSessionsDialog(
-            self.cwd, existing_names, self.tmux_checkbox.isChecked(), self
+            self.cwd,
+            existing_names,
+            self.tmux_checkbox.isChecked(),
+            self,
+            claude_accounts=self.hub.settings().get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.group_rows:
             return
@@ -5216,6 +5309,28 @@ class SessionHub(QMainWindow):
             or None
         )
 
+    def effective_account(self, session_key: str | None) -> str | None:
+        """The CLAUDE_CONFIG_DIR a Claude session would (re)launch with, if set.
+
+        Same global-then-group-then-session-override precedence as
+        effective_model, storing/reading through the same env dict - see
+        register_group_row. No Codex/Antigravity equivalent: the account
+        concept is Claude-account-specific.
+        """
+        global_env = self.settings().get("global_env") or {}
+        group_env, _ = self.group_launch_options(session_key)
+        overrides: dict = {}
+        if session_key:
+            overrides = (
+                (self.metadata.get("sessions") or {}).get(session_key) or {}
+            ).get("env") or {}
+        return (
+            overrides.get("CLAUDE_CONFIG_DIR")
+            or group_env.get("CLAUDE_CONFIG_DIR")
+            or global_env.get("CLAUDE_CONFIG_DIR")
+            or None
+        )
+
     def effective_codex_reasoning_effort(self, session_key: str | None) -> str | None:
         """The reasoning-effort level a Codex session would (re)launch with, if set.
 
@@ -5502,11 +5617,15 @@ class SessionHub(QMainWindow):
         strip_env: list[str] | None = None,
         wait_for_tracking: bool = False,
         model: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> None:
+        env = self.launch_env(session_key, strip=strip_env)
+        if extra_env:
+            env = {**(env or os.environ), **extra_env}
         subprocess.Popen(
             command,
             start_new_session=True,
-            env=self.launch_env(session_key, strip=strip_env),
+            env=env,
         )
         title = next(
             (arg[len("--title="):] for arg in command if arg.startswith("--title=")),
@@ -5767,6 +5886,7 @@ class SessionHub(QMainWindow):
         tmux_name: str | None = None,
         reasoning_effort: str | None = None,
         initial_prompt: str | None = None,
+        account_config_dir: str | None = None,
     ) -> None:
         if not Path(cwd).is_dir():
             QMessageBox.warning(self, "Missing directory", f"This directory does not exist:\n{cwd}")
@@ -5832,9 +5952,10 @@ class SessionHub(QMainWindow):
                         claude_args += ["--resume", session_id]
                     if initial_prompt:
                         claude_args += [initial_prompt]
-                claude_args = prefix_env_command(
-                    claude_args, self.group_env_overrides(session_key), strip_env
-                )
+                env_overrides = self.group_env_overrides(session_key)
+                if account_config_dir:
+                    env_overrides = {**env_overrides, "CLAUDE_CONFIG_DIR": account_config_dir}
+                claude_args = prefix_env_command(claude_args, env_overrides, strip_env)
                 command = tmux_group_launch_command(name, cwd, claude_args)
                 self.spawn(
                     command, session_key, cwd=cwd, focus=focus, strip_env=strip_env
@@ -5854,6 +5975,7 @@ class SessionHub(QMainWindow):
                 strip_env=strip_env,
                 wait_for_tracking=wait_for_tracking,
                 model=model,
+                extra_env={"CLAUDE_CONFIG_DIR": account_config_dir} if account_config_dir else None,
             )
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(self, "Could not launch session", str(error))
@@ -6375,6 +6497,11 @@ class SessionHub(QMainWindow):
                     if target == "Codex"
                     else None
                 )
+                # account_config_dir stays None here too, same reason model
+                # does for Claude: it already round-trips via CLAUDE_CONFIG_DIR
+                # stored on lookup_key, resolved automatically by
+                # group_env_overrides at launch time below.
+                account_config_dir = None
             else:
                 # No linked session for `target` yet to reuse a model/effort
                 # from - fall back to whatever this group/session is already
@@ -6388,16 +6515,22 @@ class SessionHub(QMainWindow):
                     if target == "Codex"
                     else None
                 )
+                default_account = (
+                    self.effective_account(session.key) if target == "Claude" else None
+                )
                 dialog = AgentModelEffortDialog(
                     target,
                     self,
                     default_model=default_model,
                     default_reasoning_effort=default_reasoning_effort,
+                    claude_accounts=self.settings().get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS,
+                    default_account=default_account,
                 )
                 if dialog.exec() != QDialog.DialogCode.Accepted:
                     return
                 model = dialog.model
                 reasoning_effort = dialog.reasoning_effort
+                account_config_dir = dialog.account_config_dir if target == "Claude" else None
 
             if use_tmux:
                 stop_tmux_session(tmux_name)
@@ -6432,6 +6565,10 @@ class SessionHub(QMainWindow):
                     self.metadata.setdefault("sessions", {}).setdefault(
                         target_key, {}
                     ).setdefault("env", {})["ANTHROPIC_MODEL"] = model
+                if account_config_dir:
+                    self.metadata.setdefault("sessions", {}).setdefault(
+                        target_key, {}
+                    ).setdefault("env", {})["CLAUDE_CONFIG_DIR"] = account_config_dir
                 self.launch(
                     target,
                     None,
@@ -6490,6 +6627,10 @@ class SessionHub(QMainWindow):
                         self.metadata.setdefault("sessions", {}).setdefault(
                             override_key, {}
                         ).setdefault("env", {})["ANTHROPIC_MODEL"] = model
+                    if account_config_dir:
+                        self.metadata.setdefault("sessions", {}).setdefault(
+                            override_key, {}
+                        ).setdefault("env", {})["CLAUDE_CONFIG_DIR"] = account_config_dir
                 elif target == "Codex":
                     entry = self.metadata.setdefault("sessions", {}).setdefault(
                         override_key, {}
@@ -6518,6 +6659,7 @@ class SessionHub(QMainWindow):
                 str(dialog.directory),
                 model=dialog.model,
                 reasoning_effort=dialog.reasoning_effort,
+                account_config_dir=dialog.account_config_dir,
             )
 
     def launch_selected_provider(self) -> None:
@@ -6546,7 +6688,12 @@ class SessionHub(QMainWindow):
                 continue
             provider = row.get("provider", "Claude")
             registered = self.register_group_row(
-                cwd, row["name"], provider, row.get("model"), row.get("reasoning_effort")
+                cwd,
+                row["name"],
+                provider,
+                row.get("model"),
+                row.get("reasoning_effort"),
+                row.get("account_config_dir"),
             )
             if provider == "Codex":
                 registered["codex_pending_since"] = int(time.time() * 1000)
@@ -6573,6 +6720,7 @@ class SessionHub(QMainWindow):
         provider: str,
         model_alias: str | None,
         reasoning_effort: str | None = None,
+        account_config_dir: str | None = None,
     ) -> dict:
         """Build a saved group row, minting its durable override key.
 
@@ -6583,11 +6731,13 @@ class SessionHub(QMainWindow):
         matched to a live session (see find_group_member_session, ManageGroupDialog).
         """
         override_key = f"group:{cwd}#{name}"
-        if model_alias or reasoning_effort:
+        if model_alias or reasoning_effort or account_config_dir:
             entry = self.metadata.setdefault("sessions", {}).setdefault(override_key, {})
             if provider == "Claude":
                 if model_alias:
                     entry.setdefault("env", {})["ANTHROPIC_MODEL"] = model_alias
+                if account_config_dir:
+                    entry.setdefault("env", {})["CLAUDE_CONFIG_DIR"] = account_config_dir
             elif provider == "Codex":
                 if model_alias:
                     entry["model"] = model_alias
