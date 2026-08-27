@@ -537,17 +537,14 @@ class SessionHubTests(unittest.TestCase):
         self.assertEqual(sessions[0].title, "Logical Session")
         self.assertEqual(sessions[0].key, "Codex:codex-id")
 
-    def test_pending_handoff_matches_unique_handoff_filename(self):
+    def test_pending_link_matches_by_provider_and_cwd(self):
         source_key = "Claude:source-id"
         destination = session_hub.Session(
             "Antigravity",
             "agy-id",
-            (
-                "Continue using "
-                "/home/user/.local/share/session-hub/handoffs/unique-file.md"
-            ),
-            "/home/user",
-            "/home/user",
+            "Continuation session",
+            "/different/path",
+            "/different/path",
             2000,
             Path("/tmp/agy.db"),
         )
@@ -559,24 +556,20 @@ class SessionHubTests(unittest.TestCase):
                     "active": "Codex:codex-id",
                 }
             },
-            "pending_handoffs": [
+            "pending_links": [
                 {
                     "logical_key": source_key,
                     "target_provider": "Antigravity",
                     "existing_keys": [],
                     "cwd": "/different/path",
-                    "handoff_path": (
-                        "/home/user/.local/share/session-hub/handoffs/"
-                        "unique-file.md"
-                    ),
                     "started_ms": 1000,
                     "expires_ms": 9999999999999,
                 }
             ],
         }
-        changed = session_hub.resolve_pending_handoffs(metadata, [destination])
+        changed = session_hub.resolve_pending_links(metadata, [destination])
         self.assertTrue(changed)
-        self.assertEqual(metadata["pending_handoffs"], [])
+        self.assertEqual(metadata["pending_links"], [])
         self.assertEqual(metadata["links"][source_key]["active"], destination.native_key)
         self.assertIn(
             destination.native_key,
@@ -812,176 +805,6 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_handoff_export_keeps_conversation_without_tool_payloads(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            transcript = root / "claude.jsonl"
-            transcript.write_text(
-                "\n".join(
-                    [
-                        json.dumps(
-                            {
-                                "type": "user",
-                                "message": {"content": "Please fix the parser."},
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "assistant",
-                                "message": {
-                                    "content": [
-                                        {"type": "text", "text": "I found the bug."},
-                                        {
-                                            "type": "tool_use",
-                                            "name": "Bash",
-                                            "input": {"command": "secret-command"},
-                                        },
-                                    ]
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            session = session_hub.Session(
-                "Claude",
-                "id",
-                "Parser",
-                str(root),
-                str(root),
-                0,
-                transcript,
-            )
-            with patch("session_hub.HANDOFF_DIR", root / "handoffs"):
-                handoff = session_hub.write_handoff(session, "Codex")
-            text = handoff.read_text(encoding="utf-8")
-            self.assertIn("Please fix the parser.", text)
-            self.assertIn("I found the bug.", text)
-            self.assertNotIn("secret-command", text)
-
-    def test_handoff_includes_full_compact_summary_when_present(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            transcript = root / "claude.jsonl"
-            rows = [
-                {
-                    "type": "user",
-                    "uuid": "before",
-                    "message": {"content": "Earlier context " + "x" * 30000},
-                },
-                {
-                    "type": "user",
-                    "uuid": "compact-1",
-                    "isCompactSummary": True,
-                    "message": {"content": "Older compaction, superseded."},
-                },
-                {
-                    "type": "user",
-                    "uuid": "compact-2",
-                    "isCompactSummary": True,
-                    "message": {"content": "Complete summary " + "y" * 15000},
-                },
-                {
-                    "type": "assistant",
-                    "uuid": "noise",
-                    "message": {
-                        "content": "You've hit your session limit · resets later"
-                    },
-                },
-                {
-                    "type": "user",
-                    "uuid": "after",
-                    "message": {"content": "Latest real request"},
-                },
-            ]
-            transcript.write_text(
-                "\n".join(json.dumps(row) for row in rows),
-                encoding="utf-8",
-            )
-            session = session_hub.Session(
-                "Claude",
-                "id",
-                "Project",
-                str(root),
-                str(root),
-                0,
-                transcript,
-            )
-            with patch("session_hub.HANDOFF_DIR", root / "handoffs"):
-                handoff = session_hub.write_handoff(session, "Codex")
-            text = handoff.read_text(encoding="utf-8")
-            self.assertIn("Full /compact summary", text)
-            self.assertIn("Complete summary " + "y" * 15000, text)
-            self.assertNotIn("Older compaction, superseded.", text)
-            self.assertNotIn("Earlier context", text)
-            self.assertIn("Latest real request", text)
-            self.assertNotIn("You've hit your session limit", text)
-
-    def test_long_handoff_message_has_explicit_omission_marker(self):
-        compacted = session_hub.compact_message("a" * 20000, 12000)
-        self.assertEqual(len(compacted), 12000)
-        self.assertIn("middle of this message omitted", compacted)
-
-    @patch("session_hub.shutil.which")
-    def test_handoff_commands_launch_destination_agent(self, which):
-        which.side_effect = lambda name: {
-            "gnome-terminal": "/usr/bin/gnome-terminal",
-            "codex": "/home/user/.local/bin/codex",
-            "claude": "/home/user/.local/bin/claude",
-        }.get(name)
-        window = session_hub.SessionHub()
-        claude = window.handoff_terminal_command(
-            "Claude",
-            "/home/user",
-            Path("/tmp/handoff.md"),
-            "Linked",
-            "11111111-1111-4111-8111-111111111111",
-        )
-        codex = window.handoff_terminal_command(
-            "Codex", "/home/user", Path("/tmp/handoff.md"), "Linked"
-        )
-        self.assertIn("--session-id", claude)
-        self.assertIn("11111111-1111-4111-8111-111111111111", claude)
-        self.assertIn("-C", codex)
-        self.assertTrue(any("/tmp/handoff.md" in value for value in codex))
-        window.close()
-
-    @patch("session_hub.shutil.which")
-    def test_handoff_commands_resume_existing_linked_sessions(self, which):
-        which.side_effect = lambda name: {
-            "gnome-terminal": "/usr/bin/gnome-terminal",
-            "codex": "/home/user/.local/bin/codex",
-            "claude": "/home/user/.local/bin/claude",
-        }.get(name)
-        window = session_hub.SessionHub()
-        claude = window.handoff_terminal_command(
-            "Claude",
-            "/home/user/new-location",
-            Path("/tmp/handoff.md"),
-            "Linked",
-            "claude-existing",
-            resume_existing=True,
-            source_cwd="/home/user/original-location",
-        )
-        codex = window.handoff_terminal_command(
-            "Codex",
-            "/home/user",
-            Path("/tmp/handoff.md"),
-            "Linked",
-            "codex-existing",
-            resume_existing=True,
-        )
-        self.assertIn("--working-directory=/home/user/original-location", claude)
-        self.assertIn("--resume", claude)
-        self.assertIn("claude-existing", claude)
-        self.assertNotIn("--session-id", claude)
-        self.assertIn("resume", codex)
-        self.assertIn("codex-existing", codex)
-        self.assertTrue(any("/tmp/handoff.md" in value for value in codex))
-        window.close()
-
     def test_continue_with_other_agent_sets_correct_target_provider(self):
         active = session_hub.Session(
             "Claude",
@@ -992,6 +815,21 @@ class SessionHubTests(unittest.TestCase):
             300,
             Path("/tmp/claude.jsonl"),
         )
+
+        def fake_copy_dialog(*args, **kwargs):
+            dialog = MagicMock()
+            dialog.exec.return_value = session_hub.QDialog.DialogCode.Accepted
+            dialog.include_prompt = False
+            return dialog
+
+        def fake_model_dialog(*args, **kwargs):
+            dialog = MagicMock()
+            dialog.exec.return_value = session_hub.QDialog.DialogCode.Accepted
+            dialog.model = None
+            dialog.reasoning_effort = None
+            dialog.account_config_dir = None
+            return dialog
+
         with tempfile.TemporaryDirectory() as temp:
             fake_metadata = Path(temp) / "metadata.json"
             with (
@@ -1004,32 +842,38 @@ class SessionHubTests(unittest.TestCase):
                 window.metadata = {
                     "sessions": {},
                     "links": {},
-                    "pending_handoffs": []
+                    "pending_links": [],
                 }
                 with (
                     patch.object(window, "selected", return_value=active),
                     patch("session_hub.QInputDialog.getItem", return_value=("Antigravity", True)),
-                    patch("session_hub.QMessageBox.question", return_value=session_hub.QMessageBox.StandardButton.Yes),
-                    patch("session_hub.write_handoff", return_value=Path("/tmp/handoff.md")),
-                    patch.object(window, "handoff_terminal_command", return_value=["cmd"]),
-                    patch("session_hub.subprocess.Popen") as popen,
+                    patch("session_hub.TranscriptPathDialog", side_effect=fake_copy_dialog),
+                    patch("session_hub.AgentModelEffortDialog", side_effect=fake_model_dialog),
+                    patch("session_hub.QApplication.clipboard"),
+                    patch("session_hub.codex_sessions", return_value=[]),
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
+                    patch("session_hub.subprocess.Popen"),
                 ):
                     window.continue_with_other_agent()
-                pending = window.metadata.get("pending_handoffs", [])
+                pending = window.metadata.get("pending_links", [])
                 self.assertEqual(len(pending), 1)
                 self.assertEqual(pending[0]["target_provider"], "Antigravity")
 
-                window.metadata["pending_handoffs"] = []
+                window.metadata["pending_links"] = []
                 with (
                     patch.object(window, "selected", return_value=active),
                     patch("session_hub.QInputDialog.getItem", return_value=("Codex", True)),
-                    patch("session_hub.QMessageBox.question", return_value=session_hub.QMessageBox.StandardButton.Yes),
-                    patch("session_hub.write_handoff", return_value=Path("/tmp/handoff.md")),
-                    patch.object(window, "handoff_terminal_command", return_value=["cmd"]),
-                    patch("session_hub.subprocess.Popen") as popen,
+                    patch("session_hub.TranscriptPathDialog", side_effect=fake_copy_dialog),
+                    patch("session_hub.AgentModelEffortDialog", side_effect=fake_model_dialog),
+                    patch("session_hub.QApplication.clipboard"),
+                    patch("session_hub.codex_sessions", return_value=[]),
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
+                    patch("session_hub.subprocess.Popen"),
                 ):
                     window.continue_with_other_agent()
-                pending = window.metadata.get("pending_handoffs", [])
+                pending = window.metadata.get("pending_links", [])
                 self.assertEqual(len(pending), 1)
                 self.assertEqual(pending[0]["target_provider"], "Codex")
                 window.close()
@@ -1080,7 +924,7 @@ class SessionHubTests(unittest.TestCase):
         )
 
     @patch("session_hub.shutil.which")
-    def test_antigravity_resume_and_handoff_commands(self, which):
+    def test_antigravity_resume_command_uses_danger_mode_and_conversation_flag(self, which):
         which.side_effect = lambda name: {
             "gnome-terminal": "/usr/bin/gnome-terminal",
             "agy": "/home/user/.local/bin/agy",
@@ -1092,79 +936,9 @@ class SessionHubTests(unittest.TestCase):
             "agy-id",
             "/home/user",
         )
-        handoff = window.handoff_terminal_command(
-            "Antigravity",
-            "/home/user",
-            Path("/tmp/handoff.md"),
-            "Linked",
-            "agy-id",
-            resume_existing=True,
-        )
         self.assertIn("--dangerously-skip-permissions", resume)
         self.assertEqual(resume[-2:], ["--conversation", "agy-id"])
-        self.assertIn("--conversation", handoff)
-        self.assertIn("--prompt-interactive", handoff)
         window.close()
-
-    def test_antigravity_transcript_is_available_to_handoffs(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            transcript = (
-                root
-                / "brain"
-                / "agy-id"
-                / ".system_generated"
-                / "logs"
-                / "transcript.jsonl"
-            )
-            transcript.parent.mkdir(parents=True)
-            transcript.write_text(
-                "\n".join(
-                    (
-                        json.dumps(
-                            {
-                                "type": "USER_INPUT",
-                                "content": (
-                                    "<USER_REQUEST>Fix the launcher.</USER_REQUEST>"
-                                ),
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "PLANNER_RESPONSE",
-                                "content": "I found the desktop entry.",
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "RUN_COMMAND",
-                                "content": "secret tool output",
-                            }
-                        ),
-                    )
-                ),
-                encoding="utf-8",
-            )
-            database = root / "agy-id.db"
-            database.touch()
-            session = session_hub.Session(
-                "Antigravity",
-                "agy-id",
-                "Launcher",
-                str(root),
-                str(root),
-                0,
-                database,
-            )
-            with patch("session_hub.ANTIGRAVITY_BRAIN", root / "brain"):
-                messages = session_hub.transcript_messages(session)
-            self.assertEqual(
-                messages,
-                [
-                    ("user", "Fix the launcher."),
-                    ("assistant", "I found the desktop entry."),
-                ],
-            )
 
     def test_manual_refresh_refreshes_usage(self):
         window = session_hub.SessionHub()

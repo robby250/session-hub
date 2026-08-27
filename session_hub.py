@@ -110,7 +110,6 @@ def _cached_file_scan(path: Path, scan) -> dict:
     _FILE_SCAN_CACHE[key] = (signature, result)
     return result
 TRASH_DIR = DATA_DIR / "trash"
-HANDOFF_DIR = DATA_DIR / "handoffs"
 # Tracks Claude processes Session Hub itself launched, so a same-directory
 # /clear inside that same process (new session id, same PID) can be detected
 # and linked to the session it continues - see pid_capture_command and
@@ -1740,27 +1739,28 @@ def antigravity_sessions() -> list[Session]:
     return sessions
 
 
-def resolve_pending_handoffs(metadata: dict, sessions: list[Session]) -> bool:
+def resolve_pending_links(metadata: dict, sessions: list[Session]) -> bool:
+    """A cross-provider swap (continue_with_other_agent_for) doesn't know the
+    new native session id for Codex/Antigravity until the CLI itself creates
+    it - this matches the first same-provider/same-cwd session that shows up
+    after the swap started and folds it into the same logical link, so a
+    later swap back to that provider finds it as an existing_target instead
+    of always starting another fresh session."""
     changed = False
-    pending = metadata.setdefault("pending_handoffs", [])
+    pending = metadata.setdefault("pending_links", [])
     remaining = []
     now_ms = int(datetime.now().timestamp() * 1000)
     for item in pending:
         if now_ms > int(item.get("expires_ms", now_ms + 1)):
             changed = True
             continue
-        handoff_name = Path(item.get("handoff_path", "")).name
         candidates = [
             session
             for session in sessions
             if session.provider == item.get("target_provider")
             and session.native_key not in set(item.get("existing_keys", []))
             and session.updated_ms >= int(item.get("started_ms", 0))
-            and (
-                Path(session.cwd) == Path(item.get("cwd", ""))
-                or handoff_name
-                and handoff_name in session.title
-            )
+            and Path(session.cwd) == Path(item.get("cwd", ""))
         ]
         if not candidates:
             remaining.append(item)
@@ -1786,7 +1786,7 @@ def resolve_pending_handoffs(metadata: dict, sessions: list[Session]) -> bool:
                 if reasoning_effort:
                     entry["reasoning_effort"] = reasoning_effort
         changed = True
-    metadata["pending_handoffs"] = remaining
+    metadata["pending_links"] = remaining
     return changed
 
 
@@ -1938,7 +1938,7 @@ def discover_sessions(metadata: dict) -> list[Session]:
         sessions += claude_sessions()
     if settings.get("enable_antigravity", True):
         sessions += antigravity_sessions()
-    changed = resolve_pending_handoffs(metadata, sessions)
+    changed = resolve_pending_links(metadata, sessions)
     adopt_untracked_sessions(sessions)
     if resolve_clear_continuations(metadata, sessions):
         changed = True
@@ -2912,228 +2912,6 @@ def executable(name: str) -> str:
     return str(local)
 
 
-def text_from_content(content) -> str:
-    if isinstance(content, str):
-        return content.strip()
-    if not isinstance(content, list):
-        return ""
-    texts = []
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") in {"input_text", "output_text", "text"}:
-            value = item.get("text")
-            if value:
-                texts.append(str(value).strip())
-    return "\n".join(text for text in texts if text)
-
-
-def handoff_noise(text: str) -> bool:
-    normalized = text.strip()
-    return (
-        normalized.startswith("You've hit your session limit")
-        or normalized.startswith("You have ")
-        and "weighted tokens left" in normalized
-    )
-
-
-def compact_message(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    marker = "\n\n[…middle of this message omitted by Session Hub…]\n\n"
-    available = max(0, limit - len(marker))
-    head = available // 2
-    tail = available - head
-    return text[:head] + marker + text[-tail:]
-
-
-def transcript_messages(
-    session: Session, max_chars: int = 50000, after_uuid: str | None = None
-) -> list[tuple[str, str]]:
-    """`after_uuid` skips every row up to and including the one with that
-    uuid - used to show only what happened since the last /compact instead of
-    re-showing (and truncating) content latest_compact_summary already
-    captured in full."""
-    messages = []
-    transcript_path = (
-        antigravity_transcript_path(session.session_id)
-        if session.provider == "Antigravity"
-        else session.path
-    )
-    seen_after = after_uuid is None
-    try:
-        with transcript_path.open(encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                if len(line) > 2_000_000:
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not seen_after:
-                    if row.get("uuid") == after_uuid:
-                        seen_after = True
-                    continue
-                role = ""
-                text = ""
-                if session.provider == "Codex":
-                    payload = row.get("payload", {})
-                    if row.get("type") == "response_item" and payload.get("type") == "message":
-                        role = str(payload.get("role") or "")
-                        text = text_from_content(payload.get("content"))
-                elif session.provider == "Claude" and row.get("type") in {
-                    "user",
-                    "assistant",
-                }:
-                    role = row["type"]
-                    message = row.get("message", {})
-                    text = text_from_content(
-                        message.get("content") if isinstance(message, dict) else message
-                    )
-                elif session.provider == "Antigravity":
-                    item_type = row.get("type")
-                    if item_type == "USER_INPUT":
-                        role = "user"
-                        text = str(row.get("content") or "")
-                        match = re.search(
-                            r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>",
-                            text,
-                            re.DOTALL,
-                        )
-                        if match:
-                            text = match.group(1).strip()
-                    elif item_type in {"PLANNER_RESPONSE", "MODEL_RESPONSE"}:
-                        role = "assistant"
-                        text = str(row.get("content") or "").strip()
-                if role not in {"user", "assistant"} or not text:
-                    continue
-                if text.startswith("<environment_context>") or text.startswith(
-                    "# AGENTS.md instructions"
-                ):
-                    continue
-                if handoff_noise(text):
-                    continue
-                messages.append((role, text))
-    except OSError:
-        return []
-    selected = []
-    total = 0
-    for role, text in reversed(messages):
-        text = compact_message(text, min(12000, max_chars))
-        if selected and total + len(text) > max_chars:
-            break
-        selected.append((role, text))
-        total += len(text)
-    return list(reversed(selected))
-
-
-def latest_compact_summary(session: Session) -> tuple[str | None, str | None]:
-    """Full text + row uuid of the most recent /compact summary in a Claude
-    transcript, or (None, None) for any other provider or if there isn't one.
-
-    Claude Code marks a compaction's summary row with "isCompactSummary": true
-    (message.content holds the entire prior-context summary). A session can be
-    compacted more than once - each compaction's summary is written to cover
-    everything up to that point, so only the LAST such row matters; scan
-    forward and keep overwriting.
-    """
-    if session.provider != "Claude":
-        return None, None
-    summary: str | None = None
-    summary_uuid: str | None = None
-    try:
-        with session.path.open(encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                if len(line) > 2_000_000:
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not row.get("isCompactSummary") or row.get("type") != "user":
-                    continue
-                message = row.get("message", {})
-                text = text_from_content(
-                    message.get("content") if isinstance(message, dict) else message
-                )
-                if text:
-                    summary = text
-                    summary_uuid = row.get("uuid")
-    except OSError:
-        return None, None
-    return summary, summary_uuid
-
-
-def project_state(cwd: str) -> str:
-    if not (Path(cwd) / ".git").exists():
-        return "No Git repository detected at the working directory."
-    try:
-        result = subprocess.run(
-            ["git", "status", "--short", "--branch"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        return result.stdout.strip() or "Git working tree is clean."
-    except (OSError, subprocess.TimeoutExpired):
-        return "Git status unavailable."
-
-
-def write_handoff(session: Session, target_provider: str) -> Path:
-    HANDOFF_DIR.mkdir(parents=True, exist_ok=True)
-    path = HANDOFF_DIR / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.md"
-    lines = [
-        "# Session Hub Agent Handoff",
-        "",
-        f"- From: {session.provider}",
-        f"- To: {target_provider}",
-        f"- Session: {session.title}",
-        f"- Working directory: {session.cwd}",
-        f"- Created: {datetime.now().isoformat(timespec='seconds')}",
-        "",
-        "## Current project state",
-        "",
-        "```text",
-        project_state(session.cwd),
-        "```",
-        "",
-    ]
-    summary, summary_uuid = latest_compact_summary(session)
-    if summary:
-        lines.extend(
-            (
-                "## Full /compact summary",
-                "",
-                compact_message(summary, 100000),  # safety ceiling only, not a real limit
-                "",
-            )
-        )
-    lines.extend(
-        (
-        "## Recent conversation",
-        "",
-        )
-    )
-    for role, text in transcript_messages(session, max_chars=50000, after_uuid=summary_uuid):
-        lines.extend((f"### {role.capitalize()}", "", text, ""))
-    lines.extend(
-        (
-            "## Continuation instruction",
-            "",
-            "Continue the existing task naturally. Inspect the current files and state "
-            "before changing anything. Do not repeat work already completed. Ask only "
-            "when a missing decision materially blocks progress. Read this file by "
-            "section or in chunks if a file-viewing tool truncates its output; do not "
-            "assume the first displayed chunk is the entire handoff.",
-            "",
-        )
-    )
-    path.write_text("\n".join(lines), encoding="utf-8")
-    return path
-
-
 def is_compatibility_link(path: Path, target: Path) -> bool:
     try:
         return path.is_symlink() and path.resolve() == target.resolve()
@@ -3615,6 +3393,56 @@ class NewSessionDialog(QDialog):
             self.reasoning_effort = codex_combo_value(self.codex_effort_combo)
         self.use_tmux = self.tmux_checkbox.isChecked()
         super().accept()
+
+
+TRANSCRIPT_READ_PROMPT = (
+    "Read the transcript at the path above. If it contains a /compact "
+    "summary, read from there onward; otherwise read roughly the last 150 "
+    "messages. Inspect the current project state, then continue the task "
+    "naturally."
+)
+
+
+class TranscriptPathDialog(QDialog):
+    """Shows `session`'s on-disk transcript path so the user can copy it (and
+    optionally a suggested read prompt) and paste it into the new `target`
+    session themselves, after setting model/effort/account there - replaces
+    the old auto-written handoff .md + auto-sent initial prompt (user
+    2026-08-27: wants to paste it manually, not have Session Hub send a
+    message before they've had a chance to configure the new session)."""
+
+    def __init__(self, session: Session, target: str, parent=None) -> None:
+        super().__init__(parent)
+        self.include_prompt = False
+        self.setWindowTitle(f"Continue with {target}")
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            f"Transcript for “{session.title}” ({session.provider}) is on disk. Copy "
+            f"the path below - or the path plus a suggested read prompt - to paste "
+            f"into the new {target} session yourself."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        path_edit = QLineEdit(str(session.path))
+        path_edit.setReadOnly(True)
+        layout.addWidget(path_edit)
+
+        buttons = QHBoxLayout()
+        copy_path_btn = QPushButton("Copy path")
+        copy_path_btn.clicked.connect(lambda: self._accept(False))
+        buttons.addWidget(copy_path_btn)
+        copy_prompt_btn = QPushButton("Copy path + prompt")
+        copy_prompt_btn.clicked.connect(lambda: self._accept(True))
+        buttons.addWidget(copy_prompt_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(cancel_btn)
+        layout.addLayout(buttons)
+
+    def _accept(self, include_prompt: bool) -> None:
+        self.include_prompt = include_prompt
+        self.accept()
 
 
 class AgentModelEffortDialog(QDialog):
@@ -6767,70 +6595,6 @@ class SessionHub(QMainWindow):
         write_metadata(self.metadata)
         self.refresh()
 
-    def handoff_terminal_command(
-        self,
-        target_provider: str,
-        cwd: str,
-        handoff_path: Path,
-        title: str,
-        target_session_id: str | None = None,
-        resume_existing: bool = False,
-        source_cwd: str | None = None,
-        flags: list[str] | None = None,
-    ) -> list[str]:
-        terminal = shutil.which("gnome-terminal") or shutil.which(
-            "x-terminal-emulator"
-        )
-        if not terminal:
-            raise RuntimeError("No supported terminal emulator was found.")
-        prompt = (
-            f"Continue the existing task using the handoff file at {handoff_path}. "
-            "Read the entire file first, using section ranges or chunks if one tool "
-            "output is truncated. Then inspect the current project state and continue "
-            "naturally."
-        )
-        launch_cwd = source_cwd if target_provider == "Claude" and resume_existing else cwd
-        launch_cwd = launch_cwd or cwd
-        command = [terminal]
-        if Path(terminal).name == "gnome-terminal":
-            command += [
-                "--window",
-                f"--working-directory={launch_cwd}",
-                f"--title={target_provider} — {title}",
-                "--",
-            ]
-        else:
-            command += ["-e"]
-        if target_provider == "Claude":
-            command += [executable("claude")]
-            if self.settings().get("claude_danger_mode", False):
-                command += ["--dangerously-skip-permissions"]
-            command += flags or []
-            if target_session_id:
-                command += [
-                    "--resume" if resume_existing else "--session-id",
-                    target_session_id,
-                ]
-            if not resume_existing:
-                command += ["--name", title]
-            command += [prompt]
-        elif target_provider == "Codex":
-            command += [executable("codex")]
-            if self.settings().get("codex_danger_mode", False):
-                command += ["--dangerously-bypass-approvals-and-sandbox"]
-            if target_session_id and resume_existing:
-                command += ["resume", "-C", cwd, target_session_id, prompt]
-            else:
-                command += ["-C", cwd, prompt]
-        else:
-            command += [executable("agy")]
-            if self.settings().get("antigravity_danger_mode", False):
-                command += ["--dangerously-skip-permissions"]
-            if target_session_id and resume_existing:
-                command += ["--conversation", target_session_id]
-            command += ["--prompt-interactive", prompt]
-        return command
-
     def continue_with_other_agent(self) -> None:
         session = self.selected()
         if not session:
@@ -6861,20 +6625,14 @@ class SessionHub(QMainWindow):
         )
         if not accepted:
             return
-        answer = QMessageBox.question(
-            self,
-            f"Continue with {target}?",
-            f"Create a local handoff and continue “{session.title}” with {target}?\n\n"
-            "Session Hub will keep one visible row. The original native transcript "
-            "will remain stored but hidden.\n\n"
-            f"Choose No to just start a fresh {target} session here, with no handoff.",
-            QMessageBox.StandardButton.Cancel
-            | QMessageBox.StandardButton.No
-            | QMessageBox.StandardButton.Yes,
-            QMessageBox.StandardButton.Yes,
-        )
-        if answer == QMessageBox.StandardButton.Cancel:
+        copy_dialog = TranscriptPathDialog(session, target, self)
+        if copy_dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        clipboard_text = str(session.path)
+        if copy_dialog.include_prompt:
+            clipboard_text += "\n\n" + TRANSCRIPT_READ_PROMPT
+        QApplication.clipboard().setText(clipboard_text)
+
         group_cwd = self.group_cwd_for_session_key(session.key)
         group_row = None
         if group_cwd:
@@ -6897,253 +6655,117 @@ class SessionHub(QMainWindow):
                 or overrides.get("name")
                 or session.title
             )
-        if answer == QMessageBox.StandardButton.No:
-            self.boot_other_agent_no_handoff(
-                session, target, group_row, group_cwd, use_tmux, tmux_name
-            )
-            return
-        try:
-            handoff = write_handoff(session, target)
-            prompt = (
-                f"Continue the existing task using the handoff file at {handoff}. "
-                "Read the entire file first, using section ranges or chunks if one "
-                "tool output is truncated. Then inspect the current project state "
-                "and continue naturally."
-            )
-            logical_key = session.key
-            members = list(session.linked_keys or (session.native_key,))
-            link = self.metadata.setdefault("links", {}).setdefault(
-                logical_key, {"members": members, "active": session.native_key}
-            )
-            for member in members:
-                if member not in link["members"]:
-                    link["members"].append(member)
 
-            native_sessions = native_session_index()
-            existing_targets = [
-                native_sessions[key]
-                for key in link["members"]
-                if key in native_sessions and native_sessions[key].provider == target
-            ]
-            existing_target = (
-                max(existing_targets, key=lambda item: item.updated_ms)
-                if existing_targets
+        logical_key = session.key
+        members = list(session.linked_keys or (session.native_key,))
+        link = self.metadata.setdefault("links", {}).setdefault(
+            logical_key, {"members": members, "active": session.native_key}
+        )
+        for member in members:
+            if member not in link["members"]:
+                link["members"].append(member)
+
+        native_sessions = native_session_index()
+        existing_targets = [
+            native_sessions[key]
+            for key in link["members"]
+            if key in native_sessions and native_sessions[key].provider == target
+        ]
+        existing_target = (
+            max(existing_targets, key=lambda item: item.updated_ms)
+            if existing_targets
+            else None
+        )
+
+        if existing_target:
+            # Swapping back to a destination already launched once before -
+            # reuse whatever model/effort it was already launched with
+            # rather than asking again (resume_session's own convention,
+            # session_hub.py:5667-5672). A group row's model/effort is
+            # always written onto its override_key (the group_row sync
+            # write further below, and register_group_row's own
+            # convention elsewhere) - existing_target.key is the raw
+            # native provider key instead, a different identity that
+            # never receives that write, so a group session must be
+            # looked up by override_key or the stored value never
+            # round-trips on the next swap back.
+            lookup_key = (
+                group_row["override_key"] if group_row is not None else existing_target.key
+            )
+            model = (
+                self.effective_model(lookup_key, target)
+                if target != "Claude"
                 else None
             )
-
-            if existing_target:
-                # Swapping back to a destination already launched once before -
-                # reuse whatever model/effort it was already launched with
-                # rather than asking again (resume_session's own convention,
-                # session_hub.py:5667-5672). A group row's model/effort is
-                # always written onto its override_key (the group_row sync
-                # write further below, and register_group_row's own
-                # convention elsewhere) - existing_target.key is the raw
-                # native provider key instead, a different identity that
-                # never receives that write, so a group session must be
-                # looked up by override_key or the stored value never
-                # round-trips on the next swap back.
-                lookup_key = (
-                    group_row["override_key"] if group_row is not None else existing_target.key
-                )
-                model = (
-                    self.effective_model(lookup_key, target)
-                    if target != "Claude"
-                    else None
-                )
-                reasoning_effort = (
-                    self.effective_codex_reasoning_effort(lookup_key)
-                    if target == "Codex"
-                    else None
-                )
-                # account_config_dir stays None here too, same reason model
-                # does for Claude: it already round-trips via CLAUDE_CONFIG_DIR
-                # stored on lookup_key, resolved automatically by
-                # group_env_overrides at launch time below.
-                account_config_dir = None
-            else:
-                # No linked session for `target` yet to reuse a model/effort
-                # from - fall back to whatever this group/session is already
-                # configured to launch `target` with (same source
-                # effective_model/effective_codex_reasoning_effort read the
-                # existing_target branch above), so the dialog preselects it
-                # instead of always defaulting to "Default".
-                default_model = self.effective_model(session.key, target)
-                default_reasoning_effort = (
-                    self.effective_codex_reasoning_effort(session.key)
-                    if target == "Codex"
-                    else None
-                )
-                default_account = (
-                    self.effective_account(session.key) if target == "Claude" else None
-                )
-                dialog = AgentModelEffortDialog(
-                    target,
-                    self,
-                    default_model=default_model,
-                    default_reasoning_effort=default_reasoning_effort,
-                    claude_accounts=self.settings().get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS,
-                    default_account=default_account,
-                    accounts_enabled=bool(self.settings().get("claude_accounts_enabled")),
-                )
-                if dialog.exec() != QDialog.DialogCode.Accepted:
-                    return
-                model = dialog.model
-                reasoning_effort = dialog.reasoning_effort
-                account_config_dir = dialog.account_config_dir if target == "Claude" else None
-
-            if use_tmux:
-                stop_tmux_session(tmux_name)
-
-            if existing_target:
-                link["active"] = existing_target.native_key
-                self.launch(
-                    target,
-                    existing_target.session_id,
-                    session.cwd,
-                    source_cwd=existing_target.source_cwd,
-                    model=model,
-                    reasoning_effort=reasoning_effort,
-                    # lookup_key (not existing_target.key): launch_env/
-                    # launch_flags/group_launch_options resolve group-tier
-                    # and session-tier env/flag overrides by override_key
-                    # for a group row - the native key finds neither, so a
-                    # Claude reuse (model=None above, relying entirely on
-                    # the ANTHROPIC_MODEL env var) silently lost its model
-                    # and launched with the CLI's bare default instead.
-                    session_key=lookup_key,
-                    initial_prompt=prompt,
-                    use_tmux=use_tmux,
-                    tmux_name=tmux_name,
-                )
-            elif target == "Claude":
-                target_id = str(uuid.uuid4())
-                target_key = f"Claude:{target_id}"
-                link["members"].append(target_key)
-                link["active"] = target_key
-                if model:
-                    self.metadata.setdefault("sessions", {}).setdefault(
-                        target_key, {}
-                    ).setdefault("env", {})["ANTHROPIC_MODEL"] = model
-                if account_config_dir:
-                    self.metadata.setdefault("sessions", {}).setdefault(
-                        target_key, {}
-                    ).setdefault("env", {})["CLAUDE_CONFIG_DIR"] = account_config_dir
-                self.launch(
-                    target,
-                    None,
-                    session.cwd,
-                    model=model,
-                    session_key=target_key,
-                    flag_overrides={"--name": session.title, "--session-id": target_id},
-                    initial_prompt=prompt,
-                    use_tmux=use_tmux,
-                    tmux_name=tmux_name,
-                )
-            else:
-                provider_sessions = (
-                    codex_sessions() if target == "Codex" else antigravity_sessions()
-                )
-                existing = [item.native_key for item in provider_sessions]
-                self.metadata.setdefault("pending_handoffs", []).append(
-                    {
-                        "logical_key": logical_key,
-                        "target_provider": target,
-                        "existing_keys": existing,
-                        "cwd": session.cwd,
-                        "handoff_path": str(handoff),
-                        "started_ms": int(datetime.now().timestamp() * 1000) - 1000,
-                        "expires_ms": int(datetime.now().timestamp() * 1000)
-                        + 15 * 60 * 1000,
-                        # No session id exists yet to key this model/effort
-                        # choice onto - resolve_pending_handoffs writes it onto
-                        # the real native key once discovered, so a later swap
-                        # back to this provider (now an existing_target) still
-                        # finds it via effective_model/effective_codex_reasoning_effort.
-                        "model": model,
-                        "reasoning_effort": reasoning_effort,
-                    }
-                )
-                self.launch(
-                    target,
-                    None,
-                    session.cwd,
-                    model=model,
-                    reasoning_effort=reasoning_effort if target == "Codex" else None,
-                    initial_prompt=prompt,
-                    use_tmux=use_tmux,
-                    tmux_name=tmux_name,
-                )
-
-            if group_row is not None:
-                # The group row's own provider is what find_group_member_session
-                # filters new session matches by - left stale, the merged
-                # (now-target-provider) session can never be folded back into
-                # the group and shows up as a separate standalone row instead.
-                group_row["provider"] = target
-                override_key = group_row["override_key"]
-                if target == "Claude":
-                    if model:
-                        self.metadata.setdefault("sessions", {}).setdefault(
-                            override_key, {}
-                        ).setdefault("env", {})["ANTHROPIC_MODEL"] = model
-                    if account_config_dir:
-                        self.metadata.setdefault("sessions", {}).setdefault(
-                            override_key, {}
-                        ).setdefault("env", {})["CLAUDE_CONFIG_DIR"] = account_config_dir
-                elif target == "Codex":
-                    entry = self.metadata.setdefault("sessions", {}).setdefault(
-                        override_key, {}
-                    )
-                    if model:
-                        entry["model"] = model
-                    if reasoning_effort:
-                        entry["reasoning_effort"] = reasoning_effort
-
-            write_metadata(self.metadata)
-            QTimer.singleShot(2500, self.poll_handoffs)
-        except OSError as error:
-            QMessageBox.critical(self, "Could not create handoff", str(error))
-
-    def boot_other_agent_no_handoff(
-        self,
-        session: Session,
-        target: str,
-        group_row: dict | None,
-        group_cwd: str | None,
-        use_tmux: bool,
-        tmux_name: str | None,
-    ) -> None:
-        """Start `target` fresh in `session.cwd` - no handoff file, no link to
-        `session`. The old session/pane is not merged or hidden, just
-        replaced in place if it occupied a group row/tmux slot."""
-        lookup_key = group_row["override_key"] if group_row is not None else session.key
-        default_model = self.effective_model(lookup_key, target)
-        default_reasoning_effort = (
-            self.effective_codex_reasoning_effort(lookup_key) if target == "Codex" else None
-        )
-        default_account = self.effective_account(lookup_key) if target == "Claude" else None
-        dialog = AgentModelEffortDialog(
-            target,
-            self,
-            default_model=default_model,
-            default_reasoning_effort=default_reasoning_effort,
-            claude_accounts=self.settings().get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS,
-            default_account=default_account,
-            accounts_enabled=bool(self.settings().get("claude_accounts_enabled")),
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        model = dialog.model
-        reasoning_effort = dialog.reasoning_effort
-        account_config_dir = dialog.account_config_dir if target == "Claude" else None
+            reasoning_effort = (
+                self.effective_codex_reasoning_effort(lookup_key)
+                if target == "Codex"
+                else None
+            )
+            # account_config_dir stays None here too, same reason model
+            # does for Claude: it already round-trips via CLAUDE_CONFIG_DIR
+            # stored on lookup_key, resolved automatically by
+            # group_env_overrides at launch time below.
+            account_config_dir = None
+        else:
+            # No linked session for `target` yet to reuse a model/effort
+            # from - fall back to whatever this group/session is already
+            # configured to launch `target` with (same source
+            # effective_model/effective_codex_reasoning_effort read the
+            # existing_target branch above), so the dialog preselects it
+            # instead of always defaulting to "Default".
+            default_model = self.effective_model(session.key, target)
+            default_reasoning_effort = (
+                self.effective_codex_reasoning_effort(session.key)
+                if target == "Codex"
+                else None
+            )
+            default_account = (
+                self.effective_account(session.key) if target == "Claude" else None
+            )
+            dialog = AgentModelEffortDialog(
+                target,
+                self,
+                default_model=default_model,
+                default_reasoning_effort=default_reasoning_effort,
+                claude_accounts=self.settings().get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS,
+                default_account=default_account,
+                accounts_enabled=bool(self.settings().get("claude_accounts_enabled")),
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            model = dialog.model
+            reasoning_effort = dialog.reasoning_effort
+            account_config_dir = dialog.account_config_dir if target == "Claude" else None
 
         if use_tmux:
             stop_tmux_session(tmux_name)
 
-        if target == "Claude":
+        if existing_target:
+            link["active"] = existing_target.native_key
+            self.launch(
+                target,
+                existing_target.session_id,
+                session.cwd,
+                source_cwd=existing_target.source_cwd,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                # lookup_key (not existing_target.key): launch_env/
+                # launch_flags/group_launch_options resolve group-tier
+                # and session-tier env/flag overrides by override_key
+                # for a group row - the native key finds neither, so a
+                # Claude reuse (model=None above, relying entirely on
+                # the ANTHROPIC_MODEL env var) silently lost its model
+                # and launched with the CLI's bare default instead.
+                session_key=lookup_key,
+                use_tmux=use_tmux,
+                tmux_name=tmux_name,
+            )
+        elif target == "Claude":
             target_id = str(uuid.uuid4())
             target_key = f"Claude:{target_id}"
+            link["members"].append(target_key)
+            link["active"] = target_key
             if model:
                 self.metadata.setdefault("sessions", {}).setdefault(
                     target_key, {}
@@ -7163,6 +6785,28 @@ class SessionHub(QMainWindow):
                 tmux_name=tmux_name,
             )
         else:
+            provider_sessions = (
+                codex_sessions() if target == "Codex" else antigravity_sessions()
+            )
+            existing = [item.native_key for item in provider_sessions]
+            self.metadata.setdefault("pending_links", []).append(
+                {
+                    "logical_key": logical_key,
+                    "target_provider": target,
+                    "existing_keys": existing,
+                    "cwd": session.cwd,
+                    "started_ms": int(datetime.now().timestamp() * 1000) - 1000,
+                    "expires_ms": int(datetime.now().timestamp() * 1000)
+                    + 15 * 60 * 1000,
+                    # No session id exists yet to key this model/effort
+                    # choice onto - resolve_pending_links writes it onto
+                    # the real native key once discovered, so a later swap
+                    # back to this provider (now an existing_target) still
+                    # finds it via effective_model/effective_codex_reasoning_effort.
+                    "model": model,
+                    "reasoning_effort": reasoning_effort,
+                }
+            )
             self.launch(
                 target,
                 None,
@@ -7174,6 +6818,10 @@ class SessionHub(QMainWindow):
             )
 
         if group_row is not None:
+            # The group row's own provider is what find_group_member_session
+            # filters new session matches by - left stale, the merged
+            # (now-target-provider) session can never be folded back into
+            # the group and shows up as a separate standalone row instead.
             group_row["provider"] = target
             override_key = group_row["override_key"]
             if target == "Claude":
@@ -7186,19 +6834,21 @@ class SessionHub(QMainWindow):
                         override_key, {}
                     ).setdefault("env", {})["CLAUDE_CONFIG_DIR"] = account_config_dir
             elif target == "Codex":
-                entry = self.metadata.setdefault("sessions", {}).setdefault(override_key, {})
+                entry = self.metadata.setdefault("sessions", {}).setdefault(
+                    override_key, {}
+                )
                 if model:
                     entry["model"] = model
                 if reasoning_effort:
                     entry["reasoning_effort"] = reasoning_effort
 
         write_metadata(self.metadata)
-        self.refresh()
+        QTimer.singleShot(2500, self.poll_pending_links)
 
-    def poll_handoffs(self) -> None:
+    def poll_pending_links(self) -> None:
         self.refresh()
-        if self.metadata.get("pending_handoffs"):
-            QTimer.singleShot(2500, self.poll_handoffs)
+        if self.metadata.get("pending_links"):
+            QTimer.singleShot(2500, self.poll_pending_links)
 
     def launch_new(self, provider: str) -> None:
         dialog = NewSessionDialog(provider, self.settings(), self)
