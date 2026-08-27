@@ -2393,8 +2393,15 @@ def hook_event_to_status(payload: dict) -> tuple[str, str] | None:
     """(state, detail) for one hook stdin payload, or None if this event
     doesn't change status - see hook_notify_cli."""
     event = payload.get("hook_event_name")
-    if event in ("SessionStart", "UserPromptSubmit"):
+    if event == "UserPromptSubmit":
         return "working", ""
+    if event == "SessionStart":
+        # Fires for plain "startup" too, but also for "resume"/"compact"/
+        # "clear" - a /compact or a scheduled wakeup resume isn't the agent
+        # starting new work, so treating it as "working" produced a false
+        # Working badge on sessions that were actually idle. No prompt has
+        # been submitted yet either way, so leave status untouched.
+        return None
     if event == "Notification":
         notification_type = payload.get("notification_type", "")
         if notification_type in _NEEDS_INPUT_NOTIFICATION_TYPES:
@@ -5676,7 +5683,10 @@ class SessionHub(QMainWindow):
                 status["state"] = "idle"
             self.running_table.setItem(index, 3, self._status_column_item(status))
             self.running_table.setItem(index, 4, self._detail_column_item(status))
-        self._refresh_activity_list()
+        names_by_id = {
+            session_id: row["name"] for _dn, _cwd, row, session_id in running if session_id
+        }
+        self._refresh_activity_list(names_by_id)
 
     _STATUS_LABELS = {
         "working": ("Working", "#5aa9ff"),
@@ -5701,7 +5711,7 @@ class SessionHub(QMainWindow):
             item.setToolTip(detail)
         return item
 
-    def _refresh_activity_list(self) -> None:
+    def _refresh_activity_list(self, names_by_id: dict[str, str]) -> None:
         self.activity_list.clear()
         for session_id, status in all_session_statuses()[:20]:
             label, color = self._STATUS_LABELS.get(status.get("state"), ("", "#888888"))
@@ -5709,7 +5719,8 @@ class SessionHub(QMainWindow):
                 continue
             when = datetime.fromtimestamp(status.get("ts", 0)).strftime("%H:%M:%S")
             detail = " ".join(status.get("detail", "").split())[:80]
-            text = f"{when}  {label}" + (f" — {detail}" if detail else "")
+            name = names_by_id.get(session_id, session_id[:8])
+            text = f"{when}  {name}  {label}" + (f" — {detail}" if detail else "")
             entry = QListWidgetItem(text)
             entry.setForeground(QColor(color))
             self.activity_list.addItem(entry)
