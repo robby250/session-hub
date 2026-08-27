@@ -5069,6 +5069,13 @@ class SessionHub(QMainWindow):
         # Usage bars refresh only on demand (startup, the Refresh button, or F5);
         # there is no automatic periodic polling.
         QTimer.singleShot(0, self.refresh_usage)
+        # The first-ever "Manage group" dialog opened in a run visibly lags
+        # (~1s) before Qt's warmed up; every dialog after that is instant.
+        # Data isn't the cause - refresh() above already scans every
+        # transcript ManageGroupDialog would. Paying that one-time Qt
+        # widget-construction/layout cost here, off-screen, means the
+        # user's first real click never has to.
+        QTimer.singleShot(0, self._prewarm_manage_group_dialog)
         # Live session status, unlike usage, is cheap (local file reads) and
         # meant to feel live - refresh_running_tab never touches refresh_usage.
         self._codex_notify_warned = False
@@ -5333,6 +5340,23 @@ class SessionHub(QMainWindow):
         for project_dir in dirs:
             uninstall_status_hooks(project_dir)
         uninstall_status_hooks_codex()
+
+    def _prewarm_manage_group_dialog(self) -> None:
+        """Construct-and-discard a ManageGroupDialog off-screen at startup.
+
+        WA_DontShowOnScreen still runs the dialog through Qt's real show/
+        layout/paint machinery without it ever appearing, so the one-time
+        cost lands here instead of on the user's first real "Manage" click.
+        No-op if there are no groups yet to build one against.
+        """
+        groups = self.metadata.get("groups", {})
+        if not groups:
+            return
+        dialog = ManageGroupDialog(self, next(iter(groups)), self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        dialog.show()
+        dialog.close()
+        dialog.deleteLater()
 
     def open_deleted_sessions(self) -> None:
         DeletedSessionsDialog(self, self).exec()
