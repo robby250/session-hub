@@ -6866,11 +6866,14 @@ class SessionHub(QMainWindow):
             f"Continue with {target}?",
             f"Create a local handoff and continue “{session.title}” with {target}?\n\n"
             "Session Hub will keep one visible row. The original native transcript "
-            "will remain stored but hidden.",
-            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
+            "will remain stored but hidden.\n\n"
+            f"Choose No to just start a fresh {target} session here, with no handoff.",
+            QMessageBox.StandardButton.Cancel
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Yes,
             QMessageBox.StandardButton.Yes,
         )
-        if answer != QMessageBox.StandardButton.Yes:
+        if answer == QMessageBox.StandardButton.Cancel:
             return
         group_cwd = self.group_cwd_for_session_key(session.key)
         group_row = None
@@ -6894,6 +6897,11 @@ class SessionHub(QMainWindow):
                 or overrides.get("name")
                 or session.title
             )
+        if answer == QMessageBox.StandardButton.No:
+            self.boot_other_agent_no_handoff(
+                session, target, group_row, group_cwd, use_tmux, tmux_name
+            )
+            return
         try:
             handoff = write_handoff(session, target)
             prompt = (
@@ -7096,6 +7104,96 @@ class SessionHub(QMainWindow):
             QTimer.singleShot(2500, self.poll_handoffs)
         except OSError as error:
             QMessageBox.critical(self, "Could not create handoff", str(error))
+
+    def boot_other_agent_no_handoff(
+        self,
+        session: Session,
+        target: str,
+        group_row: dict | None,
+        group_cwd: str | None,
+        use_tmux: bool,
+        tmux_name: str | None,
+    ) -> None:
+        """Start `target` fresh in `session.cwd` - no handoff file, no link to
+        `session`. The old session/pane is not merged or hidden, just
+        replaced in place if it occupied a group row/tmux slot."""
+        lookup_key = group_row["override_key"] if group_row is not None else session.key
+        default_model = self.effective_model(lookup_key, target)
+        default_reasoning_effort = (
+            self.effective_codex_reasoning_effort(lookup_key) if target == "Codex" else None
+        )
+        default_account = self.effective_account(lookup_key) if target == "Claude" else None
+        dialog = AgentModelEffortDialog(
+            target,
+            self,
+            default_model=default_model,
+            default_reasoning_effort=default_reasoning_effort,
+            claude_accounts=self.settings().get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS,
+            default_account=default_account,
+            accounts_enabled=bool(self.settings().get("claude_accounts_enabled")),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        model = dialog.model
+        reasoning_effort = dialog.reasoning_effort
+        account_config_dir = dialog.account_config_dir if target == "Claude" else None
+
+        if use_tmux:
+            stop_tmux_session(tmux_name)
+
+        if target == "Claude":
+            target_id = str(uuid.uuid4())
+            target_key = f"Claude:{target_id}"
+            if model:
+                self.metadata.setdefault("sessions", {}).setdefault(
+                    target_key, {}
+                ).setdefault("env", {})["ANTHROPIC_MODEL"] = model
+            if account_config_dir:
+                self.metadata.setdefault("sessions", {}).setdefault(
+                    target_key, {}
+                ).setdefault("env", {})["CLAUDE_CONFIG_DIR"] = account_config_dir
+            self.launch(
+                target,
+                None,
+                session.cwd,
+                model=model,
+                session_key=target_key,
+                flag_overrides={"--name": session.title, "--session-id": target_id},
+                use_tmux=use_tmux,
+                tmux_name=tmux_name,
+            )
+        else:
+            self.launch(
+                target,
+                None,
+                session.cwd,
+                model=model,
+                reasoning_effort=reasoning_effort if target == "Codex" else None,
+                use_tmux=use_tmux,
+                tmux_name=tmux_name,
+            )
+
+        if group_row is not None:
+            group_row["provider"] = target
+            override_key = group_row["override_key"]
+            if target == "Claude":
+                if model:
+                    self.metadata.setdefault("sessions", {}).setdefault(
+                        override_key, {}
+                    ).setdefault("env", {})["ANTHROPIC_MODEL"] = model
+                if account_config_dir:
+                    self.metadata.setdefault("sessions", {}).setdefault(
+                        override_key, {}
+                    ).setdefault("env", {})["CLAUDE_CONFIG_DIR"] = account_config_dir
+            elif target == "Codex":
+                entry = self.metadata.setdefault("sessions", {}).setdefault(override_key, {})
+                if model:
+                    entry["model"] = model
+                if reasoning_effort:
+                    entry["reasoning_effort"] = reasoning_effort
+
+        write_metadata(self.metadata)
+        self.refresh()
 
     def poll_handoffs(self) -> None:
         self.refresh()
