@@ -88,3 +88,64 @@ All in `session_hub.py`: `STATUS_DIR` constant; `write_session_status`/`read_ses
 columns + `activity_list` (`QListWidget`) in `build_ui`; `refresh_running_tab` rewritten to resolve
 and render status; `reveal_running_row`/`stop_selected_running` updated for the 3-tuple row payload;
 `QTimer(2000ms)` in `SessionHub.__init__`.
+
+## Codex CLI support (2026-08-27, second pass)
+
+### Context
+User: *"aren't there codex hooks too? i have codex CLIs too"* — the above only wired up Claude
+(`provider == "Claude"` gate). Explicit go-ahead: *"yeah do a full research+implement pass"*.
+
+### Finding — verified
+- Codex session identity already resolves today, same shape as Claude's `session_id`:
+  `codex_sessions()` (session_hub.py:1422) reads `CODEX_STATE` (`~/.codex/state_5.sqlite`) table
+  `threads(id, title, cwd, updated_at_ms, rollout_path)` — `id` is a real per-thread identifier.
+- Codex has two extension mechanisms, not one. `notify` (`config.toml`, single-command,
+  **user-level only** — confirmed explicitly not project-overridable, learn.chatgpt.com/docs/
+  config-file/config-reference) fires **only** for `agent-turn-complete`
+  (codex.danielvaughan.com, jw1.dev — both confirm no other event reaches it, and jw1.dev states
+  approval prompts are a separate, non-hookable `tui.notifications` mechanism). Payload confirmed
+  **kebab-case** by two independent concrete sources (backgrind.com's quoted JSON example,
+  jw1.dev's actual filter script): `type`, `thread-id`, `turn-id`, `cwd`, `client` (optional),
+  `input-messages` (optional), `last-assistant-message` (optional).
+- A newer lifecycle **hooks engine** (`hooks.json`, event names mirroring Claude Code's) is
+  project-scriptable, but every fetch attempting its payload schema (learn.chatgpt.com/docs/hooks,
+  doc.jarvisuni.com) returned fields identical to Claude Code's own hook payload
+  (`session_id`, `transcript_path`, `hook_event_name`, `permission_mode`, `model`) — the same
+  hallucination pattern already flagged once this session with a claude-code-guide subagent
+  report. Not trustworthy, not used.
+- No existing `notify` key on this machine's `~/.codex/config.toml` (checked directly).
+
+## Decisions
+| question | answer |
+|---|---|
+| Codex state set | Done only — no Working/Needs-input signal exists for Codex. Same Done→Idle clearing as Claude. |
+| Install scope | Same Settings toggle; for Codex it writes the global `~/.codex/config.toml` `notify` key (not per-project — `notify` can't be). Tooltip says so plainly. |
+| Notify collision | Refuse to overwrite an existing non-Session-Hub `notify` command; warn once via `QMessageBox` instead. |
+| TOML editing | `tomllib` (stdlib) to read; a targeted regex line-patch to write the single `notify = [...]` line — no new dependency, rest of the file untouched. |
+| Uninstall | Mirrors the Claude path: `uninstall_status_hooks_codex()` removes the `notify` line only if it's still exactly Session Hub's own command. |
+
+## Rejected
+- **Codex's lifecycle hooks engine** — closer parity with Claude's 4-state model, but its payload
+  schema could not be verified from any trustworthy source; every fetch returned what appears to
+  be copy-pasted Claude Code documentation. Revisit if OpenAI publishes a verified schema.
+- **Chaining an existing user `notify` command** — considered, rejected as more code for a
+  collision that doesn't exist on this machine today; refuse-and-warn is simpler and non-destructive.
+
+## Implementation (Codex pass)
+`session_hub.py`: `CODEX_CONFIG` constant; `hook_event_to_status_codex`; `hook_notify_codex_cli`
+(new `--hook-notify-codex` CLI flag, reads the payload from the **last argv element**, since Codex
+appends it after the configured `notify` command rather than piping stdin like Claude);
+`codex_notify_command`/`_read_codex_notify`/`install_status_hooks_codex`/
+`uninstall_status_hooks_codex`; `SessionHub.launch()`'s gate extended to cover `provider ==
+"Codex"`, warning once (`self._codex_notify_warned`) on a real collision;
+`uninstall_status_hooks_everywhere` now also calls `uninstall_status_hooks_codex()`; Settings
+tooltip updated to explain the global-vs-per-project distinction. `refresh_running_tab` needed no
+change — it already reads status by `session_id` generically regardless of provider.
+
+## Verification (Codex pass)
+- `python3 -c "import ast; ast.parse(open('session_hub.py').read())"` — passed.
+- **Not run**: pytest (standing repo constraint).
+- **Not verified**: a real Codex `agent-turn-complete` notify invocation end-to-end (config write
+  confirmed by code path, but no live Codex session was run to trigger it this pass). The argv
+  payload shape (last element, kebab-case fields) rests on two independent but still third-party
+  sources, not an official OpenAI schema doc — treat as best-effort until seen firing for real.

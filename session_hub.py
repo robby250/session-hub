@@ -19,6 +19,7 @@ import sys
 import termios
 import threading
 import time
+import tomllib
 import uuid
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -71,6 +72,7 @@ HOME = Path.home()
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
 CODEX_STATE = HOME / ".codex" / "state_5.sqlite"
 CODEX_MODELS_CACHE = HOME / ".codex" / "models_cache.json"
+CODEX_CONFIG = HOME / ".codex" / "config.toml"
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
 CLAUDE_HISTORY = HOME / ".claude" / "history.jsonl"
 ANTIGRAVITY_HOME = HOME / ".gemini" / "antigravity-cli"
@@ -114,8 +116,9 @@ HANDOFF_DIR = DATA_DIR / "handoffs"
 # and linked to the session it continues - see pid_capture_command and
 # resolve_clear_continuations.
 PID_DIR = DATA_DIR / "pids"
-# One JSON file per Claude session_id, written by the --hook-notify hook
-# handler and read back by refresh_running_tab - see install_status_hooks.
+# One JSON file per session_id (Claude transcript UUID or Codex thread id),
+# written by the --hook-notify / --hook-notify-codex handlers and read back
+# by refresh_running_tab - see install_status_hooks/install_status_hooks_codex.
 STATUS_DIR = DATA_DIR / "status"
 PROC_ROOT = Path("/proc")
 APP_ICON = Path(__file__).resolve().parent / "assets" / "session-hub.svg"
@@ -2404,6 +2407,19 @@ def hook_event_to_status(payload: dict) -> tuple[str, str] | None:
     return None
 
 
+def hook_event_to_status_codex(payload: dict) -> tuple[str, str] | None:
+    """(state, detail) for one Codex `notify` payload, or None to ignore it.
+
+    Codex's `notify` fires only for "agent-turn-complete" - no distinct
+    needs-input or working signal exists (approval prompts are a separate,
+    non-hookable `tui.notifications` mechanism) - so Codex rows only ever
+    reach "done" through this, same Done -> Idle clearing as Claude rows.
+    """
+    if payload.get("type") != "agent-turn-complete":
+        return None
+    return "done", str(payload.get("last-assistant-message", ""))
+
+
 def hook_notify_cli() -> int:
     """--hook-notify: the command Claude Code itself runs as a hook.
 
@@ -2422,6 +2438,29 @@ def hook_notify_cli() -> int:
     if mapped is None:
         return 0
     write_session_status(session_id, *mapped)
+    return 0
+
+
+def hook_notify_codex_cli(argv: list[str]) -> int:
+    """--hook-notify-codex: the command Codex's `notify` config runs.
+
+    Codex appends its JSON payload as one extra argv element after the
+    configured command (third-party captures confirm this - OpenAI's own
+    docs don't spell out the exact argv shape), so the payload is always
+    the LAST argument regardless of how many flags precede it. Never
+    raises, same reasoning as hook_notify_cli.
+    """
+    try:
+        payload = json.loads(argv[-1])
+    except (IndexError, ValueError):
+        return 0
+    thread_id = payload.get("thread-id")
+    if not thread_id:
+        return 0
+    mapped = hook_event_to_status_codex(payload)
+    if mapped is None:
+        return 0
+    write_session_status(thread_id, *mapped)
     return 0
 
 
@@ -2484,6 +2523,69 @@ def uninstall_status_hooks(project_dir: Path) -> None:
         data.pop("hooks", None)
     if changed:
         settings_path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def codex_notify_command() -> list[str]:
+    """The exact argv session-hub asks Codex's `notify` config to run.
+
+    install_status_hooks_codex (writing it into ~/.codex/config.toml) and
+    uninstall_status_hooks_codex (matching it to remove) must agree on
+    this byte-for-byte, so both go through this one function - same
+    pattern as hook_notify_command for the Claude side.
+    """
+    return [sys.executable, str(Path(__file__).resolve()), "--hook-notify-codex"]
+
+
+def _read_codex_notify() -> list[str] | None:
+    try:
+        with CODEX_CONFIG.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    value = data.get("notify")
+    return value if isinstance(value, list) else None
+
+
+def install_status_hooks_codex() -> bool:
+    """Set ~/.codex/config.toml's `notify` key to session-hub's own command.
+
+    Unlike Claude's hooks, Codex's `notify` is a single slot (not a
+    mergeable list) and user-level only (not per-project) - so this only
+    ever writes if the key is unset or already ours. Returns False without
+    changing anything if the user has their own notify command configured;
+    callers should warn rather than silently overwrite it. Edits only the
+    one `notify = [...]` line via a targeted text patch, leaving the rest
+    of the user's config.toml untouched - session-hub has no TOML-writer
+    dependency to round-trip the whole file with.
+    """
+    ours = codex_notify_command()
+    existing = _read_codex_notify()
+    if existing is not None and existing != ours:
+        return False
+    line = f"notify = {json.dumps(ours)}"
+    if not CODEX_CONFIG.is_file():
+        CODEX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        CODEX_CONFIG.write_text(line + "\n")
+        return True
+    text = CODEX_CONFIG.read_text()
+    if re.search(r"(?m)^notify\s*=.*$", text):
+        text = re.sub(r"(?m)^notify\s*=.*$", line, text, count=1)
+    else:
+        text = text.rstrip("\n")
+        text = (text + "\n" if text else "") + line + "\n"
+    CODEX_CONFIG.write_text(text)
+    return True
+
+
+def uninstall_status_hooks_codex() -> None:
+    """Inverse of install_status_hooks_codex: removes the `notify` line
+    only if it's still exactly session-hub's own command."""
+    if _read_codex_notify() != codex_notify_command():
+        return
+    if not CODEX_CONFIG.is_file():
+        return
+    text = re.sub(r"(?m)^notify\s*=.*\n?", "", CODEX_CONFIG.read_text(), count=1)
+    CODEX_CONFIG.write_text(text)
 
 
 def group_row_status(row: dict, match: "Session | None", tmux_enabled: bool) -> str:
@@ -3194,12 +3296,15 @@ class SettingsDialog(QDialog):
             "Enable live session status (Working / Needs input / Done)"
         )
         self.status_hooks_enabled.setToolTip(
-            "Shows a live status column on the Running tab by merging Claude "
-            "Code hooks into each launched project's own "
-            ".claude/settings.local.json (gitignored, not committed). "
-            "Turning this off removes exactly the hook entries Session Hub "
-            "added, from every project it touched. Off by default since it "
-            "edits files inside your projects."
+            "Shows a live status column on the Running tab. For Claude, merges "
+            "hooks into each launched project's own .claude/settings.local.json "
+            "(gitignored, not committed). For Codex, sets the `notify` command "
+            "in ~/.codex/config.toml - unlike Claude this is a single, machine-"
+            "wide setting, not per-project, so it also affects Codex sessions "
+            "run outside Session Hub, and only gives a Done signal (no Working/"
+            "Needs input - Codex doesn't expose those). Turning this off removes "
+            "exactly what Session Hub added, everywhere it added it. Off by "
+            "default since it edits files outside this app."
         )
         self.status_hooks_enabled.setChecked(bool(settings.get("status_hooks_enabled", False)))
         layout.addWidget(self.status_hooks_enabled)
@@ -4966,6 +5071,7 @@ class SessionHub(QMainWindow):
         QTimer.singleShot(0, self.refresh_usage)
         # Live session status, unlike usage, is cheap (local file reads) and
         # meant to feel live - refresh_running_tab never touches refresh_usage.
+        self._codex_notify_warned = False
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(2000)
         self._status_timer.timeout.connect(self.refresh_running_tab)
@@ -5226,6 +5332,7 @@ class SessionHub(QMainWindow):
         dirs.update(Path(session.cwd) for session in self.sessions if session.cwd)
         for project_dir in dirs:
             uninstall_status_hooks(project_dir)
+        uninstall_status_hooks_codex()
 
     def open_deleted_sessions(self) -> None:
         DeletedSessionsDialog(self, self).exec()
@@ -6206,8 +6313,18 @@ class SessionHub(QMainWindow):
                 f"The session's original directory does not exist:\n{source_cwd}",
             )
             return
-        if use_tmux and provider == "Claude" and self.settings().get("status_hooks_enabled", False):
-            install_status_hooks(Path(cwd))
+        if use_tmux and self.settings().get("status_hooks_enabled", False):
+            if provider == "Claude":
+                install_status_hooks(Path(cwd))
+            elif provider == "Codex" and not install_status_hooks_codex() and not self._codex_notify_warned:
+                self._codex_notify_warned = True
+                QMessageBox.warning(
+                    self,
+                    "Codex live status not installed",
+                    "~/.codex/config.toml already has a `notify` command that isn't "
+                    "Session Hub's own, so it was left alone - Codex rows won't show "
+                    "live status until you clear or replace that `notify` line yourself.",
+                )
         try:
             flags = (
                 self.launch_flags(session_key, flag_overrides)
@@ -7751,6 +7868,8 @@ def main() -> int:
         return resume_session_cli(sys.argv)
     if "--hook-notify" in sys.argv:
         return hook_notify_cli()
+    if "--hook-notify-codex" in sys.argv:
+        return hook_notify_codex_cli(sys.argv)
     app = QApplication(sys.argv)
     app.setApplicationName("Session Hub")
     app.setDesktopFileName("session-hub")
