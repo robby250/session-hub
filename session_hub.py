@@ -49,6 +49,8 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -112,6 +114,9 @@ HANDOFF_DIR = DATA_DIR / "handoffs"
 # and linked to the session it continues - see pid_capture_command and
 # resolve_clear_continuations.
 PID_DIR = DATA_DIR / "pids"
+# One JSON file per Claude session_id, written by the --hook-notify hook
+# handler and read back by refresh_running_tab - see install_status_hooks.
+STATUS_DIR = DATA_DIR / "status"
 PROC_ROOT = Path("/proc")
 APP_ICON = Path(__file__).resolve().parent / "assets" / "session-hub.svg"
 # One-off sessions launch here instead of literally $HOME, so they don't
@@ -2060,6 +2065,28 @@ def window_titled(title: str) -> bool:
     return any(title in window_title for _, window_title in _terminal_windows())
 
 
+def active_window_title() -> str | None:
+    """The title of whichever window currently has OS focus, or None if it
+    can't be determined (xdotool missing, no X session, etc.) - used to
+    clear a row's "Done" status back to "Idle" the moment the user actually
+    looks at its terminal, without needing Session Hub to have opened it
+    itself (reveal_running_row covers that half; this covers a plain
+    alt-tab). Same xdotool primitive proven live against real window-focus
+    changes during the tmux focus-events diagnosis this feature grew out of.
+    """
+    xdotool = shutil.which("xdotool")
+    if not xdotool:
+        return None
+    try:
+        result = subprocess.run(
+            [xdotool, "getactivewindow", "getwindowname"],
+            capture_output=True, text=True, timeout=1,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
 def focus_window_by_title(title: str, timeout: float = 3.0) -> None:
     """Raise and focus the terminal window we just launched.
 
@@ -2310,6 +2337,153 @@ def stop_tmux_session(name: str) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def hook_notify_command() -> list[str]:
+    """The exact argv session-hub asks a Claude Code hook to run.
+
+    install_status_hooks (writing it into a project's settings.local.json)
+    and uninstall_status_hooks (matching it to remove) must agree on this
+    string byte-for-byte, so both go through this one function.
+    """
+    return [sys.executable, str(Path(__file__).resolve()), "--hook-notify"]
+
+
+def write_session_status(session_id: str, state: str, detail: str = "") -> None:
+    STATUS_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATUS_DIR / f"{session_id}.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"state": state, "ts": time.time(), "detail": detail}))
+    tmp.replace(path)
+
+
+def read_session_status(session_id: str) -> dict | None:
+    try:
+        return json.loads((STATUS_DIR / f"{session_id}.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def all_session_statuses() -> list[tuple[str, dict]]:
+    """Every known (session_id, status) pair, newest first.
+
+    The single source both the Status column and the Recent-activity strip
+    read from - one writer (write_session_status), two readers, no separate
+    log to drift out of sync with it.
+    """
+    if not STATUS_DIR.is_dir():
+        return []
+    entries = []
+    for path in STATUS_DIR.glob("*.json"):
+        try:
+            entries.append((path.stem, json.loads(path.read_text())))
+        except (OSError, ValueError):
+            continue
+    entries.sort(key=lambda entry: entry[1].get("ts", 0), reverse=True)
+    return entries
+
+
+_NEEDS_INPUT_NOTIFICATION_TYPES = {"idle_prompt", "permission_prompt", "agent_needs_input"}
+
+
+def hook_event_to_status(payload: dict) -> tuple[str, str] | None:
+    """(state, detail) for one hook stdin payload, or None if this event
+    doesn't change status - see hook_notify_cli."""
+    event = payload.get("hook_event_name")
+    if event in ("SessionStart", "UserPromptSubmit"):
+        return "working", ""
+    if event == "Notification":
+        notification_type = payload.get("notification_type", "")
+        if notification_type in _NEEDS_INPUT_NOTIFICATION_TYPES:
+            return "needs_input", str(payload.get("message", ""))
+        if notification_type == "agent_completed":
+            return "done", str(payload.get("message", ""))
+        return None
+    if event == "Stop":
+        return "done", str(payload.get("last_assistant_message", ""))
+    return None
+
+
+def hook_notify_cli() -> int:
+    """--hook-notify: the command Claude Code itself runs as a hook.
+
+    Reads the hook's stdin JSON, writes STATUS_DIR/<session_id>.json. Never
+    raises - a hook that errors interrupts the very session it's reporting
+    on, so malformed input is silently ignored rather than surfaced.
+    """
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return 0
+    session_id = payload.get("session_id")
+    if not session_id:
+        return 0
+    mapped = hook_event_to_status(payload)
+    if mapped is None:
+        return 0
+    write_session_status(session_id, *mapped)
+    return 0
+
+
+_STATUS_HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "Notification", "Stop")
+
+
+def install_status_hooks(project_dir: Path) -> None:
+    """Merge session-hub's status hooks into <project_dir>/.claude/settings.local.json.
+
+    Merges rather than overwrites, mirroring Claude Code's own settings-merge
+    semantics - any hooks the user already has there, for these events or
+    others, are preserved untouched.
+    """
+    settings_path = project_dir / ".claude" / "settings.local.json"
+    try:
+        data = json.loads(settings_path.read_text()) if settings_path.is_file() else {}
+    except (OSError, ValueError):
+        data = {}
+    hooks = data.setdefault("hooks", {})
+    command = shlex.join(hook_notify_command())
+    for event in _STATUS_HOOK_EVENTS:
+        entries = hooks.setdefault(event, [])
+        already = any(
+            h.get("command") == command for entry in entries for h in entry.get("hooks", [])
+        )
+        if not already:
+            entries.append({"matcher": "", "hooks": [{"type": "command", "command": command}]})
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def uninstall_status_hooks(project_dir: Path) -> None:
+    """Inverse of install_status_hooks: strips only entries whose command
+    matches ours, leaves everything else in the file alone."""
+    settings_path = project_dir / ".claude" / "settings.local.json"
+    if not settings_path.is_file():
+        return
+    try:
+        data = json.loads(settings_path.read_text())
+    except (OSError, ValueError):
+        return
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return
+    command = shlex.join(hook_notify_command())
+    changed = False
+    for event in list(hooks.keys()):
+        entries = hooks.get(event) or []
+        kept = [
+            entry for entry in entries
+            if not any(h.get("command") == command for h in entry.get("hooks", []))
+        ]
+        if len(kept) != len(entries):
+            changed = True
+        if kept:
+            hooks[event] = kept
+        else:
+            hooks.pop(event, None)
+    if not hooks:
+        data.pop("hooks", None)
+    if changed:
+        settings_path.write_text(json.dumps(data, indent=2) + "\n")
 
 
 def group_row_status(row: dict, match: "Session | None", tmux_enabled: bool) -> str:
@@ -3016,6 +3190,20 @@ class SettingsDialog(QDialog):
         launch_layout.addWidget(self.launch_options)
         layout.addWidget(launch_group)
 
+        self.status_hooks_enabled = QCheckBox(
+            "Enable live session status (Working / Needs input / Done)"
+        )
+        self.status_hooks_enabled.setToolTip(
+            "Shows a live status column on the Running tab by merging Claude "
+            "Code hooks into each launched project's own "
+            ".claude/settings.local.json (gitignored, not committed). "
+            "Turning this off removes exactly the hook entries Session Hub "
+            "added, from every project it touched. Off by default since it "
+            "edits files inside your projects."
+        )
+        self.status_hooks_enabled.setChecked(bool(settings.get("status_hooks_enabled", False)))
+        layout.addWidget(self.status_hooks_enabled)
+
         self.enable_accounts = QCheckBox("Enable multiple Claude accounts")
         self.enable_accounts.setToolTip(
             "Adds an Account picker (alongside Model) to New Session, group "
@@ -3098,6 +3286,7 @@ class SettingsDialog(QDialog):
                 "claude_accounts_enabled": self.enable_accounts.isChecked(),
                 "claude_accounts": self.accounts_editor.env(),
                 "launch_in_tmux": self.launch_in_tmux.isChecked(),
+                "status_hooks_enabled": self.status_hooks_enabled.isChecked(),
             }
         )
         return values
@@ -3144,6 +3333,7 @@ class NewSessionDialog(QDialog):
         self.model: str | None = None
         self.reasoning_effort: str | None = None
         self.account_config_dir: str | None = None
+        self.use_tmux: bool = bool(settings.get("launch_in_tmux", False))
         self.claude_accounts = settings.get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS
         self.setWindowTitle(f"New {provider} Session")
         self.setMinimumWidth(600)
@@ -3211,6 +3401,17 @@ class NewSessionDialog(QDialog):
         self.existing_widget.setLayout(existing_row)
         form.addRow("Existing folder:", self.existing_widget)
         layout.addLayout(form)
+
+        self.tmux_checkbox = QCheckBox("Launch detached inside tmux")
+        self.tmux_checkbox.setChecked(self.use_tmux)
+        self.tmux_checkbox.setToolTip(
+            "Runs this session inside its own tmux session instead of "
+            "directly in a terminal, so tooling can drive it via "
+            "`tmux send-keys` with no focus impact. Requires tmux to be "
+            "installed. Defaults to the global Settings toggle, but can be "
+            "changed for this session only."
+        )
+        layout.addWidget(self.tmux_checkbox)
 
         self.preview = QLabel()
         self.preview.setWordWrap(True)
@@ -3307,6 +3508,7 @@ class NewSessionDialog(QDialog):
         elif self.codex_model_combo is not None:
             self.model = codex_combo_value(self.codex_model_combo)
             self.reasoning_effort = codex_combo_value(self.codex_effort_combo)
+        self.use_tmux = self.tmux_checkbox.isChecked()
         super().accept()
 
 
@@ -4762,6 +4964,12 @@ class SessionHub(QMainWindow):
         # Usage bars refresh only on demand (startup, the Refresh button, or F5);
         # there is no automatic periodic polling.
         QTimer.singleShot(0, self.refresh_usage)
+        # Live session status, unlike usage, is cheap (local file reads) and
+        # meant to feel live - refresh_running_tab never touches refresh_usage.
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(2000)
+        self._status_timer.timeout.connect(self.refresh_running_tab)
+        self._status_timer.start()
 
     def build_ui(self) -> None:
         root = QWidget()
@@ -4899,8 +5107,10 @@ class SessionHub(QMainWindow):
         running_page = QWidget()
         running_layout = QVBoxLayout(running_page)
         running_layout.setContentsMargins(0, 0, 0, 0)
-        self.running_table = QTableWidget(0, 3)
-        self.running_table.setHorizontalHeaderLabels(["Project", "Name", "Provider"])
+        self.running_table = QTableWidget(0, 5)
+        self.running_table.setHorizontalHeaderLabels(
+            ["Project", "Name", "Provider", "Status", "Last message"]
+        )
         self.running_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.running_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.running_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -4915,6 +5125,14 @@ class SessionHub(QMainWindow):
         stop_button.clicked.connect(self.stop_selected_running)
         running_actions.addWidget(stop_button)
         running_layout.addLayout(running_actions)
+
+        activity_label = QLabel("Recent activity")
+        activity_label.setStyleSheet("color: #888;")
+        running_layout.addWidget(activity_label)
+        self.activity_list = QListWidget()
+        self.activity_list.setMaximumHeight(160)
+        self.activity_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        running_layout.addWidget(self.activity_list)
 
         tabs = QTabWidget()
         tabs.addTab(all_sessions_page, "All Sessions")
@@ -4979,12 +5197,16 @@ class SessionHub(QMainWindow):
         if idx >= 0:
             self.new_provider.setCurrentIndex(idx)
         elif self.new_provider.count() > 0:
-            self.new_provider.setCurrentIndex(0)
+            # PROVIDERS lists Codex first, but Claude is the default agent -
+            # fall back to it over plain index 0 when nothing was selected before.
+            default_idx = self.new_provider.findText("Claude")
+            self.new_provider.setCurrentIndex(default_idx if default_idx >= 0 else 0)
         # Handoffs need a second enabled agent to hand off to.
         multiple_agents = len(enabled_providers) > 1
         self.continue_with_other_button.setVisible(multiple_agents)
 
     def open_settings(self) -> None:
+        was_enabled = bool(self.settings().get("status_hooks_enabled", False))
         dialog = SettingsDialog(self.settings(), self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.metadata["settings"] = dialog.values()
@@ -4992,7 +5214,18 @@ class SessionHub(QMainWindow):
             self.purge_expired_trash()
             self.update_usage_visibility()
             self.update_new_provider_list()
+            if was_enabled and not self.settings().get("status_hooks_enabled", False):
+                self.uninstall_status_hooks_everywhere()
             self.refresh()
+
+    def uninstall_status_hooks_everywhere(self) -> None:
+        """Best-effort cleanup when the status-hooks Settings toggle is
+        turned back off: strips exactly the hook entries install_status_hooks
+        added, from every project directory Session Hub knows about."""
+        dirs = {Path(cwd) for cwd in self.metadata.get("groups", {})}
+        dirs.update(Path(session.cwd) for session in self.sessions if session.cwd)
+        for project_dir in dirs:
+            uninstall_status_hooks(project_dir)
 
     def open_deleted_sessions(self) -> None:
         DeletedSessionsDialog(self, self).exec()
@@ -5441,7 +5674,7 @@ class SessionHub(QMainWindow):
         if settings.get("enable_antigravity", True):
             live += antigravity_sessions()
 
-        running: list[tuple[str, str, dict]] = []
+        running: list[tuple[str, str, dict, str | None]] = []
         claimed: set[str] = set()
         for cwd, group in self.metadata.get("groups", {}).items():
             tmux_enabled = self.effective_tmux(group.get("tmux"))
@@ -5453,7 +5686,7 @@ class SessionHub(QMainWindow):
                 if match:
                     claimed.add(match.native_key)
                 if group_row_status(row, match, tmux_enabled) == "Running":
-                    running.append((display_name, cwd, row))
+                    running.append((display_name, cwd, row, match.session_id if match else None))
 
         session_overrides = self.metadata.get("sessions", {}) or {}
         for session in self.sessions:
@@ -5463,17 +5696,64 @@ class SessionHub(QMainWindow):
                 session, session_overrides.get(session.key, {}), settings
             )
             if tmux_enabled and status == "Running":
-                running.append((session.title, session.cwd, {"name": name, "provider": session.provider}))
+                running.append((
+                    session.title, session.cwd,
+                    {"name": name, "provider": session.provider}, session.session_id,
+                ))
 
+        active_title = active_window_title()
         self.running_table.setRowCount(len(running))
-        for index, (display_name, cwd, row) in enumerate(running):
+        for index, (display_name, cwd, row, session_id) in enumerate(running):
             project_item = QTableWidgetItem(display_name)
-            project_item.setData(Qt.ItemDataRole.UserRole, (cwd, row["name"]))
+            project_item.setData(Qt.ItemDataRole.UserRole, (cwd, row["name"], session_id))
             self.running_table.setItem(index, 0, project_item)
             self.running_table.setItem(index, 1, QTableWidgetItem(row["name"]))
             self.running_table.setItem(
                 index, 2, QTableWidgetItem(row.get("provider", "Claude"))
             )
+            status = read_session_status(session_id) if session_id else None
+            if status and status.get("state") == "done" and active_title and row["name"] in active_title:
+                write_session_status(session_id, "idle", status.get("detail", ""))
+                status["state"] = "idle"
+            self.running_table.setItem(index, 3, self._status_column_item(status))
+            self.running_table.setItem(index, 4, self._detail_column_item(status))
+        self._refresh_activity_list()
+
+    _STATUS_LABELS = {
+        "working": ("Working", "#5aa9ff"),
+        "needs_input": ("Needs input", "#d9534f"),
+        "done": ("Done", "#d69e2e"),
+        "idle": ("Idle", "#888888"),
+    }
+
+    def _status_column_item(self, status: dict | None) -> QTableWidgetItem:
+        state = (status or {}).get("state")
+        label, color = self._STATUS_LABELS.get(state, ("", "#888888"))
+        item = QTableWidgetItem(label)
+        item.setForeground(QColor(color))
+        return item
+
+    @staticmethod
+    def _detail_column_item(status: dict | None) -> QTableWidgetItem:
+        detail = " ".join((status or {}).get("detail", "").split())
+        snippet = detail if len(detail) <= 80 else detail[:79] + "…"
+        item = QTableWidgetItem(snippet)
+        if detail:
+            item.setToolTip(detail)
+        return item
+
+    def _refresh_activity_list(self) -> None:
+        self.activity_list.clear()
+        for session_id, status in all_session_statuses()[:20]:
+            label, color = self._STATUS_LABELS.get(status.get("state"), ("", "#888888"))
+            if not label:
+                continue
+            when = datetime.fromtimestamp(status.get("ts", 0)).strftime("%H:%M:%S")
+            detail = " ".join(status.get("detail", "").split())[:80]
+            text = f"{when}  {label}" + (f" — {detail}" if detail else "")
+            entry = QListWidgetItem(text)
+            entry.setForeground(QColor(color))
+            self.activity_list.addItem(entry)
 
     def stop_selected_running(self) -> None:
         row = self.running_table.currentRow()
@@ -5481,7 +5761,7 @@ class SessionHub(QMainWindow):
             QMessageBox.information(self, "Session Hub", "Select a running session first.")
             return
         item = self.running_table.item(row, 0)
-        cwd, name = item.data(Qt.ItemDataRole.UserRole)
+        cwd, name, _session_id = item.data(Qt.ItemDataRole.UserRole)
         confirm = QMessageBox.question(
             self,
             "Stop session",
@@ -5508,7 +5788,11 @@ class SessionHub(QMainWindow):
         item = self.running_table.item(row, 0)
         if not item:
             return
-        cwd, name = item.data(Qt.ItemDataRole.UserRole)
+        cwd, name, session_id = item.data(Qt.ItemDataRole.UserRole)
+        if session_id:
+            status = read_session_status(session_id)
+            if status and status.get("state") == "done":
+                write_session_status(session_id, "idle", status.get("detail", ""))
         if window_titled(name):
             threading.Thread(target=focus_window_by_title, args=(name,), daemon=True).start()
             return
@@ -5922,6 +6206,8 @@ class SessionHub(QMainWindow):
                 f"The session's original directory does not exist:\n{source_cwd}",
             )
             return
+        if use_tmux and provider == "Claude" and self.settings().get("status_hooks_enabled", False):
+            install_status_hooks(Path(cwd))
         try:
             flags = (
                 self.launch_flags(session_key, flag_overrides)
@@ -6678,6 +6964,11 @@ class SessionHub(QMainWindow):
     def launch_new(self, provider: str) -> None:
         dialog = NewSessionDialog(provider, self.settings(), self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.directory:
+            tmux_name = (
+                suggest_session_name(dialog.directory, dialog.model, set())
+                if dialog.use_tmux
+                else None
+            )
             self.launch(
                 provider,
                 None,
@@ -6685,6 +6976,8 @@ class SessionHub(QMainWindow):
                 model=dialog.model,
                 reasoning_effort=dialog.reasoning_effort,
                 account_config_dir=dialog.account_config_dir,
+                use_tmux=dialog.use_tmux,
+                tmux_name=tmux_name,
             )
 
     def launch_selected_provider(self) -> None:
@@ -7456,6 +7749,8 @@ def main() -> int:
         return launch_group_row_cli(sys.argv)
     if "--resume-session" in sys.argv:
         return resume_session_cli(sys.argv)
+    if "--hook-notify" in sys.argv:
+        return hook_notify_cli()
     app = QApplication(sys.argv)
     app.setApplicationName("Session Hub")
     app.setDesktopFileName("session-hub")
