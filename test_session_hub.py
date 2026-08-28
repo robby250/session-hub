@@ -1335,6 +1335,16 @@ class SessionHubTests(unittest.TestCase):
                  "session_key": "Claude:abc"},
                 {"name": "other", "override_key": "group:/tmp/vamp#other"},
             ]}},
+            "links": {
+                "manual:old": {
+                    "members": ["Claude:older", "Claude:abc"],
+                    "active": "Claude:abc",
+                }
+            },
+            "pending_links": [{
+                "logical_key": "group:/tmp/vamp#vamp-sonnet1",
+                "target_tmux_name": "vamp-sonnet1",
+            }],
         }
         result = session_hub.rename_group_row_in(metadata, "/tmp/vamp", "vamp-sonnet1", "VAMP-worker1")
         self.assertEqual(result["status"], "renamed")
@@ -1342,10 +1352,22 @@ class SessionHubTests(unittest.TestCase):
         self.assertEqual(row["name"], "VAMP-worker1")
         self.assertEqual(row["override_key"], "group:/tmp/vamp#VAMP-worker1")
         self.assertEqual(row["session_key"], "Claude:abc")
-        # bucket moved, its stale display name dropped, other fields kept
+        # The row, stable bucket, active/history names, link identity and
+        # pending tmux identity all move together.
         self.assertNotIn("group:/tmp/vamp#vamp-sonnet1", metadata["sessions"])
         self.assertEqual(metadata["sessions"]["group:/tmp/vamp#VAMP-worker1"],
-                         {"flags": {"--effort": "high"}})
+                         {"name": "VAMP-worker1", "flags": {"--effort": "high"}})
+        self.assertEqual(metadata["sessions"]["Claude:abc"]["name"], "VAMP-worker1")
+        self.assertEqual(metadata["sessions"]["Claude:older"]["name"], "VAMP-worker1")
+        self.assertNotIn("manual:old", metadata["links"])
+        self.assertIn("group:/tmp/vamp#VAMP-worker1", metadata["links"])
+        self.assertEqual(
+            metadata["pending_links"][0],
+            {
+                "logical_key": "group:/tmp/vamp#VAMP-worker1",
+                "target_tmux_name": "VAMP-worker1",
+            },
+        )
         # collisions and unknown rows refuse
         self.assertEqual(session_hub.rename_group_row_in(metadata, "/tmp/vamp", "VAMP-worker1", "other")["status"], "error")
         self.assertEqual(session_hub.rename_group_row_in(metadata, "/tmp/vamp", "nope", "x")["status"], "error")
@@ -2045,6 +2067,111 @@ class SessionHubTests(unittest.TestCase):
                 row, "/tmp/vamp", sessions, frozenset({"Codex:id-new"})
             )
         )
+
+        ambiguous = session_hub.Session(
+            "Codex", "id-sibling", "t", "/tmp/vamp", "/tmp/vamp", 600,
+            Path("/tmp/c.jsonl"),
+        )
+        self.assertIsNone(
+            session_hub.find_group_member_session(row, "/tmp/vamp", sessions + [ambiguous])
+        )
+
+    def test_codex_tmux_native_key_reads_the_open_rollout_fd(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            proc_root = root / "proc"
+            sessions_root = root / "sessions"
+            session_id = "01a047ab-db9f-78b0-91e2-5a089bc2ddc2"
+            rollout = sessions_root / f"rollout-2026-08-28T12-20-40-{session_id}.jsonl"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text("{}\n")
+            process = proc_root / "101"
+            (process / "task" / "101").mkdir(parents=True)
+            (process / "task" / "101" / "children").write_text("")
+            (process / "fd").mkdir()
+            (process / "fd" / "9").symlink_to(rollout)
+            completed = MagicMock(returncode=0, stdout="101\n")
+            with (
+                patch("session_hub.shutil.which", return_value="/usr/bin/tmux"),
+                patch("session_hub.subprocess.run", return_value=completed),
+            ):
+                key = session_hub.codex_tmux_native_key(
+                    "VAMP-worker4", proc_root=proc_root, sessions_root=sessions_root
+                )
+            self.assertEqual(key, f"Codex:{session_id}")
+
+    def test_pending_link_uses_exact_tmux_codex_identity(self):
+        worker = session_hub.Session(
+            "Codex", "worker", "worker", "/tmp/vamp", "/tmp/vamp", 300,
+            Path("/tmp/worker.jsonl"),
+        )
+        orchestrator = session_hub.Session(
+            "Codex", "orchestrator", "orchestrator", "/tmp/vamp", "/tmp/vamp", 200,
+            Path("/tmp/orchestrator.jsonl"),
+        )
+        metadata = {
+            "sessions": {},
+            "links": {"logical": {"members": ["Claude:old"], "active": "Claude:old"}},
+            "pending_links": [{
+                "logical_key": "logical",
+                "target_provider": "Codex",
+                "existing_keys": [],
+                "cwd": "/tmp/vamp",
+                "started_ms": 100,
+                "expires_ms": 9999999999999,
+                "target_tmux_name": "VAMPULSE-orchestrator",
+            }],
+        }
+        with patch(
+            "session_hub.codex_tmux_native_key", return_value="Codex:orchestrator"
+        ):
+            changed = session_hub.resolve_pending_links(metadata, [worker, orchestrator])
+        self.assertTrue(changed)
+        self.assertEqual(metadata["links"]["logical"]["active"], "Codex:orchestrator")
+
+    def test_pending_link_refuses_ambiguous_same_cwd_candidates(self):
+        sessions = [
+            session_hub.Session(
+                "Codex", value, value, "/tmp/vamp", "/tmp/vamp", 300,
+                Path(f"/tmp/{value}.jsonl"),
+            )
+            for value in ("worker", "orchestrator")
+        ]
+        item = {
+            "logical_key": "logical",
+            "target_provider": "Codex",
+            "existing_keys": [],
+            "cwd": "/tmp/vamp",
+            "started_ms": 100,
+            "expires_ms": 9999999999999,
+        }
+        metadata = {"sessions": {}, "links": {}, "pending_links": [item]}
+        self.assertFalse(session_hub.resolve_pending_links(metadata, sessions))
+        self.assertEqual(metadata["pending_links"], [item])
+
+    def test_pending_codex_group_row_uses_its_tmux_rollout(self):
+        worker = session_hub.Session(
+            "Codex", "worker", "worker", "/tmp/vamp", "/tmp/vamp", 300,
+            Path("/tmp/worker.jsonl"),
+        )
+        sibling = session_hub.Session(
+            "Codex", "sibling", "sibling", "/tmp/vamp", "/tmp/vamp", 400,
+            Path("/tmp/sibling.jsonl"),
+        )
+        row = {
+            "name": "VAMP-worker4",
+            "provider": "Codex",
+            "session_key": "Codex:old",
+            "codex_pending_since": 200,
+        }
+        metadata = {"groups": {"/tmp/vamp": {"tmux": True, "rows": [row]}}}
+        with patch("session_hub.codex_tmux_native_key", return_value="Codex:worker"):
+            changed = session_hub.resolve_pending_codex_group_rows(
+                metadata, [worker, sibling]
+            )
+        self.assertTrue(changed)
+        self.assertEqual(row["session_key"], "Codex:worker")
+        self.assertNotIn("codex_pending_since", row)
 
     def test_discover_sessions_collapses_group_members_into_one_row(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -3322,6 +3449,47 @@ class SessionHubTests(unittest.TestCase):
                 self.assertEqual(result["status"], "error")
             finally:
                 window.close()
+
+    def test_launch_group_row_resumes_saved_history_after_restart(self):
+        metadata = {
+            "sessions": {},
+            "settings": {},
+            "groups": {
+                "/tmp/vamp": {
+                    "cwd": "/tmp/vamp",
+                    "tmux": True,
+                    "rows": [{
+                        "name": "VAMP-worker4",
+                        "provider": "Codex",
+                        "override_key": "group:/tmp/vamp#VAMP-worker4",
+                        "session_key": "Codex:old-worker",
+                    }],
+                }
+            },
+        }
+        history = session_hub.Session(
+            "Codex", "old-worker", "worker", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/worker.jsonl"),
+        )
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            with (
+                patch("session_hub.tmux_session_alive", return_value=False),
+                patch("session_hub.codex_sessions", return_value=[history]),
+                patch.object(
+                    window,
+                    "resume_group_row",
+                    return_value={"status": "resumed", "name": "VAMP-worker4"},
+                ) as resume,
+                patch.object(window, "launch") as launch,
+            ):
+                result = window.launch_group_row("/tmp/vamp", "VAMP-worker4")
+            self.assertEqual(result["status"], "resumed")
+            resume.assert_called_once_with("/tmp/vamp", "VAMP-worker4")
+            launch.assert_not_called()
+        finally:
+            window.close()
 
     def test_resume_group_row_uses_tmux_when_group_flagged(self):
         with tempfile.TemporaryDirectory() as temp:

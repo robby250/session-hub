@@ -1762,10 +1762,27 @@ def resolve_pending_links(metadata: dict, sessions: list[Session]) -> bool:
             and session.updated_ms >= int(item.get("started_ms", 0))
             and Path(session.cwd) == Path(item.get("cwd", ""))
         ]
+        tmux_name = item.get("target_tmux_name")
+        if tmux_name and item.get("target_provider") == "Codex":
+            # Provider+cwd+timestamp is not an identity. Session groups
+            # deliberately run several Codex rows in the same cwd, so a
+            # simultaneous worker launch used to get stolen by whichever
+            # pending handoff refreshed first. The running Codex process has
+            # its rollout open; bind to that exact tmux row instead.
+            tmux_key = codex_tmux_native_key(tmux_name)
+            if tmux_key is None:
+                remaining.append(item)
+                continue
+            candidates = [session for session in candidates if session.native_key == tmux_key]
         if not candidates:
             remaining.append(item)
             continue
-        target = max(candidates, key=lambda session: session.updated_ms)
+        # Without an exact tmux identity, ambiguity is a reason to wait, not
+        # permission to attach an unrelated same-directory conversation.
+        if len(candidates) != 1:
+            remaining.append(item)
+            continue
+        target = candidates[0]
         logical_key = item["logical_key"]
         link = metadata.setdefault("links", {}).setdefault(
             logical_key, {"members": [logical_key], "active": logical_key}
@@ -1821,14 +1838,86 @@ def rename_group_row_in(metadata: dict, cwd: str, old: str, new: str) -> dict:
     old_key = row["override_key"]
     new_key = f"group:{cwd}#{new}"
     sessions = metadata.setdefault("sessions", {})
-    bucket = sessions.pop(old_key, None)
-    if bucket is not None:
-        bucket.pop("name", None)   # display name IS the row name now; a stale copy would shadow it
-        if bucket:
-            sessions[new_key] = bucket
+    bucket = sessions.pop(old_key, {})
+    bucket["name"] = new
+    sessions[new_key] = bucket
     row["name"] = new
     row["override_key"] = new_key
+
+    # A group-row link is keyed by the stable override key. Leaving it under
+    # the old key splits the next continuation into a second chain, while
+    # stale native-key names keep surfacing the pre-rename label in pickers
+    # and metadata. Rename the identity and every transcript in that one
+    # logical conversation together.
+    links = metadata.setdefault("links", {})
+    link_key = old_key if old_key in links else None
+    if link_key is None and row.get("session_key"):
+        matching_links = [
+            logical_key
+            for logical_key, link in links.items()
+            if row["session_key"] in link.get("members", [])
+        ]
+        if len(matching_links) == 1:
+            link_key = matching_links[0]
+    if link_key is not None:
+        old_link = links.pop(link_key)
+        if new_key in links:
+            merged = links[new_key]
+            for member in old_link.get("members", []):
+                if member not in merged.setdefault("members", []):
+                    merged["members"].append(member)
+            if old_link.get("active"):
+                merged["active"] = old_link["active"]
+        else:
+            links[new_key] = old_link
+    for pending in metadata.get("pending_links", []):
+        if pending.get("logical_key") == old_key:
+            pending["logical_key"] = new_key
+        if pending.get("target_tmux_name") == old:
+            pending["target_tmux_name"] = new
+
+    sync_group_row_name(metadata, row)
     return {"status": "renamed", "old": old, "name": new}
+
+
+def group_row_native_keys(metadata: dict, row: dict) -> set[str]:
+    """Native transcript keys belonging to one saved group row."""
+    keys = {row.get("session_key", "")}
+    override_key = row.get("override_key")
+    for logical_key, link in metadata.get("links", {}).items():
+        members = set(link.get("members", []))
+        if logical_key == override_key or keys.intersection(members):
+            keys.update(members)
+    return {
+        key for key in keys
+        if key.startswith(("Claude:", "Codex:", "Antigravity:"))
+    }
+
+
+def sync_group_row_name(metadata: dict, row: dict) -> bool:
+    """Make a row rename visible in every metadata identity it owns."""
+    name = row.get("name")
+    override_key = row.get("override_key")
+    if not name or not override_key:
+        return False
+    changed = False
+    sessions = metadata.setdefault("sessions", {})
+    for key in {override_key, *group_row_native_keys(metadata, row)}:
+        bucket = sessions.setdefault(key, {})
+        if bucket.get("name") != name:
+            bucket["name"] = name
+            changed = True
+    return changed
+
+
+def sync_group_row_names(metadata: dict) -> bool:
+    """Upgrade old rename metadata to the row's single current name."""
+    changed = False
+    for group in metadata.get("groups", {}).values():
+        for row in group.get("rows", []):
+            if sync_group_row_name(metadata, row):
+                changed = True
+    return changed
 
 
 def rename_tmux_session(old: str, new: str) -> bool:
@@ -1883,6 +1972,21 @@ def find_group_member_session(
     """
     provider = row.get("provider", "Claude")
     session_key = row.get("session_key")
+    pending_since = row.get("codex_pending_since") if provider == "Codex" else None
+    if pending_since:
+        candidates = [
+            session
+            for session in sessions
+            if session.provider == "Codex"
+            and session.cwd == cwd
+            and session.updated_ms >= pending_since
+            and session.native_key not in exclude_keys
+        ]
+        # A pending launch explicitly asks for a NEW transcript. It must win
+        # over the row's historical session_key; otherwise the old file is
+        # found on disk first forever and the new conversation can never be
+        # adopted. More than one candidate is ambiguous, not "pick newest".
+        return candidates[0] if len(candidates) == 1 else None
     if session_key:
         match = next(
             (
@@ -1911,22 +2015,32 @@ def find_group_member_session(
             ),
             None,
         )
-    if provider == "Codex":
-        pending_since = row.get("codex_pending_since")
-        if not pending_since:
-            return None
-        candidates = [
-            session
-            for session in sessions
-            if session.provider == "Codex"
-            and session.cwd == cwd
-            and session.updated_ms >= pending_since
-            and session.native_key not in exclude_keys
-        ]
-        if not candidates:
-            return None
-        return max(candidates, key=lambda session: session.updated_ms)
     return None
+
+
+def resolve_pending_codex_group_rows(metadata: dict, sessions: list[Session]) -> bool:
+    """Bind newly launched Codex group rows to their exact tmux transcript.
+
+    Codex has no --name flag, but its process keeps the rollout JSONL open.
+    The tmux row therefore provides a stronger identity than cwd/mtime and
+    disambiguates simultaneous Codex workers sharing one project directory.
+    """
+    by_key = {session.native_key: session for session in sessions}
+    changed = False
+    for group in metadata.get("groups", {}).values():
+        if not group.get("tmux"):
+            continue
+        for row in group.get("rows", []):
+            if row.get("provider") != "Codex" or not row.get("codex_pending_since"):
+                continue
+            native_key = codex_tmux_native_key(row["name"])
+            match = by_key.get(native_key)
+            if match is None or match.updated_ms < int(row["codex_pending_since"]):
+                continue
+            row["session_key"] = native_key
+            row.pop("codex_pending_since", None)
+            changed = True
+    return changed
 
 
 def discover_sessions(metadata: dict) -> list[Session]:
@@ -1938,7 +2052,11 @@ def discover_sessions(metadata: dict) -> list[Session]:
         sessions += claude_sessions()
     if settings.get("enable_antigravity", True):
         sessions += antigravity_sessions()
-    changed = resolve_pending_links(metadata, sessions)
+    changed = sync_group_row_names(metadata)
+    if resolve_pending_codex_group_rows(metadata, sessions):
+        changed = True
+    if resolve_pending_links(metadata, sessions):
+        changed = True
     adopt_untracked_sessions(sessions)
     if resolve_clear_continuations(metadata, sessions):
         changed = True
@@ -1995,6 +2113,8 @@ def discover_sessions(metadata: dict) -> list[Session]:
                 max_updated = max(max_updated, match.updated_ms)
                 if row.get("session_key") != match.native_key:
                     row["session_key"] = match.native_key
+                    groups_changed = True
+                if row.pop("codex_pending_since", None) is not None:
                     groups_changed = True
         display_name = group.get("display_name") or Path(cwd).name or cwd
         # The pseudo-session's own provider is cosmetic only (Agent-column
@@ -2328,6 +2448,72 @@ def tmux_session_alive(name: str) -> bool:
         stderr=subprocess.DEVNULL,
     )
     return result.returncode == 0
+
+
+def codex_tmux_native_key(
+    name: str,
+    *,
+    proc_root: Path | None = None,
+    sessions_root: Path | None = None,
+) -> str | None:
+    """Return the exact Codex transcript key open in tmux session `name`.
+
+    The rollout file descriptor is authoritative for both a fresh `codex`
+    process (whose argv has no session id) and `codex resume`. Descendant
+    traversal also covers tmux panes that launch through a shell wrapper.
+    """
+    tmux = shutil.which("tmux")
+    if not tmux:
+        return None
+    try:
+        panes = subprocess.run(
+            [tmux, "list-panes", "-t", name, "-F", "#{pane_pid}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if panes.returncode != 0:
+        return None
+
+    proc_root = proc_root or PROC_ROOT
+    sessions_root = (sessions_root or CODEX_SESSIONS).resolve()
+    pending = []
+    for value in panes.stdout.split():
+        try:
+            pending.append(int(value))
+        except ValueError:
+            continue
+    seen: set[int] = set()
+    session_id_re = re.compile(
+        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$"
+    )
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        children = proc_root / str(pid) / "task" / str(pid) / "children"
+        try:
+            pending.extend(int(value) for value in children.read_text().split())
+        except (OSError, ValueError):
+            pass
+        fd_dir = proc_root / str(pid) / "fd"
+        try:
+            descriptors = list(fd_dir.iterdir())
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                target = descriptor.resolve(strict=True)
+                target.relative_to(sessions_root)
+            except (OSError, ValueError):
+                continue
+            match = session_id_re.search(target.name)
+            if match:
+                return f"Codex:{match.group(1)}"
+    return None
 
 
 def stop_tmux_session(name: str) -> None:
@@ -6816,6 +7002,11 @@ class SessionHub(QMainWindow):
                     # finds it via effective_model/effective_codex_reasoning_effort.
                     "model": model,
                     "reasoning_effort": reasoning_effort,
+                    # In a tmux group this is the launch identity. The Codex
+                    # process under that row exposes its exact rollout via an
+                    # open fd, so resolve_pending_links never has to guess
+                    # among sibling Codex sessions sharing the same cwd.
+                    "target_tmux_name": tmux_name if use_tmux else None,
                 }
             )
             self.launch(
@@ -6981,6 +7172,27 @@ class SessionHub(QMainWindow):
         if not row:
             return {"status": "error", "message": f"No row named {name!r} in this group"}
         provider = row.get("provider", "Claude")
+        use_tmux = self.effective_tmux(group.get("tmux"))
+        if use_tmux and tmux_session_alive(row["name"]):
+            return {"status": "already_running", "name": name}
+
+        # A pending marker only describes the process that was just launched.
+        # If its tmux row is gone, it is stale and must not mask the row's
+        # saved history or cause another orphan transcript on this click.
+        if provider == "Codex" and row.pop("codex_pending_since", None) is not None:
+            write_metadata(self.metadata)
+
+        # A saved row is a persistent conversation. Reopening it after a
+        # reboot must resume its history; launch_new_rows_into_group is the
+        # separate path that intentionally creates a fresh transcript.
+        candidates = {
+            "Claude": claude_sessions,
+            "Codex": codex_sessions,
+            "Antigravity": antigravity_sessions,
+        }.get(provider, lambda: [])()
+        history = find_group_member_session(row, cwd, candidates)
+        if history is not None:
+            return self.resume_group_row(cwd, name)
         # No session_is_tracked_alive gate here: that "Running" read is only
         # ever as good as PID tracking (untrustworthy for anything not
         # launched directly through Session Hub - a tmux group member's own
@@ -6995,11 +7207,9 @@ class SessionHub(QMainWindow):
             else None
         )
         if provider == "Codex":
-            # Every launch here starts a fresh (non-resume) process - see
-            # find_group_member_session's third branch - so this needs
-            # re-arming on every launch, not just the first, or a stale
-            # timestamp could let the guess latch onto an old dead session
-            # instead of the one just started.
+            # Only a row with no history reaches here. Mark this one fresh
+            # process until its exact tmux rollout is discovered.
+            row.pop("session_key", None)
             row["codex_pending_since"] = int(time.time() * 1000)
             write_metadata(self.metadata)
         self.launch(
@@ -7014,7 +7224,7 @@ class SessionHub(QMainWindow):
             flag_overrides={"--name": row["name"]},
             strip_env=strip_env,
             wait_for_tracking=wait_for_tracking,
-            use_tmux=self.effective_tmux(group.get("tmux")),
+            use_tmux=use_tmux,
         )
         return {"status": "launched", "name": name}
 
