@@ -242,7 +242,10 @@ def codex_combo_value(combo: QComboBox) -> str | None:
 # Shared session-table column set: SessionHub's main listview and
 # ManageGroupDialog both render from this (see SessionHub.populate_session_table)
 # so their common columns are defined once, in one order.
-SESSION_TABLE_COLUMNS = ("Agent", "Model", "Name", "Working directory", "Last updated", "Session ID")
+SESSION_TABLE_COLUMNS = (
+    "Agent", "Model", "Name", "Status", "Last message", "Working directory",
+    "Last updated", "Session ID",
+)
 # Catalog of well-known agent environment variables. Each spec drives the
 # value editor (a slider, spin box, dropdown, or text field, per "kind") and
 # the description shown when the row is selected. The editor still accepts any
@@ -2188,28 +2191,6 @@ def window_titled(title: str) -> bool:
     return any(title in window_title for _, window_title in _terminal_windows())
 
 
-def active_window_title() -> str | None:
-    """The title of whichever window currently has OS focus, or None if it
-    can't be determined (xdotool missing, no X session, etc.) - used to
-    clear a row's "Done" status back to "Idle" the moment the user actually
-    looks at its terminal, without needing Session Hub to have opened it
-    itself (reveal_running_row covers that half; this covers a plain
-    alt-tab). Same xdotool primitive proven live against real window-focus
-    changes during the tmux focus-events diagnosis this feature grew out of.
-    """
-    xdotool = shutil.which("xdotool")
-    if not xdotool:
-        return None
-    try:
-        result = subprocess.run(
-            [xdotool, "getactivewindow", "getwindowname"],
-            capture_output=True, text=True, timeout=1,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return result.stdout.strip() if result.returncode == 0 else None
-
-
 def focus_window_by_title(title: str, timeout: float = 3.0) -> None:
     """Raise and focus the terminal window we just launched.
 
@@ -2442,11 +2423,20 @@ def tmux_session_alive(name: str) -> bool:
     tmux = shutil.which("tmux")
     if not tmux:
         return False
-    result = subprocess.run(
-        [tmux, "has-session", "-t", name],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        result = subprocess.run(
+            [tmux, "has-session", "-t", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except subprocess.TimeoutExpired:
+        # session_activity now calls this from every live-row status lookup
+        # (GUI/TUI/JSON alike), not just the Running tab - a wedged tmux
+        # server must not be able to hang status refresh itself, so this
+        # fails closed to "not alive" the same way a malformed transcript
+        # line fails closed to "unknown" rather than raising.
+        return False
     return result.returncode == 0
 
 
@@ -2611,6 +2601,128 @@ def hook_event_to_status_codex(payload: dict) -> tuple[str, str] | None:
     if payload.get("type") != "agent-turn-complete":
         return None
     return "done", str(payload.get("last-assistant-message", ""))
+
+
+_CODEX_TURN_EVENTS = ("task_started", "task_complete", "turn_aborted")
+_CODEX_TAIL_BYTES = 65536  # a turn's own tool-output lines can be arbitrarily
+# large (a single custom_tool_call has been observed over 1MB), but the
+# task_started/task_complete/turn_aborted markers this reads for are tiny and
+# always the most recent thing worth finding - a bounded tail read costs the
+# same whether the rollout file is 10KB or the 1.5GB real ones on this
+# machine reach, unlike scanning from the start (see session_activity).
+
+
+def _codex_tail_turn_state(path: Path) -> tuple[str, float] | None:
+    """The most recent task_started/task_complete/turn_aborted event_msg
+    record in the last _CODEX_TAIL_BYTES of a Codex rollout file, as
+    (kind, epoch_seconds), or None if the tail window contains none of the
+    three. "task_started" with nothing newer after it is durable evidence of
+    an in-progress turn; "task_complete"/"turn_aborted" is durable evidence
+    the last turn already ended - see hook_event_to_status_codex's own
+    docstring for why Codex's `notify` alone can't tell the difference.
+    """
+    try:
+        size = path.stat().st_size
+        offset = max(0, size - _CODEX_TAIL_BYTES)
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            chunk = handle.read()
+    except OSError:
+        return None
+    lines = chunk.split(b"\n")
+    if offset > 0:
+        lines = lines[1:]  # seeked mid-file: first line may be truncated
+    latest: tuple[str, float] | None = None
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get("type") != "event_msg":
+            continue
+        kind = (record.get("payload") or {}).get("type")
+        if kind not in _CODEX_TURN_EVENTS:
+            continue
+        try:
+            epoch = datetime.fromisoformat(
+                str(record.get("timestamp")).replace("Z", "+00:00")
+            ).timestamp()
+        except (ValueError, AttributeError):
+            continue
+        if latest is None or epoch >= latest[1]:
+            latest = (kind, epoch)
+    return latest
+
+
+def _codex_activity(session: "Session", status: dict | None) -> tuple[str, str]:
+    """Codex activity verdict: `notify` only ever proves turn completion
+    (hook_event_to_status_codex), so "working" has to come from the rollout
+    transcript itself rather than from mere process existence - a completed
+    turn with no evidence of a newer one becomes "done", never blank.
+    """
+    turn = _codex_tail_turn_state(session.path)
+    if turn and turn[0] == "task_started" and turn[1] >= (status or {}).get("ts", 0):
+        return "working", ""
+    if status:
+        return status.get("state", "unknown"), status.get("detail", "")
+    if turn:
+        # A turn already finished in the transcript before session-hub's own
+        # notify hook ever wrote a status file for it (hook installed after
+        # the turn started, or a write that raced/lost) - still don't blank it.
+        return "done", ""
+    return "unknown", ""
+
+
+def session_activity(
+    session: "Session", *, tmux_enabled: bool = False, tmux_name: str | None = None
+) -> tuple[str, str]:
+    """(state, detail) activity verdict for `session`: one of
+    working/needs_input/done/idle/unknown. The one function every
+    presentation layer - the GUI's Running tab and All Sessions table, the
+    TUI's equivalents (via --sessions-json, which calls this), the
+    recent-activity strip, and --sessions-json/CLI directly - computes a
+    session's CURRENT activity through, so no provider branch can diverge or
+    silently return blank (see status_pipeline_plan.md's contract).
+
+    Liveness is a separate fact from activity (also per that contract) and is
+    checked here only to keep transcript parsing bounded to rows that are
+    actually running: `session_is_tracked_alive` is Claude's own best-effort
+    PID tracking, and a tmux-launched row never gets PID-tracked at launch
+    (see tmux_group_launch_command) - a caller that already knows this
+    session's tmux identity (group_row_status/standalone_tmux_status) passes
+    it so a live tmux-launched Codex/Claude/Antigravity session isn't
+    wrongly treated as dead. With neither signal, a session reads as not
+    live and this returns "unknown" without touching its transcript at all -
+    stale status files and stopped processes must not show as live activity.
+    """
+    if session.session_id.startswith("group:"):
+        return "unknown", ""
+    live = session_is_tracked_alive(session) or (
+        tmux_enabled and tmux_name is not None and tmux_session_alive(tmux_name)
+    )
+    if not live:
+        return "unknown", ""
+    status = read_session_status(session.session_id)
+    if session.provider == "Codex":
+        return _codex_activity(session, status)
+    if not status:
+        return "unknown", ""
+    return status.get("state", "unknown"), status.get("detail", "")
+
+
+ACTIVITY_LABELS = {
+    "working": ("Working", "#5aa9ff"),
+    "needs_input": ("Needs input", "#d9534f"),
+    "done": ("Done", "#d69e2e"),
+    "idle": ("Idle", "#888888"),
+}
+
+
+def activity_label(state: str | None) -> tuple[str, str]:
+    """(label, color) for one activity state - see ACTIVITY_LABELS. Shared by
+    every presentation layer so "Working"/"Needs input"/etc. render with one
+    spelling and color everywhere, not a per-widget copy that can drift."""
+    return ACTIVITY_LABELS.get(state, ("", "#888888"))
 
 
 def hook_notify_cli() -> int:
@@ -4183,7 +4295,11 @@ class ManageGroupDialog(QDialog):
     SHARED_COLUMNS = tuple(
         column
         for column in SESSION_TABLE_COLUMNS
-        if column not in ("Working directory", "Session ID")
+        # This dialog keeps its own launch-liveness STATUS_COLUMN
+        # (Running/Stopped, via group_row_status) - the main listview's
+        # Status/Last message columns are a different fact (activity, not
+        # liveness - see session_activity) and would collide with it here.
+        if column not in ("Working directory", "Session ID", "Status", "Last message")
     )
     TRANSCRIPTS_COLUMN = len(SHARED_COLUMNS)
     STATUS_COLUMN = len(SHARED_COLUMNS) + 1
@@ -5202,7 +5318,10 @@ class SessionHub(QMainWindow):
         configure_resizable_columns(
             self.table,
             SessionHub.SESSION_TABLE_COLUMNS,
-            {"Agent": 90, "Model": 90, "Name": 220, "Working directory": 320, "Last updated": 140},
+            {
+                "Agent": 90, "Model": 90, "Name": 220, "Status": 90,
+                "Last message": 260, "Working directory": 320, "Last updated": 140,
+            },
             stretch_column="Session ID",
         )
         restore_column_widths(self.table, self.settings().get("main_table_columns"))
@@ -5761,9 +5880,25 @@ class SessionHub(QMainWindow):
         out separately.
         """
         colors = {"Codex": "#5aa9ff", "Claude": "#d977ff", "Antigravity": "#42d6c5"}
+        # Only computed when a caller's own column set actually asks for it
+        # (ManageGroupDialog's SHARED_COLUMNS deliberately doesn't - see its
+        # own STATUS_COLUMN) - session_activity's transcript read is bounded
+        # per call, but there is no reason to pay it at all for a table that
+        # never shows the result.
+        needs_activity = "Status" in columns or "Last message" in columns
+        settings = self.metadata.get("settings", {}) if needs_activity else {}
+        session_overrides = self.metadata.get("sessions", {}) or {} if needs_activity else {}
         table.setSortingEnabled(False)
         table.setRowCount(len(sessions))
         for row, session in enumerate(sessions):
+            activity = ("unknown", "")
+            if needs_activity and not self.is_group_session(session):
+                tmux_enabled, tmux_name, _ = standalone_tmux_status(
+                    session, session_overrides.get(session.key, {}), settings
+                )
+                activity = session_activity(
+                    session, tmux_enabled=tmux_enabled, tmux_name=tmux_name
+                )
             for col, column in enumerate(columns):
                 if column == "Agent":
                     # A collapsed group's own summary row spans every member's
@@ -5783,6 +5918,15 @@ class SessionHub(QMainWindow):
                     )
                 elif column == "Name":
                     item = QTableWidgetItem(session.title)
+                elif column == "Status":
+                    label, color = activity_label(activity[0])
+                    item = QTableWidgetItem(label)
+                    item.setForeground(QColor(color))
+                elif column == "Last message":
+                    detail = " ".join(activity[1].split())
+                    item = QTableWidgetItem(detail if len(detail) <= 80 else detail[:79] + "…")
+                    if detail:
+                        item.setToolTip(detail)
                 elif column == "Working directory":
                     item = QTableWidgetItem(session.cwd)
                 elif column == "Last updated":
@@ -5826,7 +5970,7 @@ class SessionHub(QMainWindow):
         if settings.get("enable_antigravity", True):
             live += antigravity_sessions()
 
-        running: list[tuple[str, str, dict, str | None]] = []
+        running: list[tuple[str, str, dict, Session | None]] = []
         claimed: set[str] = set()
         for cwd, group in self.metadata.get("groups", {}).items():
             tmux_enabled = self.effective_tmux(group.get("tmux"))
@@ -5838,7 +5982,7 @@ class SessionHub(QMainWindow):
                 if match:
                     claimed.add(match.native_key)
                 if group_row_status(row, match, tmux_enabled) == "Running":
-                    running.append((display_name, cwd, row, match.session_id if match else None))
+                    running.append((display_name, cwd, row, match))
 
         session_overrides = self.metadata.get("sessions", {}) or {}
         for session in self.sessions:
@@ -5850,12 +5994,12 @@ class SessionHub(QMainWindow):
             if tmux_enabled and status == "Running":
                 running.append((
                     session.title, session.cwd,
-                    {"name": name, "provider": session.provider}, session.session_id,
+                    {"name": name, "provider": session.provider}, session,
                 ))
 
-        active_title = active_window_title()
         self.running_table.setRowCount(len(running))
-        for index, (display_name, cwd, row, session_id) in enumerate(running):
+        for index, (display_name, cwd, row, match) in enumerate(running):
+            session_id = match.session_id if match else None
             project_item = QTableWidgetItem(display_name)
             project_item.setData(Qt.ItemDataRole.UserRole, (cwd, row["name"], session_id))
             self.running_table.setItem(index, 0, project_item)
@@ -5863,34 +6007,34 @@ class SessionHub(QMainWindow):
             self.running_table.setItem(
                 index, 2, QTableWidgetItem(row.get("provider", "Claude"))
             )
-            status = read_session_status(session_id) if session_id else None
-            if status and status.get("state") == "done" and active_title and row["name"] in active_title:
-                write_session_status(session_id, "idle", status.get("detail", ""))
-                status["state"] = "idle"
-            self.running_table.setItem(index, 3, self._status_column_item(status))
-            self.running_table.setItem(index, 4, self._detail_column_item(status))
+            # Every row here is already confirmed tmux-alive (group_row_status/
+            # standalone_tmux_status above), so session_activity's own liveness
+            # check always passes - it still goes through the one shared verdict
+            # function rather than reading status files directly (see its
+            # docstring), so this can never diverge from the All Sessions/TUI/
+            # JSON verdicts for the same session. Read-only: refresh must never
+            # write status itself (status_pipeline_plan.md's contract) - the
+            # only writer is the hook pipeline (write_session_status).
+            state, detail = (
+                session_activity(match, tmux_enabled=True, tmux_name=row["name"])
+                if match else ("unknown", "")
+            )
+            self.running_table.setItem(index, 3, self._status_column_item(state))
+            self.running_table.setItem(index, 4, self._detail_column_item(detail))
         names_by_id = {
-            session_id: row["name"] for _dn, _cwd, row, session_id in running if session_id
+            match.session_id: row["name"] for _dn, _cwd, row, match in running if match
         }
         self._refresh_activity_list(names_by_id)
 
-    _STATUS_LABELS = {
-        "working": ("Working", "#5aa9ff"),
-        "needs_input": ("Needs input", "#d9534f"),
-        "done": ("Done", "#d69e2e"),
-        "idle": ("Idle", "#888888"),
-    }
-
-    def _status_column_item(self, status: dict | None) -> QTableWidgetItem:
-        state = (status or {}).get("state")
-        label, color = self._STATUS_LABELS.get(state, ("", "#888888"))
+    def _status_column_item(self, state: str) -> QTableWidgetItem:
+        label, color = activity_label(state)
         item = QTableWidgetItem(label)
         item.setForeground(QColor(color))
         return item
 
     @staticmethod
-    def _detail_column_item(status: dict | None) -> QTableWidgetItem:
-        detail = " ".join((status or {}).get("detail", "").split())
+    def _detail_column_item(detail: str) -> QTableWidgetItem:
+        detail = " ".join(detail.split())
         snippet = detail if len(detail) <= 80 else detail[:79] + "…"
         item = QTableWidgetItem(snippet)
         if detail:
@@ -5900,7 +6044,7 @@ class SessionHub(QMainWindow):
     def _refresh_activity_list(self, names_by_id: dict[str, str]) -> None:
         self.activity_list.clear()
         for session_id, status in all_session_statuses()[:20]:
-            label, color = self._STATUS_LABELS.get(status.get("state"), ("", "#888888"))
+            label, color = activity_label(status.get("state"))
             if not label:
                 continue
             when = datetime.fromtimestamp(status.get("ts", 0)).strftime("%H:%M:%S")
@@ -7629,11 +7773,19 @@ def sessions_json_cli() -> int:
             match = find_group_member_session(row, cwd, live, frozenset(claimed))
             if match:
                 claimed.add(match.native_key)
+            activity_state, activity_detail = (
+                session_activity(match, tmux_enabled=tmux_enabled, tmux_name=row["name"])
+                if match else ("unknown", "")
+            )
             rows_out.append(
                 {
                     "name": row["name"],
                     "provider": row.get("provider", "Claude"),
+                    # Liveness (process/tmux) - separate fact from activity below.
                     "status": group_row_status(row, match, tmux_enabled),
+                    "activity": activity_state,
+                    "activity_label": activity_label(activity_state)[0],
+                    "activity_detail": activity_detail,
                 }
             )
         groups[cwd] = {
@@ -7651,6 +7803,9 @@ def sessions_json_cli() -> int:
             if is_group
             else standalone_tmux_status(item, session_overrides.get(item.key, {}), settings)
         )
+        activity_state, activity_detail = session_activity(
+            item, tmux_enabled=tmux_enabled, tmux_name=tmux_name
+        )
         return {
             "provider": item.provider,
             "key": item.key,
@@ -7661,7 +7816,11 @@ def sessions_json_cli() -> int:
             "updated_ms": item.updated_ms,
             "tmux": tmux_enabled,
             "tmux_name": tmux_name,
+            # Liveness (process/tmux) - separate fact from activity below.
             "status": status,
+            "activity": activity_state,
+            "activity_label": activity_label(activity_state)[0],
+            "activity_detail": activity_detail,
         }
 
     print(

@@ -4,6 +4,7 @@ import os
 import json
 import subprocess
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -4736,6 +4737,221 @@ class SessionHubTests(unittest.TestCase):
                 window.close()
                 saved = json.loads(metadata_path.read_text(encoding="utf-8"))
                 self.assertIn("logical", saved["links"])
+
+
+def _iso(epoch: float) -> str:
+    """Codex rollout timestamp format for a given epoch: '...Z', UTC."""
+    from datetime import timezone
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class SessionActivityTests(unittest.TestCase):
+    """status_pipeline_plan.md's contract: one provider-neutral activity
+    verdict (session_activity), with liveness and activity kept as separate
+    facts and no provider branch allowed to diverge or return blank."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.temp = Path(temp_dir.name)
+        for name, value in (
+            ("STATUS_DIR", self.temp / "status"),
+            ("PID_DIR", self.temp / "pids"),
+            ("METADATA_PATH", self.temp / "metadata.json"),
+        ):
+            patcher = patch.object(session_hub, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _rollout(self, records: list[dict]) -> Path:
+        path = self.temp / f"rollout_{len(list(self.temp.glob('rollout_*.jsonl')))}.jsonl"
+        path.write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
+        )
+        return path
+
+    def _event(self, epoch: float, kind: str) -> dict:
+        return {"timestamp": _iso(epoch), "type": "event_msg", "payload": {"type": kind}}
+
+    # --- live + active turn => Working -------------------------------
+    def test_codex_working_when_task_started_is_the_latest_turn_event(self):
+        path = self._rollout([self._event(time.time(), "task_started")])
+        session = session_hub.Session("Codex", "id-work", "t", "/tmp", "/tmp", 0, path)
+        with patch.object(session_hub, "tmux_session_alive", return_value=True):
+            state, _ = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "working")
+
+    def test_claude_working_from_hook_evidence_when_live(self):
+        session_id = "id-claude-work"
+        session_hub.write_session_status(session_id, "working", "")
+        session = session_hub.Session(
+            "Claude", session_id, "t", "/tmp", "/tmp", 0, Path("/tmp/x.jsonl")
+        )
+        with patch.object(session_hub, "session_is_tracked_alive", return_value=True):
+            state, _ = session_hub.session_activity(session)
+        self.assertEqual(state, "working")
+
+    # --- live + completed turn => Done/Idle, never blank --------------
+    def test_codex_done_when_task_complete_is_the_latest_turn_event(self):
+        path = self._rollout([
+            self._event(time.time() - 5, "task_started"),
+            self._event(time.time(), "task_complete"),
+        ])
+        session_id = "id-done"
+        session_hub.write_session_status(session_id, "done", "finished")
+        session = session_hub.Session("Codex", session_id, "t", "/tmp", "/tmp", 0, path)
+        with patch.object(session_hub, "tmux_session_alive", return_value=True):
+            state, detail = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "done")
+        self.assertEqual(detail, "finished")
+        self.assertNotEqual(state, "")
+
+    def test_codex_done_from_transcript_alone_when_notify_hook_never_wrote(self):
+        # A turn already finished in the transcript before session-hub's own
+        # notify hook ever wrote a status file for it - must still read as
+        # "done", never blank (the exact reported bug: a live Codex row with
+        # no status file showed nothing at all).
+        path = self._rollout([self._event(time.time(), "task_complete")])
+        session = session_hub.Session("Codex", "id-no-hook", "t", "/tmp", "/tmp", 0, path)
+        with patch.object(session_hub, "tmux_session_alive", return_value=True):
+            state, _ = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "done")
+
+    # --- needs-input where the provider exposes it ---------------------
+    def test_claude_needs_input_from_notification_hook_payload(self):
+        mapped = session_hub.hook_event_to_status({
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt",
+            "message": "approve?",
+        })
+        self.assertEqual(mapped, ("needs_input", "approve?"))
+
+    def test_codex_notify_never_produces_needs_input(self):
+        # Documented, deliberate limitation (hook_event_to_status_codex):
+        # Codex approval prompts are a separate, non-hookable mechanism.
+        mapped = session_hub.hook_event_to_status_codex({
+            "type": "approval-request", "last-assistant-message": "approve?",
+        })
+        self.assertIsNone(mapped)
+
+    # --- stopped process with fresh-looking status => no live badge ----
+    def test_claude_fresh_status_without_liveness_signal_reads_unknown(self):
+        session_id = "id-stale"
+        session_hub.write_session_status(session_id, "working", "")
+        session = session_hub.Session(
+            "Claude", session_id, "t", "/tmp", "/tmp", 0, Path("/tmp/x.jsonl")
+        )
+        # No PID tracking file and no tmux identity passed - the app has no
+        # liveness signal for this session at all, so it must not surface
+        # the fresh-looking "working" status file as live activity.
+        state, _ = session_hub.session_activity(session)
+        self.assertEqual(state, "unknown")
+
+    def test_codex_stopped_tmux_reads_unknown_even_with_fresh_status(self):
+        session_id = "id-stopped-tmux"
+        session_hub.write_session_status(session_id, "working", "")
+        path = self._rollout([self._event(time.time(), "task_started")])
+        session = session_hub.Session("Codex", session_id, "t", "/tmp", "/tmp", 0, path)
+        with patch.object(session_hub, "tmux_session_alive", return_value=False):
+            state, _ = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "unknown")
+
+    # --- stale status older than a new turn => new turn wins -----------
+    def test_codex_new_task_started_after_stale_done_status_wins(self):
+        session_id = "id-restart"
+        session_hub.write_session_status(session_id, "done", "old turn")
+        path = self._rollout([self._event(time.time() + 5, "task_started")])
+        session = session_hub.Session("Codex", session_id, "t", "/tmp", "/tmp", 0, path)
+        with patch.object(session_hub, "tmux_session_alive", return_value=True):
+            state, detail = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "working")
+
+    # --- two same-cwd sessions => exact ids, no cross-talk --------------
+    def test_two_same_cwd_sessions_get_independent_activity_states(self):
+        session_hub.write_session_status("id-a", "working", "")
+        session_hub.write_session_status("id-b", "needs_input", "pick one")
+        a = session_hub.Session("Claude", "id-a", "a", "/tmp/vamp", "/tmp/vamp", 100, Path("/tmp/a.jsonl"))
+        b = session_hub.Session("Claude", "id-b", "b", "/tmp/vamp", "/tmp/vamp", 200, Path("/tmp/b.jsonl"))
+        with patch.object(session_hub, "session_is_tracked_alive", return_value=True):
+            state_a, _ = session_hub.session_activity(a)
+            state_b, _ = session_hub.session_activity(b)
+        self.assertEqual(state_a, "working")
+        self.assertEqual(state_b, "needs_input")
+
+    # --- malformed/partial last transcript line => bounded fallback -----
+    def test_codex_tail_survives_malformed_trailing_bytes(self):
+        ok = json.dumps(self._event(time.time() - 10, "thread_settings_applied"))
+        started = json.dumps(self._event(time.time(), "task_started"))
+        path = self.temp / "malformed.jsonl"
+        path.write_bytes(
+            (ok + "\n" + started + "\n").encode("utf-8")
+            + b'{"timestamp": "2026-08-29T00:00:0'  # truncated trailing record
+        )
+        session = session_hub.Session("Codex", "id-malformed", "t", "/tmp", "/tmp", 0, path)
+        with patch.object(session_hub, "tmux_session_alive", return_value=True):
+            state, _ = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "working")
+
+    def test_codex_tail_on_missing_file_reads_unknown_not_a_crash(self):
+        session = session_hub.Session(
+            "Codex", "id-missing", "t", "/tmp", "/tmp", 0, Path("/tmp/does-not-exist.jsonl")
+        )
+        with patch.object(session_hub, "tmux_session_alive", return_value=True):
+            state, _ = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "unknown")
+
+    # --- group session ids never surface a real activity state ----------
+    def test_group_pseudo_session_activity_is_always_unknown(self):
+        # No hook ever writes a status file keyed by a "group:..." pseudo id
+        # (real hooks only ever see a provider's own native session/thread
+        # id) - session_activity must short-circuit before even trying.
+        session_id = "group:/tmp/vamp"
+        session = session_hub.Session(
+            "Claude", session_id, "g", "/tmp/vamp", "/tmp/vamp", 0, Path("/tmp/vamp")
+        )
+        with patch.object(session_hub, "session_is_tracked_alive", return_value=True):
+            state, _ = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "unknown")
+
+    # --- GUI, TUI (via JSON) and --sessions-json/CLI agree exactly ------
+    def test_gui_running_tab_and_sessions_json_report_the_same_label(self):
+        session = session_hub.Session(
+            "Claude", "id-shared", "shared", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/shared.jsonl"),
+        )
+        session_hub.write_session_status("id-shared", "needs_input", "approve the plan?")
+        row = {"name": "VAMP-shared", "provider": "Claude", "session_key": "Claude:id-shared"}
+        session_hub.METADATA_PATH.write_text(
+            json.dumps({
+                "settings": {},
+                "sessions": {},
+                "groups": {"/tmp/vamp": {"tmux": True, "rows": [row]}},
+            }),
+            encoding="utf-8",
+        )
+        with (
+            patch.object(session_hub, "claude_sessions", return_value=[session]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub, "tmux_session_alive", return_value=True),
+        ):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                session_hub.sessions_json_cli()
+            payload = json.loads(out.getvalue())
+            json_label = payload["groups"]["/tmp/vamp"]["rows"][0]["activity_label"]
+
+            with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+                window = session_hub.SessionHub()
+                window.refresh_running_tab()
+                gui_label = window.running_table.item(0, 3).text()
+                window.close()
+
+        self.assertEqual(json_label, "Needs input")
+        self.assertEqual(gui_label, "Needs input")
 
 
 if __name__ == "__main__":
