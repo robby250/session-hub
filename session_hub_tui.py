@@ -221,13 +221,15 @@ class MainPane(Vertical):
             self.filtered = list(sessions)
         table = self.query_one("#main", DataTable)
         table.clear(columns=True)
-        table.add_columns("Provider", "Name", "Status", "Working directory", "Session ID")
+        table.add_columns("Provider", "Name", "Status", "Last message", "Working directory", "Session ID")
         table.cursor_type = "row"
         for session in self.filtered:
+            detail = " ".join(str(session.get("activity_detail", "")).split())
             table.add_row(
                 "Group" if session["is_group"] else session["provider"],
                 session["title"],
                 session.get("activity_label", ""),
+                detail if len(detail) <= 60 else detail[:59] + "…",
                 session["cwd"],
                 session["session_id"],
             )
@@ -307,6 +309,7 @@ class RunningPane(Vertical):
             {
                 "kind": "group", "cwd": cwd, "name": row["name"], "provider": row["provider"],
                 "display": group["display_name"], "status_label": row.get("activity_label", ""),
+                "detail": row.get("activity_detail", ""),
             }
             for cwd, group in data.get("groups", {}).items()
             for row in group["rows"]
@@ -315,16 +318,21 @@ class RunningPane(Vertical):
             {
                 "kind": "standalone", "key": s["key"], "name": s["tmux_name"], "provider": s["provider"],
                 "display": s["title"], "status_label": s.get("activity_label", ""),
+                "detail": s.get("activity_detail", ""),
             }
             for s in data.get("sessions", [])
             if not s["is_group"] and s["status"] == "Running"
         ]
         table = self.query_one("#running", DataTable)
         table.clear(columns=True)
-        table.add_columns("Project", "Name", "Provider", "Status")
+        table.add_columns("Project", "Name", "Provider", "Status", "Last message")
         table.cursor_type = "row"
         for row in self.rows:
-            table.add_row(row["display"], row["name"], row["provider"], row["status_label"])
+            detail = " ".join(str(row["detail"]).split())
+            table.add_row(
+                row["display"], row["name"], row["provider"], row["status_label"],
+                detail if len(detail) <= 60 else detail[:59] + "…",
+            )
 
     def selected(self) -> dict | None:
         table = self.query_one("#running", DataTable)

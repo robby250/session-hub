@@ -34,9 +34,16 @@ tmux sessions. Work only in this worktree/branch and commit the result.
 4. Identity join: exact provider + session/thread id wins. Cwd/title/name are fallback hints only.
    Two processes or transcripts sharing one cwd must not populate one row twice or steal status.
    Stale status files and stopped processes cannot appear as live activity.
-5. Presentation: GUI Running and All Sessions, TUI Running and All Sessions, `sessions_json()`/CLI,
-   and the recent-activity strip must call the same verdict function. No provider-specific UI branch
-   may silently omit the Status/Last-message fields.
+5. Presentation: GUI Running and All Sessions, TUI Running and All Sessions, and `sessions_json()`/
+   CLI must call the same CURRENT-activity verdict function. No provider-specific UI branch may
+   silently omit the Status/Last-message fields.
+
+   The recent-activity strip is explicitly NOT one of these callers. It is a history log of past
+   `write_session_status` events, each already carrying its own recorded (state, detail, timestamp)
+   - rerunning the current verdict for every historical row would silently replace "what happened,
+   and when" with today's live state on each refresh. It shares only the verdict function's label/
+   color vocabulary so the two surfaces render identically (task-2114 rework, corrected from an
+   earlier draft of this item that wrongly folded the strip into the same requirement).
 6. Refresh must be read-only apart from the existing atomic status artifact writer; rendering the
    UI must not rewrite `done` to `idle` based on which terminal happens to have focus.
 7. Keep transcript reads bounded from the tail and fail closed to unknown on malformed/partial JSON.

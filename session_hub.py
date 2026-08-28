@@ -2411,7 +2411,38 @@ def session_is_tracked_alive(session: Session) -> bool:
     return False
 
 
-def tmux_session_alive(name: str) -> bool:
+def tmux_live_session_names() -> frozenset[str]:
+    """One bounded snapshot of every currently-alive tmux session name.
+
+    A refresh (GUI All Sessions, Running tab, or --sessions-json) used to call
+    `tmux_session_alive` once per row via group_row_status/standalone_tmux_status
+    and AGAIN per row via session_activity - two `tmux` subprocess spawns per
+    row, and All Sessions fans this over every historical session, not just
+    live ones. `tmux list-sessions` is one process for the whole refresh; every
+    caller now takes this snapshot and does an in-memory membership check
+    instead of spawning its own subprocess (see tmux_session_alive's
+    `live_names` param).
+    """
+    tmux = shutil.which("tmux")
+    if not tmux:
+        return frozenset()
+    try:
+        result = subprocess.run(
+            [tmux, "list-sessions", "-F", "#{session_name}"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except subprocess.TimeoutExpired:
+        return frozenset()
+    if result.returncode != 0:
+        # Also the correct (and common) reading for "no tmux server running
+        # at all" - has-session's per-name equivalent already fails closed.
+        return frozenset()
+    return frozenset(line for line in result.stdout.splitlines() if line)
+
+
+def tmux_session_alive(name: str, live_names: frozenset[str] | None = None) -> bool:
     """Is a tmux session named `name` currently alive.
 
     Provider-agnostic and correct for any tmux-launched group row - unlike
@@ -2419,7 +2450,14 @@ def tmux_session_alive(name: str) -> bool:
     (see adopt_untracked_sessions). A row's tmux session name always equals
     its own row["name"] (tmux_group_launch_command's own invariant), so this
     needs no session-id matching at all.
+
+    `live_names`, when given, is a tmux_live_session_names() snapshot - pass
+    one whenever checking more than one name per refresh so this does a plain
+    membership test instead of its own subprocess. Omitted only by isolated
+    callers that just want one name's answer.
     """
+    if live_names is not None:
+        return name in live_names
     tmux = shutil.which("tmux")
     if not tmux:
         return False
@@ -2604,54 +2642,89 @@ def hook_event_to_status_codex(payload: dict) -> tuple[str, str] | None:
 
 
 _CODEX_TURN_EVENTS = ("task_started", "task_complete", "turn_aborted")
-_CODEX_TAIL_BYTES = 65536  # a turn's own tool-output lines can be arbitrarily
-# large (a single custom_tool_call has been observed over 1MB), but the
-# task_started/task_complete/turn_aborted markers this reads for are tiny and
-# always the most recent thing worth finding - a bounded tail read costs the
-# same whether the rollout file is 10KB or the 1.5GB real ones on this
-# machine reach, unlike scanning from the start (see session_activity).
+_CODEX_TAIL_BYTES = 65536  # starting window - the task_started/task_complete/
+# turn_aborted markers this reads for are tiny and always the most recent
+# thing worth finding, so almost every call resolves off this one small read.
+_CODEX_TAIL_MAX_BYTES = 8 * 1024 * 1024  # escalation ceiling - a turn's own
+# tool-output lines can be arbitrarily large (a single custom_tool_call has
+# been observed over 1MB), so a FIXED 64KB tail can land entirely inside that
+# one giant record and miss a task_started sitting just before it, reading a
+# mid-turn session as stale/blank. 8MB covers that observed case with wide
+# margin while staying a tiny, bounded read next to the 1.5GB rollout files
+# this machine actually has - never a full-history scan (see session_activity).
+
+# path -> (mtime_ns, size, result) at the time it was last read. A GUI refresh
+# can ask about the same live Codex session twice in one pass (the All
+# Sessions table and the Running tab are separate calls within one refresh()) -
+# keying on the file's own mtime/size rather than a refresh-cycle counter
+# means a genuinely-unchanged file is never reparsed, AND a file that changed
+# between two calls (a turn actually advancing mid-refresh) is still read
+# fresh rather than serving a stale cached verdict.
+_codex_tail_cache: dict[str, tuple[int, int, tuple[str, float] | None]] = {}
 
 
 def _codex_tail_turn_state(path: Path) -> tuple[str, float] | None:
     """The most recent task_started/task_complete/turn_aborted event_msg
-    record in the last _CODEX_TAIL_BYTES of a Codex rollout file, as
-    (kind, epoch_seconds), or None if the tail window contains none of the
-    three. "task_started" with nothing newer after it is durable evidence of
-    an in-progress turn; "task_complete"/"turn_aborted" is durable evidence
-    the last turn already ended - see hook_event_to_status_codex's own
-    docstring for why Codex's `notify` alone can't tell the difference.
+    record found in a bounded tail of a Codex rollout file, as
+    (kind, epoch_seconds), or None if no tail window up to
+    _CODEX_TAIL_MAX_BYTES contains one. "task_started" with nothing newer
+    after it is durable evidence of an in-progress turn; "task_complete"/
+    "turn_aborted" is durable evidence the last turn already ended - see
+    hook_event_to_status_codex's own docstring for why Codex's `notify` alone
+    can't tell the difference. Cached per path by (mtime, size) - see
+    _codex_tail_cache.
     """
     try:
-        size = path.stat().st_size
-        offset = max(0, size - _CODEX_TAIL_BYTES)
-        with path.open("rb") as handle:
-            handle.seek(offset)
-            chunk = handle.read()
+        stat = path.stat()
     except OSError:
         return None
-    lines = chunk.split(b"\n")
-    if offset > 0:
-        lines = lines[1:]  # seeked mid-file: first line may be truncated
-    latest: tuple[str, float] | None = None
-    for line in lines:
+    cached = _codex_tail_cache.get(str(path))
+    if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+        return cached[2]
+    result = _codex_tail_turn_state_scan(path, stat.st_size)
+    _codex_tail_cache[str(path)] = (stat.st_mtime_ns, stat.st_size, result)
+    return result
+
+
+def _codex_tail_turn_state_scan(path: Path, size: int) -> tuple[str, float] | None:
+    window = _CODEX_TAIL_BYTES
+    while True:
+        offset = max(0, size - window)
         try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if record.get("type") != "event_msg":
-            continue
-        kind = (record.get("payload") or {}).get("type")
-        if kind not in _CODEX_TURN_EVENTS:
-            continue
-        try:
-            epoch = datetime.fromisoformat(
-                str(record.get("timestamp")).replace("Z", "+00:00")
-            ).timestamp()
-        except (ValueError, AttributeError):
-            continue
-        if latest is None or epoch >= latest[1]:
-            latest = (kind, epoch)
-    return latest
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                chunk = handle.read()
+        except OSError:
+            return None
+        lines = chunk.split(b"\n")
+        if offset > 0:
+            lines = lines[1:]  # seeked mid-file: first line may be truncated
+        latest: tuple[str, float] | None = None
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("type") != "event_msg":
+                continue
+            kind = (record.get("payload") or {}).get("type")
+            if kind not in _CODEX_TURN_EVENTS:
+                continue
+            try:
+                epoch = datetime.fromisoformat(
+                    str(record.get("timestamp")).replace("Z", "+00:00")
+                ).timestamp()
+            except (ValueError, AttributeError):
+                continue
+            if latest is None or epoch >= latest[1]:
+                latest = (kind, epoch)
+        if latest is not None or offset == 0 or window >= _CODEX_TAIL_MAX_BYTES:
+            # A window that reached start-of-file or the escalation ceiling
+            # with nothing found is a real "no marker here", not a signal to
+            # keep growing - only an empty window that could plausibly be
+            # hiding a marker just past its edge escalates.
+            return latest
+        window = min(window * 4, _CODEX_TAIL_MAX_BYTES)
 
 
 def _codex_activity(session: "Session", status: dict | None) -> tuple[str, str]:
@@ -2674,15 +2747,29 @@ def _codex_activity(session: "Session", status: dict | None) -> tuple[str, str]:
 
 
 def session_activity(
-    session: "Session", *, tmux_enabled: bool = False, tmux_name: str | None = None
+    session: "Session",
+    *,
+    tmux_enabled: bool = False,
+    tmux_name: str | None = None,
+    live_names: frozenset[str] | None = None,
 ) -> tuple[str, str]:
     """(state, detail) activity verdict for `session`: one of
     working/needs_input/done/idle/unknown. The one function every
-    presentation layer - the GUI's Running tab and All Sessions table, the
-    TUI's equivalents (via --sessions-json, which calls this), the
-    recent-activity strip, and --sessions-json/CLI directly - computes a
-    session's CURRENT activity through, so no provider branch can diverge or
-    silently return blank (see status_pipeline_plan.md's contract).
+    presentation layer showing a session's CURRENT activity - the GUI's
+    Running tab and All Sessions table, the TUI's equivalents (via
+    --sessions-json, which calls this), and --sessions-json/CLI directly -
+    computes it through, so no provider branch can diverge or silently
+    return blank (see status_pipeline_plan.md's contract).
+
+    The recent-activity strip (_refresh_activity_list) is NOT one of these
+    callers - it is a history log of past write_session_status events, each
+    already carrying its own (state, detail, ts) from the moment it was
+    written, not a live "what is this session doing right now" readout.
+    Recomputing each historical row's CURRENT verdict here would replace what
+    the log is for (what happened, and when) with today's live state,
+    silently rewriting history on every refresh. It shares this function's
+    activity_label() vocabulary so the two surfaces render identically, but
+    intentionally not the verdict computation itself.
 
     Liveness is a separate fact from activity (also per that contract) and is
     checked here only to keep transcript parsing bounded to rows that are
@@ -2698,7 +2785,7 @@ def session_activity(
     if session.session_id.startswith("group:"):
         return "unknown", ""
     live = session_is_tracked_alive(session) or (
-        tmux_enabled and tmux_name is not None and tmux_session_alive(tmux_name)
+        tmux_enabled and tmux_name is not None and tmux_session_alive(tmux_name, live_names)
     )
     if not live:
         return "unknown", ""
@@ -2893,34 +2980,47 @@ def uninstall_status_hooks_codex() -> None:
     CODEX_CONFIG.write_text(text)
 
 
-def group_row_status(row: dict, match: "Session | None", tmux_enabled: bool) -> str:
+def group_row_status(
+    row: dict,
+    match: "Session | None",
+    tmux_enabled: bool,
+    live_names: frozenset[str] | None = None,
+) -> str:
     """"Running" or "Stopped" for one group row - the only two states shown anywhere.
 
     tmux-enabled rows trust tmux_session_alive outright (provider-agnostic,
     authoritative). Non-tmux rows fall back to the older PID-tracking signal,
     which only ever works for Claude - a known, pre-existing limitation this
-    doesn't attempt to fix.
+    doesn't attempt to fix. Pass a tmux_live_session_names() snapshot as
+    `live_names` when calling this for more than one row per refresh.
     """
     if tmux_enabled:
-        return "Running" if tmux_session_alive(row["name"]) else "Stopped"
+        return "Running" if tmux_session_alive(row["name"], live_names) else "Stopped"
     return "Running" if match and session_is_tracked_alive(match) else "Stopped"
 
 
-def standalone_tmux_status(session: "Session", overrides: dict, settings: dict) -> tuple[bool, str | None, str | None]:
+def standalone_tmux_status(
+    session: "Session",
+    overrides: dict,
+    settings: dict,
+    live_names: frozenset[str] | None = None,
+) -> tuple[bool, str | None, str | None]:
     """(tmux_enabled, tmux_name, status) for one non-group session.
 
     Mirrors SessionHub.resume_session's own tmux_name computation
     ((--name flag override) or (Hub rename) or (transcript title)) so
     tmux_session_alive sees the exact session a resume would attach to.
     status is None when tmux launching isn't enabled for this session -
-    there is no tmux session to check.
+    there is no tmux session to check. Pass a tmux_live_session_names()
+    snapshot as `live_names` when calling this for more than one session per
+    refresh.
     """
     explicit = overrides.get("tmux")
     tmux_enabled = explicit if explicit is not None else settings.get("launch_in_tmux", False)
     if not tmux_enabled:
         return False, None, None
     name = (overrides.get("flags") or {}).get("--name") or overrides.get("name") or session.title
-    return True, name, ("Running" if tmux_session_alive(name) else "Stopped")
+    return True, name, ("Running" if tmux_session_alive(name, live_names) else "Stopped")
 
 
 def parse_claude_cmdline_identity(cmdline: str) -> tuple[str | None, str | None]:
@@ -4614,6 +4714,9 @@ class ManageGroupDialog(QDialog):
         pairs = self.matched_sessions()
         row_sessions = [self.row_session(row, match) for row, match in pairs]
         self.hub.populate_session_table(self.table, row_sessions, self.SHARED_COLUMNS)
+        # One tmux snapshot for every row in this dialog, not one subprocess
+        # per row (see tmux_live_session_names).
+        live_names = tmux_live_session_names()
         for index, ((row, match), row_session) in enumerate(zip(pairs, row_sessions)):
             self.table.setItem(
                 index, self.SESSION_ID_COLUMN, QTableWidgetItem(row_session.session_id)
@@ -4626,7 +4729,7 @@ class ManageGroupDialog(QDialog):
             self.table.setCellWidget(index, self.TRANSCRIPTS_COLUMN, checkbox)
 
             status = group_row_status(
-                row, match, self.hub.effective_tmux(group.get("tmux"))
+                row, match, self.hub.effective_tmux(group.get("tmux")), live_names
             )
             self.table.setItem(index, self.STATUS_COLUMN, QTableWidgetItem(status))
         if select_override_keys:
@@ -5888,16 +5991,20 @@ class SessionHub(QMainWindow):
         needs_activity = "Status" in columns or "Last message" in columns
         settings = self.metadata.get("settings", {}) if needs_activity else {}
         session_overrides = self.metadata.get("sessions", {}) or {} if needs_activity else {}
+        # One tmux snapshot for the whole table, not one `tmux` subprocess per
+        # row - All Sessions can list every historical session, so this is the
+        # difference between one process and up to 2*N per refresh.
+        live_names = tmux_live_session_names() if needs_activity else None
         table.setSortingEnabled(False)
         table.setRowCount(len(sessions))
         for row, session in enumerate(sessions):
             activity = ("unknown", "")
             if needs_activity and not self.is_group_session(session):
                 tmux_enabled, tmux_name, _ = standalone_tmux_status(
-                    session, session_overrides.get(session.key, {}), settings
+                    session, session_overrides.get(session.key, {}), settings, live_names
                 )
                 activity = session_activity(
-                    session, tmux_enabled=tmux_enabled, tmux_name=tmux_name
+                    session, tmux_enabled=tmux_enabled, tmux_name=tmux_name, live_names=live_names
                 )
             for col, column in enumerate(columns):
                 if column == "Agent":
@@ -5970,6 +6077,11 @@ class SessionHub(QMainWindow):
         if settings.get("enable_antigravity", True):
             live += antigravity_sessions()
 
+        # One tmux snapshot for the whole refresh - every group row and every
+        # standalone session below shares it instead of each spawning its own
+        # `tmux has-session` (was up to 2 subprocesses per row).
+        live_names = tmux_live_session_names()
+
         running: list[tuple[str, str, dict, Session | None]] = []
         claimed: set[str] = set()
         for cwd, group in self.metadata.get("groups", {}).items():
@@ -5981,7 +6093,7 @@ class SessionHub(QMainWindow):
                 match = find_group_member_session(row, cwd, live, frozenset(claimed))
                 if match:
                     claimed.add(match.native_key)
-                if group_row_status(row, match, tmux_enabled) == "Running":
+                if group_row_status(row, match, tmux_enabled, live_names) == "Running":
                     running.append((display_name, cwd, row, match))
 
         session_overrides = self.metadata.get("sessions", {}) or {}
@@ -5989,7 +6101,7 @@ class SessionHub(QMainWindow):
             if session.session_id.startswith("group:"):
                 continue
             tmux_enabled, name, status = standalone_tmux_status(
-                session, session_overrides.get(session.key, {}), settings
+                session, session_overrides.get(session.key, {}), settings, live_names
             )
             if tmux_enabled and status == "Running":
                 running.append((
@@ -6016,7 +6128,7 @@ class SessionHub(QMainWindow):
             # write status itself (status_pipeline_plan.md's contract) - the
             # only writer is the hook pipeline (write_session_status).
             state, detail = (
-                session_activity(match, tmux_enabled=True, tmux_name=row["name"])
+                session_activity(match, tmux_enabled=True, tmux_name=row["name"], live_names=live_names)
                 if match else ("unknown", "")
             )
             self.running_table.setItem(index, 3, self._status_column_item(state))
@@ -6042,6 +6154,12 @@ class SessionHub(QMainWindow):
         return item
 
     def _refresh_activity_list(self, names_by_id: dict[str, str]) -> None:
+        """Recent-activity strip: a history log of raw write_session_status
+        events (each entry's own recorded state/detail/ts), deliberately NOT
+        routed through session_activity's CURRENT-state verdict - see that
+        function's docstring for why a log of past events must not be
+        rewritten to today's live state. Shares only activity_label() so the
+        two surfaces render identically."""
         self.activity_list.clear()
         for session_id, status in all_session_statuses()[:20]:
             label, color = activity_label(status.get("state"))
@@ -7763,6 +7881,10 @@ def sessions_json_cli() -> int:
     if settings.get("enable_antigravity", True):
         live += antigravity_sessions()
 
+    # One tmux snapshot for the whole CLI invocation - shared by every group
+    # row and every session below instead of a `tmux has-session` per call.
+    live_names = tmux_live_session_names()
+
     claimed: set[str] = set()
     groups = {}
     for cwd, group in metadata.get("groups", {}).items():
@@ -7774,7 +7896,9 @@ def sessions_json_cli() -> int:
             if match:
                 claimed.add(match.native_key)
             activity_state, activity_detail = (
-                session_activity(match, tmux_enabled=tmux_enabled, tmux_name=row["name"])
+                session_activity(
+                    match, tmux_enabled=tmux_enabled, tmux_name=row["name"], live_names=live_names
+                )
                 if match else ("unknown", "")
             )
             rows_out.append(
@@ -7782,7 +7906,7 @@ def sessions_json_cli() -> int:
                     "name": row["name"],
                     "provider": row.get("provider", "Claude"),
                     # Liveness (process/tmux) - separate fact from activity below.
-                    "status": group_row_status(row, match, tmux_enabled),
+                    "status": group_row_status(row, match, tmux_enabled, live_names),
                     "activity": activity_state,
                     "activity_label": activity_label(activity_state)[0],
                     "activity_detail": activity_detail,
@@ -7801,10 +7925,12 @@ def sessions_json_cli() -> int:
         tmux_enabled, tmux_name, status = (
             (False, None, None)
             if is_group
-            else standalone_tmux_status(item, session_overrides.get(item.key, {}), settings)
+            else standalone_tmux_status(
+                item, session_overrides.get(item.key, {}), settings, live_names
+            )
         )
         activity_state, activity_detail = session_activity(
-            item, tmux_enabled=tmux_enabled, tmux_name=tmux_name
+            item, tmux_enabled=tmux_enabled, tmux_name=tmux_name, live_names=live_names
         )
         return {
             "provider": item.provider,

@@ -3,6 +3,7 @@ import io
 import os
 import json
 import subprocess
+import shutil
 import tempfile
 import time
 import unittest
@@ -807,12 +808,14 @@ class SessionHubTests(unittest.TestCase):
                 window.close()
 
     def test_continue_with_other_agent_sets_correct_target_provider(self):
+        real_cwd = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, real_cwd, ignore_errors=True)
         active = session_hub.Session(
             "Claude",
             "claude-id",
             "Logical Session",
-            "/home/user/project",
-            "/home/user/project",
+            real_cwd,
+            real_cwd,
             300,
             Path("/tmp/claude.jsonl"),
         )
@@ -4896,6 +4899,41 @@ class SessionActivityTests(unittest.TestCase):
             state, _ = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
         self.assertEqual(state, "working")
 
+    def test_codex_tail_survives_a_large_trailing_tool_output_block(self):
+        """A turn's own tool-output line can exceed 1MB (rework item 5) - a
+        FIXED 64KB tail read lands entirely inside that one blob and never
+        sees the task_started marker sitting just before it. The escalating
+        window (_codex_tail_turn_state_scan) must keep growing until it does."""
+        started = self._event(time.time() - 1, "task_started")
+        huge_tool_output = {
+            "timestamp": _iso(time.time()),
+            "type": "event_msg",
+            "payload": {"type": "item_completed", "blob": "x" * 1_500_000},
+        }
+        path = self._rollout([started, huge_tool_output])
+        self.assertGreater(path.stat().st_size, session_hub._CODEX_TAIL_BYTES)
+        session = session_hub.Session("Codex", "id-huge-tail", "t", "/tmp", "/tmp", 0, path)
+        with patch.object(session_hub, "tmux_session_alive", return_value=True):
+            state, _ = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "working")
+
+    def test_codex_tail_cache_reuses_unchanged_file_but_rescans_after_a_write(self):
+        path = self._rollout([self._event(time.time(), "task_started")])
+        with patch.object(
+            session_hub, "_codex_tail_turn_state_scan",
+            wraps=session_hub._codex_tail_turn_state_scan,
+        ) as scan:
+            first = session_hub._codex_tail_turn_state(path)
+            second = session_hub._codex_tail_turn_state(path)
+            self.assertEqual(scan.call_count, 1)
+            self.assertEqual(first, second)
+
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(self._event(time.time(), "task_complete")) + "\n")
+            third = session_hub._codex_tail_turn_state(path)
+            self.assertEqual(scan.call_count, 2)
+            self.assertEqual(third[0], "task_complete")
+
     def test_codex_tail_on_missing_file_reads_unknown_not_a_crash(self):
         session = session_hub.Session(
             "Codex", "id-missing", "t", "/tmp", "/tmp", 0, Path("/tmp/does-not-exist.jsonl")
@@ -4952,6 +4990,65 @@ class SessionActivityTests(unittest.TestCase):
 
         self.assertEqual(json_label, "Needs input")
         self.assertEqual(gui_label, "Needs input")
+
+    def test_refresh_running_tab_makes_one_tmux_subprocess_call_for_n_rows(self):
+        """group_row_status and session_activity used to each call
+        tmux_session_alive independently - 2 subprocess spawns per row, times
+        N rows. refresh_running_tab must take one tmux_live_session_names()
+        snapshot per refresh and every row reuses it (see the `live_names`
+        param threaded through group_row_status/session_activity)."""
+        rows = [
+            {"name": f"VAMP-{i}", "provider": "Claude", "session_key": f"Claude:id-{i}"}
+            for i in range(5)
+        ]
+        session_hub.METADATA_PATH.write_text(
+            json.dumps({
+                "settings": {},
+                "sessions": {},
+                "groups": {"/tmp/vamp": {"tmux": True, "rows": rows}},
+            }),
+            encoding="utf-8",
+        )
+        sessions = [
+            session_hub.Session(
+                "Claude", f"id-{i}", f"s{i}", "/tmp/vamp", "/tmp/vamp", 100,
+                Path(f"/tmp/s{i}.jsonl"),
+            )
+            for i in range(5)
+        ]
+
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            result = MagicMock()
+            result.returncode = 0
+            if argv[1] == "list-sessions":
+                result.stdout = "\n".join(row["name"] for row in rows) + "\n"
+            return result
+
+        with (
+            patch.object(session_hub, "claude_sessions", return_value=sessions),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.shutil, "which", return_value="/usr/bin/tmux"),
+            patch.object(session_hub.subprocess, "run", side_effect=fake_run),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            # SessionHub() itself does a full refresh() at construction (both
+            # the All Sessions table and the Running tab, each its own
+            # logical refresh with its own snapshot) - isolate exactly ONE
+            # refresh_running_tab() call to prove ITS subprocess count is
+            # O(1) in row count, not O(N).
+            window = session_hub.SessionHub()
+            calls.clear()
+            window.refresh_running_tab()
+            self.assertEqual(window.running_table.rowCount(), 5)
+            window.close()
+
+        tmux_calls = [c for c in calls if c and c[0] == "/usr/bin/tmux"]
+        self.assertEqual(len(tmux_calls), 1)
+        self.assertEqual(tmux_calls[0][1], "list-sessions")
 
 
 if __name__ == "__main__":
