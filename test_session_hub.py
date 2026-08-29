@@ -4898,6 +4898,42 @@ class SessionActivityTests(unittest.TestCase):
             state, detail = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
         self.assertEqual(state, "working")
 
+    # --- newer task_complete/turn_aborted beats a stale "working" status ---
+    def test_codex_task_complete_newer_than_stale_working_status_wins(self):
+        session_id = "id-stale-working"
+        session_hub.write_session_status(session_id, "working", "")
+        path = self._rollout([
+            self._event(time.time() - 5, "task_started"),
+            self._event(time.time() + 5, "task_complete"),
+        ])
+        session = session_hub.Session("Codex", session_id, "t", "/tmp", "/tmp", 0, path)
+        with patch.object(session_hub, "tmux_session_alive", return_value=True):
+            state, _ = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "done")
+
+    def test_codex_turn_aborted_newer_than_stale_working_status_wins(self):
+        session_id = "id-stale-working-aborted"
+        session_hub.write_session_status(session_id, "working", "")
+        path = self._rollout([
+            self._event(time.time() - 5, "task_started"),
+            self._event(time.time() + 5, "turn_aborted"),
+        ])
+        session = session_hub.Session("Codex", session_id, "t", "/tmp", "/tmp", 0, path)
+        with patch.object(session_hub, "tmux_session_alive", return_value=True):
+            state, _ = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "done")
+
+    def test_codex_working_status_survives_an_older_task_complete(self):
+        # Negative control: a "working" status newer than the last completion
+        # event must NOT be overridden - only a newer completion beats it.
+        session_id = "id-working-genuinely-current"
+        path = self._rollout([self._event(time.time() - 5, "task_complete")])
+        session_hub.write_session_status(session_id, "working", "")
+        session = session_hub.Session("Codex", session_id, "t", "/tmp", "/tmp", 0, path)
+        with patch.object(session_hub, "tmux_session_alive", return_value=True):
+            state, _ = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "working")
+
     # --- two same-cwd sessions => exact ids, no cross-talk --------------
     def test_two_same_cwd_sessions_get_independent_activity_states(self):
         session_hub.write_session_status("id-a", "working", "")
@@ -5061,6 +5097,28 @@ class SessionActivityTests(unittest.TestCase):
                     session_hub.tmux_live_session_names(),
                     frozenset({"VAMP-worker1", "VAMP-worker2"}),
                 )
+
+    def test_tmux_session_alive_isolated_call_survives_oserror(self):
+        """The isolated (no live_names snapshot) path spawns its own `tmux
+        has-session` and had only caught TimeoutExpired - tmux_live_session_names
+        already fails closed on OSError but this sibling spawn did not (row426
+        audit rework: 'isolated tmux_session_alive() must catch OSError too')."""
+        with patch.object(session_hub.shutil, "which", return_value="/usr/bin/tmux"):
+            with patch.object(
+                session_hub.subprocess, "run", side_effect=OSError("tmux vanished")
+            ):
+                self.assertFalse(session_hub.tmux_session_alive("VAMP-x"))
+            with patch.object(
+                session_hub.subprocess, "run",
+                side_effect=subprocess.TimeoutExpired(cmd="tmux", timeout=2),
+            ):
+                self.assertFalse(session_hub.tmux_session_alive("VAMP-x"))
+            # Negative control: a real success path still returns True.
+            with patch.object(
+                session_hub.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0),
+            ):
+                self.assertTrue(session_hub.tmux_session_alive("VAMP-x"))
 
     def test_refresh_running_tab_makes_one_tmux_subprocess_call_for_n_rows(self):
         """group_row_status and session_activity used to each call

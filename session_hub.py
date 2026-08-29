@@ -2473,12 +2473,15 @@ def tmux_session_alive(name: str, live_names: frozenset[str] | None = None) -> b
             stderr=subprocess.DEVNULL,
             timeout=2,
         )
-    except subprocess.TimeoutExpired:
+    except (OSError, subprocess.TimeoutExpired):
         # session_activity now calls this from every live-row status lookup
         # (GUI/TUI/JSON alike), not just the Running tab - a wedged tmux
         # server must not be able to hang status refresh itself, so this
         # fails closed to "not alive" the same way a malformed transcript
-        # line fails closed to "unknown" rather than raising.
+        # line fails closed to "unknown" rather than raising. OSError covers
+        # the same tmux-binary-vanishes-after-shutil.which() window
+        # tmux_live_session_names already guards - this isolated spawn had
+        # been left with only the timeout half of that fix.
         return False
     return result.returncode == 0
 
@@ -2756,6 +2759,18 @@ def _codex_activity(session: "Session", status: dict | None) -> tuple[str, str]:
     if turn and turn[0] == "task_started" and turn[1] >= (status or {}).get("ts", 0):
         return "working", ""
     if status:
+        if (
+            status.get("state") == "working"
+            and turn is not None
+            and turn[0] in ("task_complete", "turn_aborted")
+            and turn[1] > status.get("ts", 0)
+        ):
+            # The status file is stale: it was last written mid-turn
+            # ("working") but the transcript proves that turn has since
+            # ended (notify hook never fired for the completion event, or
+            # its write raced/lost). Without this a session gets stuck
+            # showing Working forever once its rollout moves on.
+            return "done", ""
         return status.get("state", "unknown"), status.get("detail", "")
     if turn:
         # A turn already finished in the transcript before session-hub's own
