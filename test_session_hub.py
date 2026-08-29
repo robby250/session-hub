@@ -1451,40 +1451,92 @@ class SessionHubTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             session_hub.tmux_group_launch_command("vamp-s1", "/tmp/vamp", ["claude"])
 
-    def test_tmux_group_launch_command_actually_creates_a_live_tmux_session(self):
-        # Regression: string-shape assertions alone missed a real bug (env's
-        # "--" placement, see prefix_env_command) that killed the tmux
-        # session before it could ever attach - only running the real
-        # binaries end to end catches that class of failure.
-        if not (session_hub.shutil.which("tmux") and session_hub.shutil.which("gnome-terminal")):
-            self.skipTest("tmux/gnome-terminal not installed")
-        session_name = f"session-hub-test-{session_hub.uuid.uuid4().hex[:8]}"
-        claude_args = session_hub.prefix_env_command(
-            ["bash", "-c", "echo $MARKER_VAR; sleep 10"],
-            {"MARKER_VAR": "it-worked"},
-            None,
-        )
-        command = session_hub.tmux_group_launch_command(session_name, "/tmp", claude_args)
-        proc = subprocess.Popen(command, start_new_session=True)
-        try:
-            deadline = session_hub.time.monotonic() + 5
-            output = ""
-            while session_hub.time.monotonic() < deadline:
-                result = subprocess.run(
-                    ["tmux", "capture-pane", "-t", session_name, "-p"],
-                    capture_output=True,
-                    text=True,
-                )
-                if result.returncode == 0:
-                    output = result.stdout
-                    break
-                session_hub.time.sleep(0.2)
-            self.assertIn("it-worked", output)
-        finally:
-            subprocess.run(
-                ["tmux", "kill-session", "-t", session_name], capture_output=True
+    def test_tmux_group_launch_command_actually_executes_the_shell_script(self):
+        """Replaces the live tmux/gnome-terminal integration test (row432 audit rework
+        r2): row432's setUp-level `shutil.which("tmux") -> None` net made this test's
+        own `if not (which("tmux") and which("gnome-terminal")): skipTest(...)` guard
+        fire unconditionally, silently losing the coverage its own comment says caught
+        a real bug (env's `--` placement killing the tmux session before it could ever
+        attach) - string-shape assertions alone had missed that once already.
+
+        This hermetic replacement resolves "tmux"/"gnome-terminal"/"env" to tiny fake
+        executables on a temp PATH instead of the real binaries, then runs the FULL
+        generated bash script (all five positional args: has-session/new-session/
+        set-option x3/exec attach) for real via subprocess.run - proving actual
+        command execution, not just its string shape - with no real tmux server,
+        window, live background daemon, or polling loop: the fake "tmux new-session"
+        handler runs the built command synchronously and captures its real output
+        before returning, so the whole test is one blocking subprocess call.
+
+        The fake "env" specifically rejects a bare `--`, mirroring the disc-confirmed
+        bug prefix_env_command's own docstring describes, independent of what
+        /usr/bin/env the test host actually ships - GNU coreutils 9.4 here happens to
+        accept `--`, which is exactly why relying on the real binary would not catch a
+        regression back to the old behavior."""
+        with tempfile.TemporaryDirectory() as fakebin_dir:
+            fakebin = Path(fakebin_dir)
+            marker = fakebin / "captured.txt"
+
+            fake_tmux = fakebin / "tmux"
+            fake_tmux.write_text(
+                "#!/bin/bash\n"
+                'case "$1" in\n'
+                "  has-session) exit 1 ;;\n"
+                '  new-session) sh -c "${@: -1}" > "%s" 2>&1; exit 0 ;;\n'
+                "  set-option) exit 0 ;;\n"
+                "  attach) exit 0 ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n" % marker
             )
-            proc.wait(timeout=5)
+            fake_tmux.chmod(0o755)
+
+            fake_terminal = fakebin / "gnome-terminal"
+            fake_terminal.write_text("#!/bin/bash\nexit 0\n")
+            fake_terminal.chmod(0o755)
+
+            fake_env = fakebin / "env"
+            fake_env.write_text(
+                "#!/bin/bash\n"
+                "while [ $# -gt 0 ]; do\n"
+                '  case "$1" in\n'
+                '    --) echo "env: -- : No such file or directory" >&2; exit 127 ;;\n'
+                '    -u) unset "$2"; shift 2 ;;\n'
+                '    *=*) export "$1"; shift ;;\n'
+                "    *) break ;;\n"
+                "  esac\n"
+                "done\n"
+                'exec "$@"\n'
+            )
+            fake_env.chmod(0o755)
+
+            spawn_env = dict(os.environ, PATH=f"{fakebin}:{os.environ.get('PATH', '')}")
+
+            def run_and_capture(claude_args: list[str]) -> str:
+                marker.unlink(missing_ok=True)
+                with patch.object(
+                    session_hub.shutil, "which",
+                    side_effect=lambda name: {
+                        "tmux": str(fake_tmux), "gnome-terminal": str(fake_terminal),
+                    }.get(name),
+                ):
+                    command = session_hub.tmux_group_launch_command(
+                        "session-hub-test", "/tmp", claude_args
+                    )
+                subprocess.run(command, env=spawn_env, timeout=5, check=True)
+                return marker.read_text(encoding="utf-8") if marker.exists() else ""
+
+            # Positive: today's prefix_env_command emits no `--`, so the real child
+            # process actually ran and the marker sees its real output.
+            good_args = session_hub.prefix_env_command(
+                ["bash", "-c", "echo $MARKER_VAR"], {"MARKER_VAR": "it-worked"}, None
+            )
+            self.assertIn("it-worked", run_and_capture(good_args))
+
+            # Negative control: reconstruct the exact old buggy shape (a bare `--`
+            # inserted before the NAME=VALUE pairs) - proves this harness actually
+            # discriminates good from bad execution, not just that it runs something.
+            bad_args = ["env", "--", "MARKER_VAR=it-worked", "bash", "-c", "echo $MARKER_VAR"]
+            self.assertNotIn("it-worked", run_and_capture(bad_args))
 
     @patch("session_hub.shutil.which")
     def test_launch_with_tmux_builds_tmux_command_and_skips_pid_capture(self, which):
