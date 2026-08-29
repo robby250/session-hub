@@ -6173,6 +6173,95 @@ class SessionActivityTests(unittest.TestCase):
         second = session_hub._codex_tail_turn_state(path)
         self.assertEqual(second[0], "task_started")
 
+    class _ReadSizeSpyHandle:
+        """Wraps a real file handle so every read() call's requested size
+        is recorded, proving the round-2 rework's bounded-read claim
+        without needing to guess at internal chunk boundaries."""
+
+        def __init__(self, real, sizes: list[int]):
+            self._real = real
+            self._sizes = sizes
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            self._real.close()
+            return False
+
+        def seek(self, *args, **kwargs):
+            return self._real.seek(*args, **kwargs)
+
+        def read(self, size=-1):
+            self._sizes.append(size)
+            return self._real.read(size)
+
+    def _spy_on_path_reads(self, sizes: list[int]):
+        real_open = Path.open
+
+        def spy_open(path_self, *args, **kwargs):
+            return self._ReadSizeSpyHandle(real_open(path_self, *args, **kwargs), sizes)
+
+        return patch.object(Path, "open", spy_open)
+
+    def test_codex_scan_reads_stay_chunk_bounded_and_reconstruct_a_straddled_marker(self):
+        """Round-2 rework proof: the scan's read size must never scale with
+        the range being searched - only the fixed chunk constant, however
+        deep a marker sits. A JSONL record longer than one chunk (as this
+        marker deliberately is) is mathematically guaranteed to straddle at
+        least one backward chunk boundary, proving cross-chunk
+        reconstruction; a long unparseable non-marker line closer to EOF
+        must be walked past, not mistaken for a marker or crash the scan."""
+        chunk = 40
+        with patch.object(session_hub, "_CODEX_TAIL_BYTES", chunk):
+            marker_line = json.dumps(self._event(time.time(), "task_started"))
+            self.assertGreater(len(marker_line), chunk)  # guarantees straddling
+            long_non_marker = "n" * (chunk * 3)  # spans several chunks, not JSON
+            content = "z" * 7 + "\n" + marker_line + "\n" + long_non_marker + "\n"
+            path = self.temp / "straddle.jsonl"
+            path.write_text(content, encoding="utf-8")
+
+            read_sizes: list[int] = []
+            with self._spy_on_path_reads(read_sizes):
+                result, resume_from = session_hub._codex_scan_range_for_turn_marker(
+                    path, 0, path.stat().st_size
+                )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "task_started")
+        self.assertGreater(len(read_sizes), 3)  # actually walked back several chunks
+        for size in read_sizes:
+            self.assertLessEqual(size, chunk)
+        self.assertEqual(resume_from, path.stat().st_size)
+
+    def test_codex_delta_scan_reads_stay_chunk_bounded_on_a_huge_appended_burst(self):
+        """Same bounded-read proof against the real _CODEX_TAIL_BYTES and a
+        >old-ceiling delta burst (the exact shape of the reported bug and
+        of the round-1 rework's own fixture) - every read the delta path
+        issues must still be <= the chunk constant."""
+        path = self._rollout([self._event(time.time() - 100, "task_started")])
+        first = session_hub._codex_tail_turn_state(path)
+        self.assertEqual(first[0], "task_started")
+
+        filler = {
+            "timestamp": _iso(time.time()),
+            "type": "event_msg",
+            "payload": {"type": "item_completed", "blob": "x" * 500_000},
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            for _ in range(20):  # >= 10MB, past the old ceiling
+                handle.write(json.dumps(filler) + "\n")
+        self.assertGreater(path.stat().st_size, session_hub._CODEX_TAIL_MAX_BYTES)
+
+        read_sizes: list[int] = []
+        with self._spy_on_path_reads(read_sizes):
+            grown = session_hub._codex_tail_turn_state(path)
+
+        self.assertEqual(grown[0], "task_started")
+        self.assertGreater(len(read_sizes), 1)
+        for size in read_sizes:
+            self.assertLessEqual(size, session_hub._CODEX_TAIL_BYTES)
+
     def test_codex_tail_cache_evicts_oldest_path_once_over_the_bound(self):
         """codex_sessions() lists every thread ever recorded (no LIMIT), so a
         long-running GUI can be asked about far more distinct rollout paths

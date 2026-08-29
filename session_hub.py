@@ -2758,21 +2758,25 @@ def hook_event_to_status_codex(payload: dict) -> tuple[str, str] | None:
 
 
 _CODEX_TURN_EVENTS = ("task_started", "task_complete", "turn_aborted")
-_CODEX_TAIL_BYTES = 65536  # starting window - the task_started/task_complete/
+_CODEX_TAIL_BYTES = 65536  # fixed chunk size for every single read the scan
+# below issues, walking backward from EOF - the task_started/task_complete/
 # turn_aborted markers this reads for are tiny and always the most recent
-# thing worth finding, so almost every call resolves off this one small read.
-_CODEX_TAIL_MAX_BYTES = 8 * 1024 * 1024  # escalation STARTING-STEP reference
-# only, not a correctness ceiling - a turn's own tool-output lines can be
-# arbitrarily large (a single custom_tool_call has been observed over 1MB,
-# and a whole still-open turn's worth was observed over 20MB against a real
-# live rollout), so a FIXED 64KB tail can land entirely inside that one
-# giant record and miss a task_started sitting just before it. The
-# escalating window below keeps doubling from _CODEX_TAIL_BYTES with NO cap
-# until it reaches the range's floor - reaching this constant used to stop
-# the search and silently report "no marker", which is what turned a
-# genuinely still-open turn into a false Done. Steady-state cost stays
-# small because the cache resumes each call from near the previous read's
-# end, not from byte 0 - see _codex_tail_cache and resume_from below.
+# thing worth finding, so almost every call resolves off the first chunk.
+_CODEX_TAIL_MAX_BYTES = 8 * 1024 * 1024  # documentation-only reference for
+# "how far behind EOF is unusually deep", not a correctness ceiling and not
+# a read/allocation size - a turn's own tool-output lines can be arbitrarily
+# large (a single custom_tool_call has been observed over 1MB, and a whole
+# still-open turn's worth was observed over 20MB against a real live
+# rollout), so a marker can legitimately sit this far behind EOF. The
+# reverse-chunk walk below reads _CODEX_TAIL_BYTES at a time, moving one
+# chunk further from EOF each iteration, until it finds a marker or reaches
+# the range's floor - unlike an escalating single read, no individual read
+# or allocation ever scales with the distance walked or the file's total
+# size (round 2 rework: the prior escalating-window version's read size
+# itself grew without bound, allocating gigabytes against a >1.6GB rollout
+# with no nearby marker). Steady-state cost stays small because the cache
+# resumes each call from near the previous read's end, not from byte 0 -
+# see _codex_tail_cache and resume_from below.
 
 # path -> (mtime_ns, size, (dev, ino), result, resume_from) at the time it
 # was last read. A GUI refresh can ask about the same live Codex session
@@ -2858,73 +2862,114 @@ def _codex_tail_turn_state(path: Path) -> tuple[str, float] | None:
     return result
 
 
+def _codex_parse_turn_marker_line(line: bytes) -> tuple[str, float] | None:
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return None
+    if record.get("type") != "event_msg":
+        return None
+    kind = (record.get("payload") or {}).get("type")
+    if kind not in _CODEX_TURN_EVENTS:
+        return None
+    try:
+        epoch = datetime.fromisoformat(
+            str(record.get("timestamp")).replace("Z", "+00:00")
+        ).timestamp()
+    except (ValueError, AttributeError):
+        return None
+    return (kind, epoch)
+
+
 def _codex_scan_range_for_turn_marker(
     path: Path, floor: int, end: int
 ) -> tuple[tuple[str, float] | None, int]:
-    """Escalating-window scan for the latest task_started/task_complete/
-    turn_aborted event_msg record within byte range [floor, end) of `path`,
-    doubling the trailing window from _CODEX_TAIL_BYTES with no upper cap
-    until it reaches `floor` (or a marker is found first) - the caller
-    decides what "nothing in this range" means: no marker exists at all
-    (the cold/full scan, floor=0), or nothing NEWER than an already-known
-    one (the incremental scan, floor=last confirmed resume point). Shared by
-    _codex_tail_turn_state_scan and _codex_tail_turn_state_delta.
+    """Reverse fixed-size-chunk scan for the latest task_started/
+    task_complete/turn_aborted event_msg record within byte range
+    [floor, end) of `path` - walking backward from `end` one
+    _CODEX_TAIL_BYTES chunk at a time until a marker is found or `floor` is
+    reached. The caller decides what "nothing in this range" means: no
+    marker exists at all (the cold/full scan, floor=0), or nothing NEWER
+    than an already-known one (the incremental scan, floor=last confirmed
+    resume point). Shared by _codex_tail_turn_state_scan and
+    _codex_tail_turn_state_delta.
+
+    Every single `read()` call this makes is <= _CODEX_TAIL_BYTES,
+    regardless of how far back in the file (or how large the file) the walk
+    must go - a round-2 rework fix. The prior version doubled a SINGLE
+    read's size on every escalation with no cap, so a cold scan of a large
+    rollout with no nearby marker could allocate a read approaching the
+    entire scanned range (observed: ~1.68GB). Reading in constant-size,
+    non-overlapping, strictly-backward chunks instead means the largest
+    single allocation is one chunk plus whatever partial line is still
+    unterminated (see `tail_fragment` below) - bounded by the size of the
+    one JSONL record straddling a chunk boundary, not by the file or range.
 
     Also returns `resume_from`: the offset where the LAST (possibly
-    incomplete) line in the bytes actually read begins. A write landing
-    between another process's stat()/read() calls can leave the file's exact
-    byte count mid-line (most likely for the >1MB single-record tool-output
-    case); resuming a later scan from the raw byte count would then read
-    only that line's tail half, fail to parse it, and silently lose whatever
-    marker it was. Resuming from `resume_from` instead re-reads that small
-    trailing fragment together with whatever completes it, so the full
-    record is seen intact once the write finishes. In the overwhelmingly
-    common case (the file's last byte is already a newline) this is just
-    `end`, unchanged from before.
+    incomplete) line within [floor, end) begins, as measured from the FIRST
+    (EOF-anchored) chunk only. A write landing between another process's
+    stat()/read() calls can leave the file's exact byte count mid-line
+    (most likely for the >1MB single-record tool-output case); resuming a
+    later scan from the raw byte count would then read only that line's
+    tail half, fail to parse it, and silently lose whatever marker it was.
+    Resuming from `resume_from` instead re-reads that small trailing
+    fragment together with whatever completes it, so the full record is
+    seen intact once the write finishes. In the overwhelmingly common case
+    (the file's last byte is already a newline) this is just `end`.
     """
     if end <= floor:
         return None, floor
-    window = _CODEX_TAIL_BYTES
-    while True:
-        offset = max(floor, end - window)
-        try:
-            with path.open("rb") as handle:
-                handle.seek(offset)
-                chunk = handle.read(end - offset)
-        except OSError:
-            return None, floor
-        lines = chunk.split(b"\n")
-        if offset > floor:
-            lines = lines[1:]  # seeked mid-file: first line may be truncated
-        latest: tuple[str, float] | None = None
-        for line in lines:
+    try:
+        handle = path.open("rb")
+    except OSError:
+        return None, floor
+    with handle:
+        position = end
+        # The still-incomplete line at the START of the most-recently-read
+        # (more EOF-ward) chunk - its true start lies further back in the
+        # file, so it is prefixed onto the NEXT (earlier) chunk's data
+        # rather than parsed on its own. Can grow past one chunk only when
+        # a single JSONL record itself straddles more than one chunk
+        # boundary (the giant tool-output-blob case) - bounded by that
+        # record's own size, not by the range being scanned.
+        tail_fragment = b""
+        resume_from = end
+        first_chunk = True
+        while True:
+            read_size = min(_CODEX_TAIL_BYTES, position - floor)
+            position -= read_size
             try:
-                record = json.loads(line)
-            except ValueError:
-                continue
-            if record.get("type") != "event_msg":
-                continue
-            kind = (record.get("payload") or {}).get("type")
-            if kind not in _CODEX_TURN_EVENTS:
-                continue
-            try:
-                epoch = datetime.fromisoformat(
-                    str(record.get("timestamp")).replace("Z", "+00:00")
-                ).timestamp()
-            except (ValueError, AttributeError):
-                continue
-            if latest is None or epoch >= latest[1]:
-                latest = (kind, epoch)
-        last_newline = chunk.rfind(b"\n")
-        resume_from = offset if last_newline == -1 else offset + last_newline + 1
-        if latest is not None or offset <= floor:
-            # A window that reached the floor with nothing found is a real
-            # "no marker here", not a signal to keep growing - only an empty
-            # window that could plausibly be hiding a marker just past its
-            # edge escalates, and it keeps escalating (no ceiling) until it
-            # either finds one or reaches the floor.
-            return latest, resume_from
-        window *= 4
+                handle.seek(position)
+                chunk = handle.read(read_size)
+            except OSError:
+                return None, floor
+            combined = chunk + tail_fragment
+            if first_chunk:
+                last_newline = chunk.rfind(b"\n")
+                resume_from = (
+                    position if last_newline == -1 else position + last_newline + 1
+                )
+                first_chunk = False
+            if position <= floor:
+                lines = combined.split(b"\n")
+                tail_fragment = b""
+            else:
+                parts = combined.split(b"\n")
+                tail_fragment = parts[0]  # may still be incomplete; carried back
+                lines = parts[1:]
+            latest: tuple[str, float] | None = None
+            for line in lines:
+                marker = _codex_parse_turn_marker_line(line)
+                if marker is not None and (latest is None or marker[1] >= latest[1]):
+                    latest = marker
+            if latest is not None or position <= floor:
+                # A chunk that reached the floor with nothing found is a
+                # real "no marker here", not a signal to keep walking back -
+                # only an empty chunk that could plausibly be hiding a
+                # marker just past its edge continues, and it keeps going
+                # (no ceiling) until it either finds one or reaches the
+                # floor.
+                return latest, resume_from
 
 
 def _codex_tail_turn_state_scan(
