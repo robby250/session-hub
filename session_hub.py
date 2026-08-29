@@ -518,16 +518,45 @@ def env_int(value, fallback: int) -> int:
         return int(fallback)
 
 
+_TMUX_NAME_UNSAFE = re.compile(r"[.:]")
+
+
+def sanitize_tmux_session_name(name: str) -> str:
+    """Replace characters tmux treats as target-spec separators ('.' between
+    window/pane, ':' between session/window) with '_'.
+
+    Passed a name containing either, `tmux new-session -s` silently CREATES
+    the session under the substituted name instead of erroring - so a caller
+    that goes on to use the original, unsanitized name for `has-session`/
+    `attach` (as tmux_group_launch_command's script does for every launch,
+    not just the one that created the session) targets a name that was never
+    actually created. `attach` then fails with "can't find session", the
+    surrounding `exec` fails, and the launched agent ends up running headless
+    in a tmux session no window ever attaches to - reproduced live with a
+    Codex model slug like "gpt-5.6-luna": every dotted model name silently
+    became a no-visible-effect "New" click. Applying the same substitution
+    tmux performs BEFORE we ever call it keeps the name we use, the name tmux
+    actually assigns, and the name stored as this session's address (Codex
+    has no --name; the tmux session name IS it) identical.
+    """
+    return _TMUX_NAME_UNSAFE.sub("_", name)
+
+
 def suggest_session_name(
     directory: Path | None, model_alias: str | None, existing_names: set[str]
 ) -> str:
     """`<dirname>-<model>` for a model's first row in a group, `-2`/`-3`/...
     for further rows of the same model - a starting point only, since the
     name field stays freely editable in the dialogs that call this.
+
+    Pre-sanitized for tmux (see sanitize_tmux_session_name) so a dotted model
+    slug (routine for Codex, e.g. "gpt-5.6-luna") never even appears as a
+    suggestion that would later mismatch the real tmux session name.
     """
     base = (directory.name if directory else "") or "session"
     if model_alias:
         base = f"{base}-{model_alias}"
+    base = sanitize_tmux_session_name(base)
     if base not in existing_names:
         return base
     suffix = 2
@@ -2393,6 +2422,7 @@ def tmux_group_launch_command(name: str, cwd: str, claude_args: list[str]) -> li
     wired up for tmux-launched sessions (deliberately out of scope for this
     pass - see SessionHub.launch_group_row_via_tmux).
     """
+    name = sanitize_tmux_session_name(name)
     terminal = shutil.which("gnome-terminal")
     if not terminal:
         raise RuntimeError("Launching into tmux currently requires gnome-terminal.")
@@ -3671,6 +3701,136 @@ def executable(name: str) -> str:
         return found
     local = HOME / ".local" / "bin" / name
     return str(local)
+
+
+# The canonical VAMPULSE-game checkout. `~/.codex/config.toml`'s
+# `[mcp_servers.vampulse]` block is a flat, unconditional GLOBAL entry with
+# no per-project scoping of its own, so every Codex session loads it
+# regardless of cwd - confirmed live: a session launched into plain
+# ~/projects logged `MCP client for 'vampulse' failed to start`. Session Hub
+# is the only thing that knows which cwd a launch is headed for, so scoping
+# has to happen here, as a launch-time argv override, never by editing that
+# global file (which would also affect every non-Session-Hub codex
+# invocation and the user's other configured MCPs).
+VAMPULSE_PROJECT_ROOT = Path("/home/user/projects/vampulse/VAMPULSE-game")
+
+
+def _resolve_real_path(path: Path) -> Path | None:
+    try:
+        return path.resolve()
+    except OSError:
+        return None
+
+
+def vampulse_governed_worktrees(root: Path = VAMPULSE_PROJECT_ROOT) -> list[Path]:
+    """Every real `git worktree` of the canonical VAMPULSE-game checkout,
+    resolved. Queried live (bounded, single subprocess, only while building a
+    Codex launch command) rather than hardcoded - the worktree set changes as
+    lanes are opened/closed and a stale hardcoded list would silently exclude
+    a currently-governed worktree or include a torn-down one.
+    """
+    resolved_root = _resolve_real_path(root)
+    if resolved_root is None or not resolved_root.is_dir():
+        return []
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=resolved_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        # ValueError/TypeError: a caller that broadly mocks subprocess.Popen
+        # to keep an unrelated test hermetic (this file does that in several
+        # places) breaks subprocess.run's own internals the same way a real
+        # git failure would look from here - either way, an unusable worktree
+        # lookup must fail CLOSED (no worktrees recognized as governed), not
+        # crash the launch it's a side-check for.
+        return []
+    worktrees = []
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            resolved = _resolve_real_path(Path(line[len("worktree "):]))
+            if resolved is not None:
+                worktrees.append(resolved)
+    return worktrees
+
+
+def vampulse_mcp_applies(cwd: str | Path) -> bool:
+    """True only when `cwd` is the canonical VAMPULSE-game checkout, inside
+    it, or inside one of its real git worktrees.
+
+    Both sides are resolved to their real filesystem path first (symlinks
+    followed, `..` collapsed) and compared with Path.is_relative_to rather
+    than a string prefix - a plain `str(cwd).startswith(str(root))` would
+    wrongly admit a textual-prefix impostor like
+    "/home/.../VAMPULSE-game-old" (which starts with the root's own string
+    but is a different directory), and would wrongly admit or reject a
+    symlink depending on which side it sits on. Fails closed (False) if the
+    canonical root doesn't exist or `cwd` can't be resolved - an
+    unrecognized or broken path never gets the MCP.
+    """
+    resolved_cwd = _resolve_real_path(Path(cwd))
+    if resolved_cwd is None:
+        return False
+    # VAMPULSE_PROJECT_ROOT passed explicitly, not left to
+    # vampulse_governed_worktrees's own default parameter: a default
+    # argument value binds to the ORIGINAL module-level object at function
+    # definition time, so a test (or any future caller) patching
+    # session_hub.VAMPULSE_PROJECT_ROOT would silently be ignored here
+    # otherwise - the function would keep resolving worktrees of the real
+    # canonical root no matter what was patched.
+    roots = [
+        root
+        for root in (
+            [_resolve_real_path(VAMPULSE_PROJECT_ROOT)]
+            + vampulse_governed_worktrees(VAMPULSE_PROJECT_ROOT)
+        )
+        if root is not None
+    ]
+    return any(resolved_cwd == root or resolved_cwd.is_relative_to(root) for root in roots)
+
+
+def codex_launch_args(
+    cwd: str,
+    *,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    danger_mode: bool = False,
+    session_id: str | None = None,
+    source_cwd: str | None = None,
+    initial_prompt: str | None = None,
+) -> list[str]:
+    """The Codex CLI argv shared by every launch path (direct terminal,
+    tmux, resume) - one place that decides model/effort/MCP-scope flags so
+    they can't drift between the direct-terminal and tmux code paths the way
+    two independently-maintained copies of this list already had (dual-write
+    class; see docs/netcode_dual_write_audit.md's game-code equivalent).
+    """
+    args = [executable("codex")]
+    if danger_mode:
+        args += ["--dangerously-bypass-approvals-and-sandbox"]
+    if model:
+        args += ["-m", model]
+    if reasoning_effort:
+        args += ["-c", f"model_reasoning_effort={reasoning_effort}"]
+    if not vampulse_mcp_applies(cwd):
+        args += ["-c", "mcp_servers.vampulse.enabled=false"]
+    if session_id:
+        # source_cwd, not cwd: `codex resume -C <dir>` silently FORKS into a
+        # brand-new near-empty thread instead of erroring when <dir> differs
+        # from the session's own root - observed directly (a cwd-drifted
+        # group row, e.g. one that cd'd into a worktree, forked twice and
+        # died with no visible output under tmux). Resuming in the session's
+        # actual directory avoids triggering that fork at all.
+        args += ["resume", "-C", source_cwd or cwd, session_id]
+    else:
+        args += ["-C", cwd]
+    if initial_prompt:
+        args += [initial_prompt]
+    return args
 
 
 def is_compatibility_link(path: Path, target: Path) -> bool:
@@ -5677,6 +5837,15 @@ class SessionHub(QMainWindow):
 
         self.new_provider = QComboBox()
         self.new_provider.addItems(PROVIDERS)
+        # PROVIDERS lists Codex first (update_new_provider_list's own
+        # fallback comment already says so), but addItems() alone leaves
+        # index 0 - Codex - selected, and that selection is "current" by the
+        # time update_new_provider_list() runs right after build_ui(), so its
+        # Claude fallback (only reached when nothing matches) never actually
+        # fires on a fresh launch. Set the real default here instead.
+        claude_index = self.new_provider.findText("Claude")
+        if claude_index >= 0:
+            self.new_provider.setCurrentIndex(claude_index)
         self.new_provider.setToolTip("Agent used for the new session")
         toolbar.addWidget(self.new_provider)
 
@@ -6932,24 +7101,15 @@ class SessionHub(QMainWindow):
             command += ["-e"]
 
         if provider == "Codex":
-            command += [executable("codex")]
-            if self.settings().get("codex_danger_mode", False):
-                command += ["--dangerously-bypass-approvals-and-sandbox"]
-            if model:
-                command += ["-m", model]
-            if reasoning_effort:
-                command += ["-c", f"model_reasoning_effort={reasoning_effort}"]
-            if session_id:
-                # launch_cwd (the session's own source_cwd when known), not
-                # cwd: `codex resume -C <dir>` silently FORKS into a new
-                # near-empty thread rather than erroring when <dir> differs
-                # from the session's actual root - see the matching comment
-                # in launch()'s tmux branch, which hits the identical issue.
-                command += ["resume", "-C", launch_cwd, session_id]
-            else:
-                command += ["-C", cwd]
-            if initial_prompt:
-                command += [initial_prompt]
+            command += codex_launch_args(
+                cwd,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                danger_mode=self.settings().get("codex_danger_mode", False),
+                session_id=session_id,
+                source_cwd=source_cwd,
+                initial_prompt=initial_prompt,
+            )
         elif provider == "Claude":
             claude_args = [executable("claude")]
             if self.settings().get("claude_danger_mode", False):
@@ -7063,28 +7223,15 @@ class SessionHub(QMainWindow):
                     # Before 2026-08-23 this branch was Claude-only, so a Codex
                     # row with "Launch in tmux" checked silently fell through to a
                     # plain gnome-terminal and tmux could not see it.
-                    claude_args = [executable("codex")]
-                    if self.settings().get("codex_danger_mode", False):
-                        claude_args += ["--dangerously-bypass-approvals-and-sandbox"]
-                    if model:
-                        claude_args += ["-m", model]
-                    if reasoning_effort:
-                        claude_args += ["-c", f"model_reasoning_effort={reasoning_effort}"]
-                    if session_id:
-                        # source_cwd, not cwd: `codex resume -C <dir>` silently
-                        # FORKS into a brand-new near-empty thread instead of
-                        # erroring when <dir> differs from the session's own
-                        # root (observed directly - a cwd-drifted group row,
-                        # e.g. one that cd'd into a worktree, forked twice and
-                        # died with no visible output under tmux). Resuming in
-                        # the session's actual directory avoids triggering
-                        # that fork at all - same reasoning terminal_command's
-                        # Claude branch already applies via its own launch_cwd.
-                        claude_args += ["resume", "-C", source_cwd or cwd, session_id]
-                    else:
-                        claude_args += ["-C", cwd]
-                    if initial_prompt:
-                        claude_args += [initial_prompt]
+                    claude_args = codex_launch_args(
+                        cwd,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
+                        danger_mode=self.settings().get("codex_danger_mode", False),
+                        session_id=session_id,
+                        source_cwd=source_cwd,
+                        initial_prompt=initial_prompt,
+                    )
                 else:
                     claude_args = [executable("claude")]
                     if self.settings().get("claude_danger_mode", False):

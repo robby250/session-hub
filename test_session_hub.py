@@ -1073,6 +1073,50 @@ class SessionHubTests(unittest.TestCase):
         launch_new.assert_called_once_with("Antigravity")
         window.close()
 
+    def test_new_session_toolbar_defaults_to_claude_not_codex(self):
+        # task-2139/row447: PROVIDERS lists Codex first, and addItems()
+        # alone leaves index 0 (Codex) selected - which is already "current"
+        # by the time update_new_provider_list() runs right after build_ui(),
+        # so its own Claude-fallback comment never actually fired on a fresh
+        # launch. A real widget test, not a string-shape assertion: this
+        # constructs the real SessionHub/QComboBox and reads back its actual
+        # selection before any interaction, the same state a "New" click
+        # would open NewSessionDialog with.
+        all_enabled = {
+            "sessions": {},
+            "settings": {
+                "enable_codex": True,
+                "enable_claude": True,
+                "enable_antigravity": True,
+            },
+        }
+        with patch("session_hub.read_metadata", return_value=all_enabled):
+            window = session_hub.SessionHub()
+        self.assertEqual(window.new_provider.currentText(), "Claude")
+        with patch.object(window, "launch_new") as launch_new:
+            window.launch_selected_provider()
+        launch_new.assert_called_once_with("Claude")
+        window.close()
+
+    def test_new_session_toolbar_retains_explicit_non_claude_choice(self):
+        # The default-to-Claude fix must not override an explicit user pick,
+        # including across an update_new_provider_list() re-population
+        # (settings toggles trigger this).
+        all_enabled = {
+            "sessions": {},
+            "settings": {
+                "enable_codex": True,
+                "enable_claude": True,
+                "enable_antigravity": True,
+            },
+        }
+        with patch("session_hub.read_metadata", return_value=all_enabled):
+            window = session_hub.SessionHub()
+        window.new_provider.setCurrentText("Codex")
+        window.update_new_provider_list()
+        self.assertEqual(window.new_provider.currentText(), "Codex")
+        window.close()
+
     def test_enter_key_resumes_selected_session(self):
         from PyQt6.QtGui import QKeySequence, QShortcut
 
@@ -1564,6 +1608,299 @@ class SessionHubTests(unittest.TestCase):
             # discriminates good from bad execution, not just that it runs something.
             bad_args = ["env", "--", "MARKER_VAR=it-worked", "bash", "-c", "echo $MARKER_VAR"]
             self.assertNotIn("it-worked", run_and_capture(bad_args))
+
+    def test_sanitize_tmux_session_name_matches_real_tmux_substitution(self):
+        # Empirically confirmed against the real tmux binary (row447): `tmux
+        # new-session -s "x.y"` silently creates a session actually named
+        # "x_y", and `tmux has-session -t "x.y"`/`attach -t "x.y"` both then
+        # fail to find it (dots/colons are session:window.pane separators in
+        # a target spec). sanitize_tmux_session_name must apply the identical
+        # substitution so a name used consistently through it never diverges
+        # from what tmux itself would call the session.
+        self.assertEqual(
+            session_hub.sanitize_tmux_session_name("gpt-5.6-luna"), "gpt-5_6-luna"
+        )
+        self.assertEqual(session_hub.sanitize_tmux_session_name("a:b.c"), "a_b_c")
+        self.assertEqual(session_hub.sanitize_tmux_session_name("plain-name"), "plain-name")
+
+    def test_suggest_session_name_pre_sanitizes_dotted_model_slugs(self):
+        # Every offered Codex model slug follows the "gpt-5.x[.y]" naming
+        # convention (dots), so this is the common case, not an edge case -
+        # the auto-suggested name must already be tmux-safe before it is ever
+        # shown in a UI field or stored as this session's address.
+        name = session_hub.suggest_session_name(
+            Path("/home/user/projects"), "gpt-5.6-luna", set()
+        )
+        self.assertEqual(name, "projects-gpt-5_6-luna")
+        self.assertNotIn(".", name)
+
+    def test_tmux_group_launch_command_sanitizes_a_raw_dotted_name(self):
+        # Defense in depth: even a caller that skips suggest_session_name
+        # (a manually-typed name, or a future call site) gets a tmux-safe
+        # name out of the one shared launch helper.
+        with patch.object(
+            session_hub.shutil, "which",
+            side_effect=lambda n: {"tmux": "/usr/bin/tmux", "gnome-terminal": "/usr/bin/gnome-terminal"}.get(n),
+        ):
+            command = session_hub.tmux_group_launch_command("gpt-5.6-luna", "/tmp", ["codex"])
+        self.assertIn("gpt-5_6-luna", command)
+        self.assertNotIn("gpt-5.6-luna", command)
+
+    def test_dotted_tmux_name_fails_end_to_end_before_the_fix_succeeds_after(self):
+        """Negative-controls the exact row447 mechanism with a hermetic fake tmux
+        that reproduces the REAL binary's confirmed behavior (see
+        test_sanitize_tmux_session_name_matches_real_tmux_substitution's docstring):
+        has-session/new-session/attach all silently apply the same dot/colon->'_'
+        substitution tmux itself does, tracked via one state file so the three
+        calls agree with each other exactly like the real daemon does.
+
+        Feeding the OLD unsanitized dotted name into all three positions (bypassing
+        today's fix) reproduces the user's report: new-session succeeds (creating
+        the substituted name), but the final `attach -t <dotted name>` cannot find
+        it, so the script exits non-zero - a real Codex process could be running
+        headless in tmux while gnome-terminal never attaches to it, i.e. "launches
+        nothing" from the user's side. Today's tmux_group_launch_command output
+        (name pre-sanitized) exits zero for the identical fake tmux and codex.
+        """
+        with tempfile.TemporaryDirectory() as fakebin_dir:
+            fakebin = Path(fakebin_dir)
+            state = fakebin / "created_name.txt"
+
+            # Models the real tmux binary's two DIFFERENT behaviors for the
+            # same string (confirmed live against /usr/bin/tmux, row447):
+            # `-s NAME` on session CREATION silently substitutes '.'/':' with
+            # '_' in the name it actually stores; but `-t NAME` on has-session/
+            # attach TARGET RESOLUTION parses '.'/':' as session:window.pane
+            # separators instead, taking only the literal text before the
+            # first one as the session part - it does NOT apply the same
+            # substitution. So querying with the original dotted string never
+            # matches the substituted name that was actually created.
+            fake_tmux = fakebin / "tmux"
+            fake_tmux.write_text(
+                "#!/bin/bash\n"
+                "substitute() { echo \"$1\" | tr '.:' '__'; }\n"
+                "session_part() { echo \"$1\" | sed -E 's/[.:].*//'; }\n"
+                'case "$1" in\n'
+                '  has-session) t=$(session_part "$3");'
+                f'    [ -f "{state}" ] && [ "$(cat "{state}")" = "$t" ] && exit 0 || exit 1 ;;\n'
+                '  new-session) n=$(substitute "$4"); echo "$n" > "%s"; exit 0 ;;\n'
+                '  attach) t=$(session_part "$3");'
+                f'    [ -f "{state}" ] && [ "$(cat "{state}")" = "$t" ] && exit 0 || exit 1 ;;\n'
+                "  set-option) exit 0 ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n" % state
+            )
+            fake_tmux.chmod(0o755)
+
+            # Unlike the no-op stub used elsewhere in this file, this fake
+            # terminal actually execs its trailing `-- CMD ARGS...` (as a
+            # real gnome-terminal ultimately runs the command it's given) so
+            # the script's final `exec "$5" --window -- "$1" attach -t "$2"`
+            # really invokes the fake tmux's `attach` branch instead of the
+            # terminal launcher silently swallowing its exit status.
+            fake_terminal = fakebin / "gnome-terminal"
+            fake_terminal.write_text(
+                "#!/bin/bash\n"
+                'while [ "$1" != "--" ]; do shift; done\n'
+                "shift\n"
+                'exec "$@"\n'
+            )
+            fake_terminal.chmod(0o755)
+
+            with patch.object(
+                session_hub.shutil, "which",
+                side_effect=lambda n: {"tmux": str(fake_tmux), "gnome-terminal": str(fake_terminal)}.get(n),
+            ):
+                fixed_command = session_hub.tmux_group_launch_command(
+                    "gpt-5.6-luna", "/tmp", ["codex", "-m", "gpt-5.6-luna"]
+                )
+
+            # Reconstruct the pre-fix shape: the raw dotted name in every
+            # position tmux_group_launch_command's script uses it.
+            buggy_command = list(fixed_command)
+            sanitized_index = buggy_command.index("gpt-5_6-luna")
+            buggy_command[sanitized_index] = "gpt-5.6-luna"
+
+            state.unlink(missing_ok=True)
+            buggy_result = subprocess.run(buggy_command, capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(
+                buggy_result.returncode, 0,
+                "the pre-fix dotted-name script should fail to attach, exactly "
+                "like the user's report",
+            )
+
+            state.unlink(missing_ok=True)
+            fixed_result = subprocess.run(fixed_command, capture_output=True, text=True, timeout=5)
+            self.assertEqual(fixed_result.returncode, 0, fixed_result.stderr)
+
+    def test_codex_launch_args_reach_the_real_child_for_default_and_every_custom_model_effort(self):
+        """Table-driven per the row447 brief: Default plus representative custom
+        Codex model/effort pairs (gpt-5.6-luna/high is the user's exact report),
+        proven at the real child argv boundary - the full tmux_group_launch_command
+        script (shlex.join -> a real shell re-parse), not just this process's own
+        string-shape assertions on the built list - via a fake `codex` that
+        records the argv it actually received.
+        """
+        with tempfile.TemporaryDirectory() as fakebin_dir:
+            fakebin = Path(fakebin_dir)
+            marker = fakebin / "argv.txt"
+
+            fake_tmux = fakebin / "tmux"
+            fake_tmux.write_text(
+                "#!/bin/bash\n"
+                'case "$1" in\n'
+                "  has-session) exit 1 ;;\n"
+                '  new-session) sh -c "${@: -1}" ; exit 0 ;;\n'
+                "  set-option) exit 0 ;;\n"
+                "  attach) exit 0 ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n"
+            )
+            fake_tmux.chmod(0o755)
+
+            fake_terminal = fakebin / "gnome-terminal"
+            fake_terminal.write_text("#!/bin/bash\nexit 0\n")
+            fake_terminal.chmod(0o755)
+
+            fake_codex = fakebin / "codex"
+            fake_codex.write_text(f'#!/bin/bash\nprintf "%s\\n" "$@" > "{marker}"\n')
+            fake_codex.chmod(0o755)
+
+            spawn_env = dict(os.environ, PATH=f"{fakebin}:{os.environ.get('PATH', '')}")
+
+            cases = [
+                ("Default", None, None),
+                ("reported failing pair", "gpt-5.6-luna", "high"),
+                ("another dotted model", "gpt-5.5", "xhigh"),
+            ]
+            for label, model, effort in cases:
+                with self.subTest(label):
+                    marker.unlink(missing_ok=True)
+                    with patch.object(session_hub, "executable", return_value=str(fake_codex)):
+                        args = session_hub.codex_launch_args(
+                            "/tmp", model=model, reasoning_effort=effort
+                        )
+                    with patch.object(
+                        session_hub.shutil, "which",
+                        side_effect=lambda n: {
+                            "tmux": str(fake_tmux), "gnome-terminal": str(fake_terminal),
+                        }.get(n),
+                    ):
+                        name = session_hub.suggest_session_name(Path("/tmp"), model, set())
+                        command = session_hub.tmux_group_launch_command(name, "/tmp", args)
+                    subprocess.run(command, env=spawn_env, timeout=5, check=True)
+                    recorded = marker.read_text(encoding="utf-8").splitlines()
+                    # Round-trip fidelity through shlex.join -> tmux -> a real
+                    # shell re-parse: the fake codex must see the exact argv
+                    # codex_launch_args built (minus argv[0], which the fake
+                    # binary itself replaces).
+                    self.assertEqual(recorded, args[1:])
+                    if model:
+                        self.assertIn(model, recorded)
+                    if effort:
+                        self.assertIn(f"model_reasoning_effort={effort}", recorded)
+
+    def _make_vampulse_fixture(self):
+        """A REAL temp git repo standing in for the canonical VAMPULSE-game
+        checkout, with one REAL `git worktree` of it - not mocked, since
+        vampulse_mcp_applies's whole job is resolving real filesystem paths
+        (symlinks, `..`) and vampulse_governed_worktrees's is parsing real
+        `git worktree list --porcelain` output. Returns
+        (canonical_root, governed_worktree, cleanup_dir) and patches
+        session_hub.VAMPULSE_PROJECT_ROOT to canonical_root for the caller's
+        remaining scope (caller must use it inside a `with` on the returned
+        patcher or call .stop() itself - done via addCleanup below).
+        """
+        base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        canonical_root = base / "VAMPULSE-game"
+        canonical_root.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=canonical_root, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit",
+             "--allow-empty", "-q", "-m", "init"],
+            cwd=canonical_root, check=True,
+        )
+        worktree = base / "worktrees" / "vamp-worker9"
+        worktree.parent.mkdir(parents=True)
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "vamp-worker9", str(worktree)],
+            cwd=canonical_root, check=True,
+        )
+        patcher = patch.object(session_hub, "VAMPULSE_PROJECT_ROOT", canonical_root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return canonical_root, worktree, base
+
+    def test_vampulse_mcp_applies_admits_canonical_root_subdir_and_governed_worktree(self):
+        canonical_root, worktree, _base = self._make_vampulse_fixture()
+        self.assertTrue(session_hub.vampulse_mcp_applies(canonical_root))
+        self.assertTrue(session_hub.vampulse_mcp_applies(canonical_root / "docs"))
+        self.assertTrue(session_hub.vampulse_mcp_applies(worktree))
+
+    def test_vampulse_mcp_applies_excludes_sibling_and_textual_prefix_impostor(self):
+        canonical_root, _worktree, base = self._make_vampulse_fixture()
+        sibling = base / "other-project"
+        sibling.mkdir()
+        self.assertFalse(session_hub.vampulse_mcp_applies(sibling))
+
+        # Same parent directory, a name that starts with the canonical root's
+        # own string but is a different directory - Path.is_relative_to must
+        # be used, not `str(cwd).startswith(str(root))`.
+        impostor = base / (canonical_root.name + "-old")
+        impostor.mkdir()
+        self.assertFalse(session_hub.vampulse_mcp_applies(impostor))
+
+    def test_vampulse_mcp_applies_excludes_a_symlink_that_escapes_the_root(self):
+        canonical_root, _worktree, base = self._make_vampulse_fixture()
+        outside = base / "outside-target"
+        outside.mkdir()
+        escape_link = canonical_root / "escape"
+        escape_link.symlink_to(outside, target_is_directory=True)
+        # The symlink's literal path sits inside the canonical root, but it
+        # resolves outside it - real-path resolution must catch this, a plain
+        # string-prefix check on the unresolved path would not.
+        self.assertFalse(session_hub.vampulse_mcp_applies(escape_link))
+        self.assertFalse(session_hub.vampulse_mcp_applies(escape_link / "anything"))
+
+    def test_vampulse_mcp_applies_excludes_unrelated_real_directory(self):
+        self._make_vampulse_fixture()
+        with tempfile.TemporaryDirectory() as unrelated:
+            self.assertFalse(session_hub.vampulse_mcp_applies(unrelated))
+
+    def test_vampulse_governed_worktrees_fails_closed_on_a_missing_root(self):
+        missing = Path(tempfile.mkdtemp()) / "does-not-exist"
+        self.assertEqual(session_hub.vampulse_governed_worktrees(missing), [])
+
+    def test_codex_launch_args_never_touches_the_global_codex_config_file(self):
+        # "Do not globally disable the user's other Codex MCPs" (row447 brief):
+        # scoping must be a per-launch argv override, never a config.toml edit.
+        # Proven directly - patch CODEX_CONFIG to a real file with known
+        # content and assert codex_launch_args, for both an in-scope and an
+        # out-of-scope cwd, never so much as opens it.
+        canonical_root, _worktree, base = self._make_vampulse_fixture()
+        fake_config = base / "config.toml"
+        original = "[mcp_servers.vampulse]\ncommand = \"nice\"\n"
+        fake_config.write_text(original, encoding="utf-8")
+        with patch.object(session_hub, "CODEX_CONFIG", fake_config):
+            session_hub.codex_launch_args(str(canonical_root), model="gpt-5.6-luna")
+            session_hub.codex_launch_args(str(base / "unrelated"), model="gpt-5.6-luna")
+        self.assertEqual(fake_config.read_text(encoding="utf-8"), original)
+
+    def test_codex_launch_args_scopes_vampulse_mcp_by_cwd(self):
+        canonical_root, worktree, base = self._make_vampulse_fixture()
+        in_scope = session_hub.codex_launch_args(str(canonical_root), model="gpt-5.6-luna")
+        self.assertNotIn("mcp_servers.vampulse.enabled=false", in_scope)
+
+        in_scope_worktree = session_hub.codex_launch_args(str(worktree))
+        self.assertNotIn("mcp_servers.vampulse.enabled=false", in_scope_worktree)
+
+        unrelated = base / "unrelated"
+        unrelated.mkdir()
+        out_of_scope = session_hub.codex_launch_args(str(unrelated))
+        self.assertIn("mcp_servers.vampulse.enabled=false", out_of_scope)
+        # Never a blanket MCP disable - only the vampulse server is named.
+        self.assertNotIn("mcp_servers.google_sheets.enabled=false", out_of_scope)
 
     @patch("session_hub.shutil.which")
     def test_launch_with_tmux_builds_tmux_command_and_skips_pid_capture(self, which):
@@ -5481,8 +5818,15 @@ class SessionHubTests(unittest.TestCase):
         self.assertEqual(
             command[command.index("-c") + 1], "model_reasoning_effort=high"
         )
+        # "/home/user" is outside the canonical VAMPULSE root (row447), so
+        # codex_launch_args now always adds its own "-c
+        # mcp_servers.vampulse.enabled=false" here regardless of effort -
+        # "-c" is no longer exclusively the reasoning-effort flag's marker.
         no_effort_command = window.terminal_command("Codex", None, "/home/user")
-        self.assertNotIn("-c", no_effort_command)
+        self.assertNotIn(
+            "model_reasoning_effort=", " ".join(no_effort_command)
+        )
+        self.assertIn("mcp_servers.vampulse.enabled=false", no_effort_command)
         window.close()
 
     def test_launch_passes_global_effort_flag_to_claude_command(self):
