@@ -4573,8 +4573,8 @@ class SessionHubTests(unittest.TestCase):
     def test_all_sessions_table_restored_to_six_original_columns_running_unchanged(self):
         # task-2136: task-2114 added Status/Last message to All Sessions
         # without being asked, corrupting the saved widths/order of its
-        # original six columns. Running is a different table/widget
-        # entirely and keeps its own Status/Last message unchanged.
+        # original six columns. Running is a different table/widget entirely;
+        # task-2142 later reduced it to exactly Name/Status/Last message.
         metadata = {"sessions": {}, "settings": {}, "groups": {}}
         with patch("session_hub.read_metadata", return_value=metadata):
             window = session_hub.SessionHub()
@@ -4591,9 +4591,7 @@ class SessionHubTests(unittest.TestCase):
                 window.running_table.horizontalHeaderItem(i).text()
                 for i in range(window.running_table.columnCount())
             ]
-            self.assertEqual(
-                running_headers, ["Project", "Name", "Provider", "Status", "Last message"]
-            )
+            self.assertEqual(running_headers, ["Name", "Status", "Last message"])
         finally:
             window.close()
 
@@ -7349,86 +7347,58 @@ class SessionActivityTests(unittest.TestCase):
             with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
                 window = session_hub.SessionHub()
                 window.refresh_running_tab()
-                gui_label = window.running_table.item(0, 3).text()
+                gui_label = window.running_table.item(0, 1).text()
                 window.close()
 
         self.assertEqual(json_label, "Needs input")
         self.assertEqual(gui_label, "Needs input")
 
-    def test_activity_item_activation_focuses_the_exact_live_session(self):
-        # task-2135: mounts the REAL Recent-activity widget through the real
-        # refresh_running_tab()/_refresh_activity_list() pipeline (not a
-        # hand-built dict), then activates each item and asserts the exact
-        # (cwd, name, session_id) passed to the shared Running focus
-        # authority. Covers: a live exact-identity Claude event, a second
-        # Claude row sharing the SAME row name in a different cwd (duplicate
-        # names must never conflate), a repaired Codex link row (its
-        # session_key already points at the current active member, as
-        # row433's persistence guarantees), and a stale/historical entry
-        # whose session_id belongs to no currently-running row.
+    def test_running_table_appends_muted_project_suffix_only_on_name_collision(self):
+        # task-2142: Running's Name column shows the bare row name, and only
+        # appends a project suffix when two currently-running rows share the
+        # same name (across different projects) - identity itself (provider/
+        # project/cwd) lives in the tooltip, not in every row's visible text.
         claude_a = session_hub.Session(
-            "Claude", "id-a", "t", "/tmp/vamp2135a", "/tmp/vamp2135a", 100,
+            "Claude", "id-a", "t", "/tmp/vamp2142a", "/tmp/vamp2142a", 100,
             Path("/tmp/a.jsonl"), agent_name="vamp-shared",
         )
         claude_b = session_hub.Session(
-            "Claude", "id-b", "t", "/tmp/vamp2135b", "/tmp/vamp2135b", 100,
+            "Claude", "id-b", "t", "/tmp/vamp2142b", "/tmp/vamp2142b", 100,
             Path("/tmp/b.jsonl"), agent_name="vamp-shared",
         )
-        codex_new = session_hub.Session(
-            "Codex", "new-id", "t", "/tmp/vamp2135c", "/tmp/vamp2135c", 100,
-            Path("/tmp/c.jsonl"),
+        claude_c = session_hub.Session(
+            "Claude", "id-c", "t", "/tmp/vamp2142c", "/tmp/vamp2142c", 100,
+            Path("/tmp/c.jsonl"), agent_name="vamp-solo",
         )
         metadata = {
             "settings": {},
             "sessions": {},
             "groups": {
-                "/tmp/vamp2135a": {"tmux": True, "rows": [{"name": "vamp-shared"}]},
-                "/tmp/vamp2135b": {"tmux": True, "rows": [{"name": "vamp-shared"}]},
-                "/tmp/vamp2135c": {
-                    "tmux": True,
-                    "rows": [{
-                        "name": "vamp-codex", "provider": "Codex",
-                        "session_key": "Codex:new-id",
-                    }],
-                },
+                "/tmp/vamp2142a": {"tmux": True, "rows": [{"name": "vamp-shared"}]},
+                "/tmp/vamp2142b": {"tmux": True, "rows": [{"name": "vamp-shared"}]},
+                "/tmp/vamp2142c": {"tmux": True, "rows": [{"name": "vamp-solo"}]},
             },
         }
-        statuses = [
-            ("id-a", {"state": "working", "ts": 1000, "detail": "a"}),
-            ("id-b", {"state": "working", "ts": 1000, "detail": "b"}),
-            ("new-id", {"state": "idle", "ts": 1000, "detail": ""}),
-            ("stale-ghost", {"state": "done", "ts": 1000, "detail": "long finished"}),
-        ]
         with (
             patch.object(session_hub, "read_metadata", return_value=metadata),
-            patch.object(session_hub, "claude_sessions", return_value=[claude_a, claude_b]),
-            patch.object(session_hub, "codex_sessions", return_value=[codex_new]),
+            patch.object(
+                session_hub, "claude_sessions",
+                return_value=[claude_a, claude_b, claude_c],
+            ),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
             patch.object(session_hub, "antigravity_sessions", return_value=[]),
             patch.object(session_hub, "tmux_session_alive", return_value=True),
-            patch.object(session_hub, "all_session_statuses", return_value=statuses),
         ):
             window = session_hub.SessionHub()
             try:
                 window.refresh_running_tab()
-                self.assertEqual(window.activity_list.count(), 4)
-                with patch.object(window, "_focus_or_resume_session") as focus_mock:
-                    window.activate_activity_item(window.activity_list.item(0))
-                    focus_mock.assert_called_once_with(
-                        "/tmp/vamp2135a", "vamp-shared", "id-a")
-
-                    focus_mock.reset_mock()
-                    window.activate_activity_item(window.activity_list.item(1))
-                    focus_mock.assert_called_once_with(
-                        "/tmp/vamp2135b", "vamp-shared", "id-b")
-
-                    focus_mock.reset_mock()
-                    window.activate_activity_item(window.activity_list.item(2))
-                    focus_mock.assert_called_once_with(
-                        "/tmp/vamp2135c", "vamp-codex", "new-id")
-
-                    focus_mock.reset_mock()
-                    window.activate_activity_item(window.activity_list.item(3))
-                    focus_mock.assert_not_called()
+                names = {
+                    window.running_table.item(row, 0).text()
+                    for row in range(window.running_table.rowCount())
+                }
+                self.assertIn("vamp-shared  (vamp2142a)", names)
+                self.assertIn("vamp-shared  (vamp2142b)", names)
+                self.assertIn("vamp-solo", names)
             finally:
                 window.close()
 

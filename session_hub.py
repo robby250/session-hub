@@ -51,8 +51,6 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -2877,25 +2875,6 @@ def read_session_status(session_id: str) -> dict | None:
         return None
 
 
-def all_session_statuses() -> list[tuple[str, dict]]:
-    """Every known (session_id, status) pair, newest first.
-
-    The single source both the Status column and the Recent-activity strip
-    read from - one writer (write_session_status), two readers, no separate
-    log to drift out of sync with it.
-    """
-    if not STATUS_DIR.is_dir():
-        return []
-    entries = []
-    for path in STATUS_DIR.glob("*.json"):
-        try:
-            entries.append((path.stem, json.loads(path.read_text())))
-        except (OSError, ValueError):
-            continue
-    entries.sort(key=lambda entry: entry[1].get("ts", 0), reverse=True)
-    return entries
-
-
 # Notification types that are a genuine blocker on the agent - the ONLY
 # reasons a status file may legitimately carry state="needs_input". A record
 # with state="needs_input" and a reason outside this set (or no "reason" key
@@ -3284,16 +3263,6 @@ def session_activity(
     --sessions-json, which calls this), and --sessions-json/CLI directly -
     computes it through, so no provider branch can diverge or silently
     return blank (see status_pipeline_plan.md's contract).
-
-    The recent-activity strip (_refresh_activity_list) is NOT one of these
-    callers - it is a history log of past write_session_status events, each
-    already carrying its own (state, detail, ts) from the moment it was
-    written, not a live "what is this session doing right now" readout.
-    Recomputing each historical row's CURRENT verdict here would replace what
-    the log is for (what happened, and when) with today's live state,
-    silently rewriting history on every refresh. It shares this function's
-    activity_label() vocabulary so the two surfaces render identically, but
-    intentionally not the verdict computation itself.
 
     Liveness is a separate fact from activity (also per that contract) and is
     checked here only to keep transcript parsing bounded to rows that are
@@ -6185,10 +6154,8 @@ class SessionHub(QMainWindow):
         running_page = QWidget()
         running_layout = QVBoxLayout(running_page)
         running_layout.setContentsMargins(0, 0, 0, 0)
-        self.running_table = QTableWidget(0, 5)
-        self.running_table.setHorizontalHeaderLabels(
-            ["Project", "Name", "Provider", "Status", "Last message"]
-        )
+        self.running_table = QTableWidget(0, 3)
+        self.running_table.setHorizontalHeaderLabels(["Name", "Status", "Last message"])
         self.running_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.running_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.running_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -6205,18 +6172,6 @@ class SessionHub(QMainWindow):
         stop_button.clicked.connect(self.stop_selected_running)
         running_actions.addWidget(stop_button)
         running_layout.addLayout(running_actions)
-
-        activity_label = QLabel("Recent activity")
-        activity_label.setStyleSheet("color: #888;")
-        running_layout.addWidget(activity_label)
-        self.activity_list = QListWidget()
-        self.activity_list.setMaximumHeight(160)
-        self.activity_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        # itemActivated covers both double-click (the same activation gesture Running's
-        # cellDoubleClicked uses) and Enter/Return on the current item - one signal, one
-        # handler, for both the mouse and keyboard paths (task-2135).
-        self.activity_list.itemActivated.connect(self.activate_activity_item)
-        running_layout.addWidget(self.activity_list)
 
         tabs = QTabWidget()
         tabs.addTab(all_sessions_page, "All Sessions")
@@ -6837,16 +6792,23 @@ class SessionHub(QMainWindow):
                     {"name": name, "provider": session.provider}, session,
                 ))
 
+        name_counts = collections.Counter(row["name"] for _dn, _cwd, row, _m in running)
         self.running_table.setRowCount(len(running))
         for index, (display_name, cwd, row, match) in enumerate(running):
             session_id = match.session_id if match else None
-            project_item = QTableWidgetItem(display_name)
-            project_item.setData(Qt.ItemDataRole.UserRole, (cwd, row["name"], session_id))
-            self.running_table.setItem(index, 0, project_item)
-            self.running_table.setItem(index, 1, QTableWidgetItem(row["name"]))
-            self.running_table.setItem(
-                index, 2, QTableWidgetItem(row.get("provider", "Claude"))
+            provider = row.get("provider", "Claude")
+            name_item = QTableWidgetItem(
+                row["name"]
+                if name_counts[row["name"]] <= 1
+                # A visible name collision (same row name, different project) gets a
+                # parenthetical project suffix so the two rows are distinguishable at
+                # a glance - full identity (provider/project/cwd) lives in the tooltip
+                # rather than cluttering every row with it.
+                else f"{row['name']}  ({display_name})"
             )
+            name_item.setData(Qt.ItemDataRole.UserRole, (cwd, row["name"], session_id))
+            name_item.setToolTip(f"{provider} · {display_name} · {cwd}")
+            self.running_table.setItem(index, 0, name_item)
             # Every row here is already confirmed tmux-alive (group_row_status/
             # standalone_tmux_status above), so session_activity's own liveness
             # check always passes - it still goes through the one shared verdict
@@ -6859,12 +6821,8 @@ class SessionHub(QMainWindow):
                 session_activity(match, tmux_enabled=True, tmux_name=row["name"], live_names=live_names)
                 if match else ("unknown", "")
             )
-            self.running_table.setItem(index, 3, self._status_column_item(state))
-            self.running_table.setItem(index, 4, self._detail_column_item(detail))
-        live_by_id = {
-            match.session_id: (cwd, row["name"]) for _dn, cwd, row, match in running if match
-        }
-        self._refresh_activity_list(live_by_id)
+            self.running_table.setItem(index, 1, self._status_column_item(state))
+            self.running_table.setItem(index, 2, self._detail_column_item(detail))
 
     def _status_column_item(self, state: str) -> QTableWidgetItem:
         label, color = activity_label(state)
@@ -6880,52 +6838,6 @@ class SessionHub(QMainWindow):
         if detail:
             item.setToolTip(detail)
         return item
-
-    def _refresh_activity_list(self, live_by_id: dict[str, tuple[str, str]]) -> None:
-        """Recent-activity strip: a history log of raw write_session_status
-        events (each entry's own recorded state/detail/ts), deliberately NOT
-        routed through session_activity's CURRENT-state verdict - see that
-        function's docstring for why a log of past events must not be
-        rewritten to today's live state. Shares only activity_label() so the
-        two surfaces render identically.
-
-        `live_by_id` is exactly the (cwd, name) pair the current refresh's
-        running-row resolution assigned to a session_id (task-2135) - not a
-        display-name lookup. An entry whose session_id is not a key here is
-        stale/stopped/historical: it gets no identity data at all, so
-        activate_activity_item() below is inert for it by construction
-        rather than guessing a same-name row or a different linked member.
-        """
-        self.activity_list.clear()
-        for session_id, status in all_session_statuses()[:20]:
-            label, color = activity_label(status.get("state"))
-            if not label:
-                continue
-            when = datetime.fromtimestamp(status.get("ts", 0)).strftime("%H:%M:%S")
-            detail = " ".join(status.get("detail", "").split())[:80]
-            live = live_by_id.get(session_id)
-            name = live[1] if live else session_id[:8]
-            text = f"{when}  {name}  {label}" + (f" — {detail}" if detail else "")
-            entry = QListWidgetItem(text)
-            entry.setForeground(QColor(color))
-            entry.setData(
-                Qt.ItemDataRole.UserRole,
-                (live[0], live[1], session_id) if live else None,
-            )
-            self.activity_list.addItem(entry)
-
-    def activate_activity_item(self, item: QListWidgetItem) -> None:
-        """Recent-activity double-click/Enter: focus the row's live session
-        through the exact same authority as Running (task-2135). A stale,
-        stopped or historical entry carries no identity data (see
-        _refresh_activity_list) and is inert here - it never starts a new
-        session, resumes a different linked member, or focuses an unrelated
-        same-name row."""
-        identity = item.data(Qt.ItemDataRole.UserRole)
-        if not identity:
-            return
-        cwd, name, session_id = identity
-        self._focus_or_resume_session(cwd, name, session_id)
 
     def stop_selected_running(self) -> None:
         row = self.running_table.currentRow()
