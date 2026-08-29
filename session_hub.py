@@ -87,26 +87,106 @@ METADATA_PATH = DATA_DIR / "metadata.json"
 # overwhelming majority on any given refresh - cost a single stat() call.
 _FILE_SCAN_CACHE: dict[str, tuple[tuple[float, int], dict]] = {}
 
+# task-2142: the above cache is per-process only, so a cold TUI/CLI
+# `--sessions-json` invocation - a brand-new interpreter every call -
+# re-scans every transcript from nothing. This on-disk index, keyed by path
+# identity (dev, ino) plus size/mtime, survives across process boundaries so
+# GUI, TUI and CLI (all funneling through discover_sessions()) share one
+# scanned-already record instead of each re-deriving it. A shrunk file, a
+# path whose (dev, ino) no longer matches (replaced/recreated), a corrupt
+# index file, or a schema version bump are all treated as "unseen" for the
+# affected entry (or the whole index, for corruption/schema) and rescanned -
+# never trusted, never crashed on.
+SCAN_INDEX_PATH = DATA_DIR / "scan_index.json"
+SCAN_INDEX_SCHEMA = 1
 
-def _file_signature(path: Path) -> tuple[float, int] | None:
+_PERSISTENT_SCAN_INDEX: dict[str, dict] | None = None
+_SCAN_INDEX_DIRTY = False
+
+
+def _load_persistent_scan_index() -> dict[str, dict]:
     try:
-        stat = path.stat()
+        payload = json.loads(SCAN_INDEX_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict) or payload.get("schema") != SCAN_INDEX_SCHEMA:
+        return {}
+    entries = payload.get("entries")
+    return entries if isinstance(entries, dict) else {}
+
+
+def _persistent_scan_index() -> dict[str, dict]:
+    global _PERSISTENT_SCAN_INDEX
+    if _PERSISTENT_SCAN_INDEX is None:
+        _PERSISTENT_SCAN_INDEX = _load_persistent_scan_index()
+    return _PERSISTENT_SCAN_INDEX
+
+
+def flush_persistent_scan_index() -> None:
+    """Atomically persist the on-disk scan index - called once per
+    discover_sessions() pass (the one choke point GUI refresh, TUI fetches
+    and the --sessions-json/--usage-json CLI verbs all share), not per file,
+    so a refresh touching hundreds of transcripts costs one write. A failed
+    write is swallowed: this index is a perf cache, never a correctness
+    dependency, and the next successful flush repairs it."""
+    global _SCAN_INDEX_DIRTY
+    if not _SCAN_INDEX_DIRTY or _PERSISTENT_SCAN_INDEX is None:
+        return
+    try:
+        SCAN_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SCAN_INDEX_PATH.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps({"schema": SCAN_INDEX_SCHEMA, "entries": _PERSISTENT_SCAN_INDEX}),
+            encoding="utf-8",
+        )
+        tmp.replace(SCAN_INDEX_PATH)
+        _SCAN_INDEX_DIRTY = False
     except OSError:
-        return None
-    return (stat.st_mtime, stat.st_size)
+        pass
 
 
 def _cached_file_scan(path: Path, scan) -> dict:
-    """Return scan(path) result, cached until the file's mtime/size change."""
-    signature = _file_signature(path)
-    if signature is None:
+    """Return scan(path) result, cached until the file's mtime/size change.
+
+    Two layers: the in-memory `_FILE_SCAN_CACHE` (this process's lifetime,
+    unchanged) and the on-disk `_persistent_scan_index()` (identity + size +
+    mtime, shared across process boundaries - see flush_persistent_scan_index).
+    """
+    global _SCAN_INDEX_DIRTY
+    try:
+        stat = path.stat()
+    except OSError:
         return {}
+    signature = (stat.st_mtime, stat.st_size)
     key = str(path)
+
     cached = _FILE_SCAN_CACHE.get(key)
     if cached is not None and cached[0] == signature:
         return cached[1]
+
+    index = _persistent_scan_index()
+    entry = index.get(key)
+    if (
+        entry is not None
+        and entry.get("dev") == stat.st_dev
+        and entry.get("ino") == stat.st_ino
+        and entry.get("size") == stat.st_size
+        and entry.get("mtime") == stat.st_mtime
+    ):
+        result = entry.get("result") or {}
+        _FILE_SCAN_CACHE[key] = (signature, result)
+        return result
+
     result = scan(path)
     _FILE_SCAN_CACHE[key] = (signature, result)
+    index[key] = {
+        "dev": stat.st_dev,
+        "ino": stat.st_ino,
+        "size": stat.st_size,
+        "mtime": stat.st_mtime,
+        "result": result,
+    }
+    _SCAN_INDEX_DIRTY = True
     return result
 TRASH_DIR = DATA_DIR / "trash"
 # Tracks Claude processes Session Hub itself launched, so a same-directory
@@ -2478,6 +2558,7 @@ def discover_sessions(metadata: dict) -> list[Session]:
         session for session in visible if session.native_key not in group_hidden
     ] + group_pseudo_sessions
 
+    flush_persistent_scan_index()
     return sorted(visible, key=lambda item: item.updated_ms, reverse=True)
 
 

@@ -177,6 +177,156 @@ class SessionHubTests(unittest.TestCase):
             self.assertEqual(third, {"content": "v2-longer"})
             self.assertEqual(len(calls), 2)
 
+    def _isolated_scan_index(self, tmp_dir: str):
+        """Patch SCAN_INDEX_PATH to a fresh file under tmp_dir and force the
+        next _cached_file_scan call to reload from disk instead of reusing
+        whatever another test left in the module-level singleton."""
+        index_path = Path(tmp_dir) / "scan_index.json"
+        session_hub._PERSISTENT_SCAN_INDEX = None
+        session_hub._SCAN_INDEX_DIRTY = False
+        return patch.object(session_hub, "SCAN_INDEX_PATH", index_path)
+
+    def _simulate_process_restart(self):
+        """Drop the in-memory layers only - the on-disk index (already
+        flushed) is what a brand-new TUI/CLI process would read."""
+        session_hub._FILE_SCAN_CACHE.clear()
+        session_hub._PERSISTENT_SCAN_INDEX = None
+        session_hub._SCAN_INDEX_DIRTY = False
+
+    def test_persistent_scan_index_survives_a_simulated_process_restart(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                path = Path(temp) / "data.txt"
+                path.write_text("v1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                session_hub._cached_file_scan(path, scan)
+                session_hub.flush_persistent_scan_index()
+                self.assertTrue(session_hub.SCAN_INDEX_PATH.exists())
+                self.assertEqual(len(calls), 1)
+
+                self._simulate_process_restart()
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "v1"})
+                self.assertEqual(len(calls), 1, "unchanged file must not rescan after restart")
+
+    def test_persistent_scan_index_growth_only_rescans_the_changed_entry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                path_a = Path(temp) / "a.txt"
+                path_b = Path(temp) / "b.txt"
+                path_a.write_text("a1", encoding="utf-8")
+                path_b.write_text("b1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                session_hub._cached_file_scan(path_a, scan)
+                session_hub._cached_file_scan(path_b, scan)
+                session_hub.flush_persistent_scan_index()
+                self.assertEqual(len(calls), 2)
+
+                self._simulate_process_restart()
+                os.utime(path_a, (os.path.getmtime(path_a) + 5,) * 2)
+                path_a.write_text("a1-grown", encoding="utf-8")
+
+                result_a = session_hub._cached_file_scan(path_a, scan)
+                result_b = session_hub._cached_file_scan(path_b, scan)
+                self.assertEqual(result_a, {"content": "a1-grown"})
+                self.assertEqual(result_b, {"content": "b1"})
+                self.assertEqual(len(calls), 3, "only the grown file should have rescanned")
+
+    def test_persistent_scan_index_shrink_forces_rescan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                path = Path(temp) / "data.txt"
+                path.write_text("a-long-first-version", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                session_hub._cached_file_scan(path, scan)
+                session_hub.flush_persistent_scan_index()
+
+                self._simulate_process_restart()
+                path.write_text("short", encoding="utf-8")
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "short"})
+                self.assertEqual(len(calls), 2, "a shrunk file must rescan, not trust the stale entry")
+
+    def test_persistent_scan_index_identity_change_forces_rescan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                path = Path(temp) / "data.txt"
+                path.write_text("v1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                session_hub._cached_file_scan(path, scan)
+                session_hub.flush_persistent_scan_index()
+
+                self._simulate_process_restart()
+                # Same path, same size/mtime as far as a naive check would
+                # see - but a different inode (a replaced/recreated file at
+                # the same path) must still force a rescan rather than
+                # trusting stale content from the old file.
+                index = session_hub._persistent_scan_index()
+                index[str(path)]["ino"] = -1
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "v1"})
+                self.assertEqual(len(calls), 2, "an identity mismatch must rescan, not trust the entry")
+
+    def test_persistent_scan_index_corruption_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                session_hub.SCAN_INDEX_PATH.write_text("not valid json {{{", encoding="utf-8")
+                path = Path(temp) / "data.txt"
+                path.write_text("v1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "v1"})
+                self.assertEqual(len(calls), 1)
+                # A corrupt index must never crash the flush that follows,
+                # and the flush repairs it with a clean, valid file.
+                session_hub.flush_persistent_scan_index()
+                reloaded = json.loads(session_hub.SCAN_INDEX_PATH.read_text(encoding="utf-8"))
+                self.assertEqual(reloaded["schema"], session_hub.SCAN_INDEX_SCHEMA)
+
+    def test_persistent_scan_index_schema_mismatch_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                session_hub.SCAN_INDEX_PATH.write_text(
+                    json.dumps({"schema": 999, "entries": {"bogus": {}}}),
+                    encoding="utf-8",
+                )
+                path = Path(temp) / "data.txt"
+                path.write_text("v1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "v1"})
+                self.assertEqual(len(calls), 1)
+
     def test_scan_claude_file_stops_after_max_lines(self):
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp) / "-home-user-projects-example-project"
