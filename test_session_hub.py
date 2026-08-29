@@ -6053,6 +6053,126 @@ class SessionActivityTests(unittest.TestCase):
         self.assertEqual(scan.call_count, 1)
         self.assertIsNone(second)
 
+    def test_codex_tail_delta_an_equal_size_changed_identity_file_gets_a_cold_scan(self):
+        """Negative control for identity: a same-path replacement that
+        happens to land on the SAME byte size (so a size-only check would
+        read it as "no growth, nothing to do") must still force a cold
+        scan once its (dev, ino) or mtime no longer matches what was
+        cached - trusting size alone here would silently keep serving the
+        old file's stale verdict forever."""
+        path = self._rollout([self._event(time.time(), "task_started")])
+        first = session_hub._codex_tail_turn_state(path)
+        self.assertEqual(first[0], "task_started")
+        old_size = path.stat().st_size
+
+        # "turn_aborted" is shorter than "task_started", so there is always
+        # non-negative padding room to hit the exact same byte count.
+        replacement = json.dumps(self._event(time.time(), "turn_aborted"))
+        self.assertLessEqual(len(replacement) + 1, old_size)
+        replacement = replacement + " " * (old_size - len(replacement) - 1) + "\n"
+        self.assertEqual(len(replacement), old_size)  # exact same byte count
+        path.write_text(replacement, encoding="utf-8")
+
+        with patch.object(
+            session_hub, "_codex_tail_turn_state_delta",
+            wraps=session_hub._codex_tail_turn_state_delta,
+        ) as delta:
+            second = session_hub._codex_tail_turn_state(path)
+        self.assertEqual(delta.call_count, 0)
+        self.assertEqual(second[0], "turn_aborted")
+
+    def test_codex_cold_scan_finds_a_marker_more_than_the_old_ceiling_behind_eof(self):
+        """Session Hub restarting (or seeing a rollout for the first time)
+        has no cached resume point to trust - the scan itself must find a
+        marker regardless of how far behind EOF it sits, written in ONE
+        shot so nothing is cached incrementally along the way. An
+        arbitrary finite ceiling here is exactly what reproduced the false
+        Done against the real 1.68GB live orchestrator rollout, whose
+        genuinely still-open turn's task_started sat ~20.4MB behind EOF."""
+        started = self._event(time.time(), "task_started")
+        filler = {
+            "timestamp": _iso(time.time()),
+            "type": "event_msg",
+            "payload": {"type": "item_completed", "blob": "x" * 500_000},
+        }
+        path = self._rollout([started] + [filler] * 20)  # >= 10MB in one write
+        self.assertGreater(path.stat().st_size, session_hub._CODEX_TAIL_MAX_BYTES)
+
+        result = session_hub._codex_tail_turn_state(path)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "task_started")
+
+        session = session_hub.Session("Codex", "id-cold-deep", "t", "/tmp", "/tmp", 0, path)
+        with patch.object(session_hub, "tmux_session_alive", return_value=True):
+            state, _ = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "working")
+
+    def test_codex_delta_scan_finds_a_marker_near_the_start_of_a_large_delta(self):
+        """More than the old ceiling can be appended between two GUI
+        refreshes in one burst (a flurry of tool output). A newer marker
+        sitting near the BEGINNING of that whole delta - not just its
+        tail - must still be found, checked in both directions: a turn
+        that just started, and one that completed right away with a large
+        burst of unrelated filler following it before the next look."""
+        path = self._rollout([self._event(time.time() - 100, "task_complete")])
+        first = session_hub._codex_tail_turn_state(path)
+        self.assertEqual(first[0], "task_complete")
+        size_before_burst = path.stat().st_size
+
+        filler = {
+            "timestamp": _iso(time.time()),
+            "type": "event_msg",
+            "payload": {"type": "item_completed", "blob": "x" * 500_000},
+        }
+        # Direction 1: a new task_started lands at the START of a large
+        # burst, nothing newer after it - must read as working.
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(self._event(time.time() - 90, "task_started")) + "\n")
+            for _ in range(20):
+                handle.write(json.dumps(filler) + "\n")
+        self.assertGreater(
+            path.stat().st_size - size_before_burst, session_hub._CODEX_TAIL_MAX_BYTES
+        )
+        grown = session_hub._codex_tail_turn_state(path)
+        self.assertEqual(grown[0], "task_started")
+        size_after_direction_1 = path.stat().st_size
+
+        # Direction 2: that turn completes immediately, but a SEPARATE
+        # large burst of unrelated filler follows before the next look -
+        # the task_complete near the burst's start must still win over the
+        # stale "working" carried forward from direction 1.
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(self._event(time.time() - 80, "task_complete")) + "\n")
+            for _ in range(20):
+                handle.write(json.dumps(filler) + "\n")
+        self.assertGreater(
+            path.stat().st_size - size_after_direction_1, session_hub._CODEX_TAIL_MAX_BYTES
+        )
+        finished = session_hub._codex_tail_turn_state(path)
+        self.assertEqual(finished[0], "task_complete")
+
+    def test_codex_tail_reconstructs_a_line_torn_across_two_reads(self):
+        """A write landing between another process's stat()/read() calls
+        (most likely for the >1MB single tool-output-blob case) can leave
+        the file's exact byte count mid-line. Resuming the NEXT scan from
+        that raw byte count would read only the tail half of that line,
+        fail to parse it, and silently lose whatever marker it was - the
+        scan must instead resume from before the torn line so the full
+        record is read intact once the write completes."""
+        started_json = json.dumps(self._event(time.time(), "task_started"))
+        complete_line = json.dumps(self._event(time.time() - 10, "task_complete")) + "\n"
+        path = self.temp / "torn.jsonl"
+        path.write_text(complete_line + started_json[:20], encoding="utf-8")  # no trailing \n
+
+        first = session_hub._codex_tail_turn_state(path)
+        self.assertEqual(first[0], "task_complete")  # torn line ignored, not crashed
+
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(started_json[20:] + "\n")  # completes the torn line
+
+        second = session_hub._codex_tail_turn_state(path)
+        self.assertEqual(second[0], "task_started")
+
     def test_codex_tail_cache_evicts_oldest_path_once_over_the_bound(self):
         """codex_sessions() lists every thread ever recorded (no LIMIT), so a
         long-running GUI can be asked about far more distinct rollout paths

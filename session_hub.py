@@ -2761,21 +2761,31 @@ _CODEX_TURN_EVENTS = ("task_started", "task_complete", "turn_aborted")
 _CODEX_TAIL_BYTES = 65536  # starting window - the task_started/task_complete/
 # turn_aborted markers this reads for are tiny and always the most recent
 # thing worth finding, so almost every call resolves off this one small read.
-_CODEX_TAIL_MAX_BYTES = 8 * 1024 * 1024  # escalation ceiling - a turn's own
-# tool-output lines can be arbitrarily large (a single custom_tool_call has
-# been observed over 1MB), so a FIXED 64KB tail can land entirely inside that
-# one giant record and miss a task_started sitting just before it, reading a
-# mid-turn session as stale/blank. 8MB covers that observed case with wide
-# margin while staying a tiny, bounded read next to the 1.5GB rollout files
-# this machine actually has - never a full-history scan (see session_activity).
+_CODEX_TAIL_MAX_BYTES = 8 * 1024 * 1024  # escalation STARTING-STEP reference
+# only, not a correctness ceiling - a turn's own tool-output lines can be
+# arbitrarily large (a single custom_tool_call has been observed over 1MB,
+# and a whole still-open turn's worth was observed over 20MB against a real
+# live rollout), so a FIXED 64KB tail can land entirely inside that one
+# giant record and miss a task_started sitting just before it. The
+# escalating window below keeps doubling from _CODEX_TAIL_BYTES with NO cap
+# until it reaches the range's floor - reaching this constant used to stop
+# the search and silently report "no marker", which is what turned a
+# genuinely still-open turn into a false Done. Steady-state cost stays
+# small because the cache resumes each call from near the previous read's
+# end, not from byte 0 - see _codex_tail_cache and resume_from below.
 
-# path -> (mtime_ns, size, result) at the time it was last read. A GUI refresh
-# can ask about the same live Codex session twice in one pass (the All
-# Sessions table and the Running tab are separate calls within one refresh()) -
-# keying on the file's own mtime/size rather than a refresh-cycle counter
-# means a genuinely-unchanged file is never reparsed, AND a file that changed
-# between two calls (a turn actually advancing mid-refresh) is still read
-# fresh rather than serving a stale cached verdict.
+# path -> (mtime_ns, size, (dev, ino), result, resume_from) at the time it
+# was last read. A GUI refresh can ask about the same live Codex session
+# twice in one pass (the All Sessions table and the Running tab are separate
+# calls within one refresh()) - keying on the file's own mtime/size rather
+# than a refresh-cycle counter means a genuinely-unchanged file is never
+# reparsed, AND a file that changed between two calls (a turn actually
+# advancing mid-refresh) is still read fresh rather than serving a stale
+# cached verdict. (dev, ino) is checked too, not just mtime/size: a path
+# whose underlying file was REPLACED (rotation) can coincidentally land on
+# the same size, and trusting that as "the same file, just grown" would
+# delta-scan from a resume point that belongs to a completely different
+# file's history.
 #
 # codex_sessions() lists every thread ever recorded in the Codex state DB
 # (no LIMIT), each with its own rollout_path, so a plain dict here grows one
@@ -2783,9 +2793,10 @@ _CODEX_TAIL_MAX_BYTES = 8 * 1024 * 1024  # escalation ceiling - a turn's own
 # Bounded LRU instead: only the most recently *looked up* paths (i.e. the
 # ones actually shown in a refresh) stay cached.
 _CODEX_TAIL_CACHE_MAX = 256
-_codex_tail_cache: "collections.OrderedDict[str, tuple[int, int, tuple[str, float] | None]]" = (
-    collections.OrderedDict()
-)
+_codex_tail_cache: (
+    "collections.OrderedDict[str, tuple[int, int, tuple[int, int], "
+    "tuple[str, float] | None, int]]"
+) = collections.OrderedDict()
 
 
 def _codex_tail_turn_state(path: Path) -> tuple[str, float] | None:
@@ -2795,36 +2806,52 @@ def _codex_tail_turn_state(path: Path) -> tuple[str, float] | None:
     durable evidence of an in-progress turn; "task_complete"/"turn_aborted"
     is durable evidence the last turn already ended - see
     hook_event_to_status_codex's own docstring for why Codex's `notify` alone
-    can't tell the difference. Cached per path by (mtime, size), bounded LRU -
-    see _codex_tail_cache.
+    can't tell the difference. Cached per path by (mtime, size, (dev, ino)),
+    bounded LRU - see _codex_tail_cache.
 
-    A file that GREW since the last lookup is scanned incrementally
-    (_codex_tail_turn_state_delta), not re-derived from a fresh bounded tail
-    of the new, larger end of file - the reported false-Done bug was exactly
-    that: a still-open turn's task_started, found while the file was small,
-    receded past _CODEX_TAIL_MAX_BYTES once later tool output in that SAME
-    turn kept appending, and a fresh escalating scan from the new EOF could
-    no longer see it, silently falling back to the previous turn's stale
-    "done" status. Scanning only what was appended since the last confirmed
-    read means a marker once found is never lost to later unrelated growth,
-    while a genuinely newer marker in the new bytes still wins. A shrunk or
-    unrecognized path (rotation, or never looked up before) gets the full
-    cold scan.
+    A file that GREW since the last lookup, and is confirmed to be the SAME
+    underlying file (dev+inode unchanged), is scanned incrementally
+    (_codex_tail_turn_state_delta) from that earlier read's resume_from, not
+    re-derived from byte 0 or capped at a fixed ceiling - the reported
+    false-Done bug was exactly a fixed ceiling silently discarding a
+    still-open turn's task_started once later tool output in that SAME turn
+    pushed it far enough behind EOF. A marker once found is never lost to
+    later unrelated growth; a genuinely newer marker in the new bytes still
+    wins; and an escalating search - now uncapped - still finds a marker
+    however far behind EOF it sits on a COLD look (app restart, or a rollout
+    seen for the first time), since there is no cached resume point to trust
+    yet. A same-or-smaller size, or a changed (dev, ino) identity even at an
+    unchanged/larger size (rotation), forces the full cold scan rather than
+    trusting stale delta bookkeeping.
     """
     try:
         stat = path.stat()
     except OSError:
         return None
     key = str(path)
+    identity = (stat.st_dev, stat.st_ino)
     cached = _codex_tail_cache.get(key)
-    if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+    if (
+        cached is not None
+        and cached[0] == stat.st_mtime_ns
+        and cached[1] == stat.st_size
+        and cached[2] == identity
+    ):
         _codex_tail_cache.move_to_end(key)
-        return cached[2]
-    if cached is not None and cached[1] <= stat.st_size:
-        result = _codex_tail_turn_state_delta(path, cached[1], stat.st_size, cached[2])
+        return cached[3]
+    if cached is not None and cached[2] == identity and cached[1] < stat.st_size:
+        # Strict growth of the confirmed-same file: resume from where the
+        # previous scan actually left off (its resume_from), which may sit
+        # a little before its raw old size if that read raced a torn write
+        # - see _codex_scan_range_for_turn_marker's resume_from.
+        result, resume_from = _codex_tail_turn_state_delta(
+            path, cached[4], stat.st_size, cached[3]
+        )
     else:
-        result = _codex_tail_turn_state_scan(path, stat.st_size)
-    _codex_tail_cache[key] = (stat.st_mtime_ns, stat.st_size, result)
+        result, resume_from = _codex_tail_turn_state_scan(path, stat.st_size)
+    _codex_tail_cache[key] = (
+        stat.st_mtime_ns, stat.st_size, identity, result, resume_from,
+    )
     _codex_tail_cache.move_to_end(key)
     if len(_codex_tail_cache) > _CODEX_TAIL_CACHE_MAX:
         _codex_tail_cache.popitem(last=False)
@@ -2833,19 +2860,30 @@ def _codex_tail_turn_state(path: Path) -> tuple[str, float] | None:
 
 def _codex_scan_range_for_turn_marker(
     path: Path, floor: int, end: int
-) -> tuple[str, float] | None:
+) -> tuple[tuple[str, float] | None, int]:
     """Escalating-window scan for the latest task_started/task_complete/
     turn_aborted event_msg record within byte range [floor, end) of `path`,
-    doubling the trailing window from _CODEX_TAIL_BYTES up to
-    _CODEX_TAIL_MAX_BYTES (or `floor`, whichever the window reaches first).
-    Returns None if nothing is found before that - the caller decides what
-    "nothing in this range" means: no marker exists at all (the cold/full
-    scan, floor=0), or nothing NEWER than an already-known one (the
-    incremental scan, floor=last confirmed offset). Shared by
+    doubling the trailing window from _CODEX_TAIL_BYTES with no upper cap
+    until it reaches `floor` (or a marker is found first) - the caller
+    decides what "nothing in this range" means: no marker exists at all
+    (the cold/full scan, floor=0), or nothing NEWER than an already-known
+    one (the incremental scan, floor=last confirmed resume point). Shared by
     _codex_tail_turn_state_scan and _codex_tail_turn_state_delta.
+
+    Also returns `resume_from`: the offset where the LAST (possibly
+    incomplete) line in the bytes actually read begins. A write landing
+    between another process's stat()/read() calls can leave the file's exact
+    byte count mid-line (most likely for the >1MB single-record tool-output
+    case); resuming a later scan from the raw byte count would then read
+    only that line's tail half, fail to parse it, and silently lose whatever
+    marker it was. Resuming from `resume_from` instead re-reads that small
+    trailing fragment together with whatever completes it, so the full
+    record is seen intact once the write finishes. In the overwhelmingly
+    common case (the file's last byte is already a newline) this is just
+    `end`, unchanged from before.
     """
     if end <= floor:
-        return None
+        return None, floor
     window = _CODEX_TAIL_BYTES
     while True:
         offset = max(floor, end - window)
@@ -2854,7 +2892,7 @@ def _codex_scan_range_for_turn_marker(
                 handle.seek(offset)
                 chunk = handle.read(end - offset)
         except OSError:
-            return None
+            return None, floor
         lines = chunk.split(b"\n")
         if offset > floor:
             lines = lines[1:]  # seeked mid-file: first line may be truncated
@@ -2877,22 +2915,27 @@ def _codex_scan_range_for_turn_marker(
                 continue
             if latest is None or epoch >= latest[1]:
                 latest = (kind, epoch)
-        if latest is not None or offset <= floor or window >= _CODEX_TAIL_MAX_BYTES:
-            # A window that reached the floor or the escalation ceiling with
-            # nothing found is a real "no marker here", not a signal to keep
-            # growing - only an empty window that could plausibly be hiding
-            # a marker just past its edge escalates.
-            return latest
-        window = min(window * 4, _CODEX_TAIL_MAX_BYTES)
+        last_newline = chunk.rfind(b"\n")
+        resume_from = offset if last_newline == -1 else offset + last_newline + 1
+        if latest is not None or offset <= floor:
+            # A window that reached the floor with nothing found is a real
+            # "no marker here", not a signal to keep growing - only an empty
+            # window that could plausibly be hiding a marker just past its
+            # edge escalates, and it keeps escalating (no ceiling) until it
+            # either finds one or reaches the floor.
+            return latest, resume_from
+        window *= 4
 
 
-def _codex_tail_turn_state_scan(path: Path, size: int) -> tuple[str, float] | None:
+def _codex_tail_turn_state_scan(
+    path: Path, size: int
+) -> tuple[tuple[str, float] | None, int]:
     return _codex_scan_range_for_turn_marker(path, 0, size)
 
 
 def _codex_tail_turn_state_delta(
     path: Path, start: int, end: int, prior: tuple[str, float] | None
-) -> tuple[str, float] | None:
+) -> tuple[tuple[str, float] | None, int]:
     """Only the bytes appended since the last confirmed read (`start` to
     `end`) can contain a marker newer than `prior` - everything below
     `start` was already accounted for by an earlier call. Falls back to
@@ -2900,8 +2943,8 @@ def _codex_tail_turn_state_delta(
     early in a still-open turn survives however much unrelated tool output
     that same turn goes on to emit after it.
     """
-    found = _codex_scan_range_for_turn_marker(path, start, end)
-    return found if found is not None else prior
+    found, resume_from = _codex_scan_range_for_turn_marker(path, start, end)
+    return (found if found is not None else prior), resume_from
 
 
 def _codex_activity(session: "Session", status: dict | None) -> tuple[str, str]:
