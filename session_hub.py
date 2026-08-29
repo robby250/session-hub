@@ -167,13 +167,14 @@ def _cached_file_scan(path: Path, scan) -> dict:
     index = _persistent_scan_index()
     entry = index.get(key)
     if (
-        entry is not None
+        isinstance(entry, dict)
         and entry.get("dev") == stat.st_dev
         and entry.get("ino") == stat.st_ino
         and entry.get("size") == stat.st_size
         and entry.get("mtime") == stat.st_mtime
+        and isinstance(entry.get("result"), dict)
     ):
-        result = entry.get("result") or {}
+        result = entry["result"]
         _FILE_SCAN_CACHE[key] = (signature, result)
         return result
 

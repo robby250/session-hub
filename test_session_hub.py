@@ -287,6 +287,70 @@ class SessionHubTests(unittest.TestCase):
                 self.assertEqual(result, {"content": "v1"})
                 self.assertEqual(len(calls), 2, "an identity mismatch must rescan, not trust the entry")
 
+    def test_persistent_scan_index_scalar_entry_rescans_instead_of_crashing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                path = Path(temp) / "data.txt"
+                path.write_text("v1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                index = session_hub._persistent_scan_index()
+                index[str(path)] = "corrupt"
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "v1"})
+                self.assertEqual(len(calls), 1, "a scalar entry must rescan, not crash on .get()")
+
+    def test_persistent_scan_index_list_entry_rescans_instead_of_crashing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                path = Path(temp) / "data.txt"
+                path.write_text("v1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                index = session_hub._persistent_scan_index()
+                index[str(path)] = ["corrupt"]
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "v1"})
+                self.assertEqual(len(calls), 1, "a list entry must rescan, not crash on .get()")
+
+    def test_persistent_scan_index_malformed_result_rescans_and_repairs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                path = Path(temp) / "data.txt"
+                path.write_text("v1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                stat = path.stat()
+                index = session_hub._persistent_scan_index()
+                index[str(path)] = {
+                    "dev": stat.st_dev,
+                    "ino": stat.st_ino,
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "result": "corrupt",
+                }
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "v1"})
+                self.assertEqual(len(calls), 1, "a non-dict result must rescan, not be trusted")
+
+                session_hub.flush_persistent_scan_index()
+                self._simulate_process_restart()
+                result_again = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result_again, {"content": "v1"})
+                self.assertEqual(len(calls), 1, "the flush must repair the entry so it caches clean")
+
     def test_persistent_scan_index_corruption_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp:
             with self._isolated_scan_index(temp):
