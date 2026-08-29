@@ -6124,6 +6124,12 @@ class SessionHub(QMainWindow):
         self.usage_widgets: dict[str, list[tuple[QLabel, QProgressBar, QLabel]]] = {}
         self.usage_headers: dict[str, QLabel] = {}
         self.usage_workers: dict[str, UsageWorker] = {}
+        # task-2142: compact one-line usage summary (label + tiny bar per
+        # enabled provider). The full per-window grid is now the "Expand"
+        # detail view, hidden until the user opens it - deliberately not a
+        # saved setting, so every launch starts compact.
+        self.usage_compact_labels: dict[str, QLabel] = {}
+        self.usage_compact_bars: dict[str, QProgressBar] = {}
         self.thread_pool = QThreadPool.globalInstance()
         self.group_dialogs: dict[str, "ManageGroupDialog"] = {}
         # task-2142: per-tmux-session-name pane census cache, keyed by the same
@@ -6221,8 +6227,32 @@ class SessionHub(QMainWindow):
             toolbar.addWidget(button)
         layout.addLayout(toolbar)
 
+        usage_compact = QHBoxLayout()
+        usage_compact.setSpacing(10)
+        for provider in PROVIDERS:
+            label = QLabel(provider)
+            label.setStyleSheet("font-size: 11px; color: #aaa;")
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setTextVisible(False)
+            bar.setFixedSize(60, 8)
+            bar.setToolTip("Loading…")
+            usage_compact.addWidget(label)
+            usage_compact.addWidget(bar)
+            self.usage_compact_labels[provider] = label
+            self.usage_compact_bars[provider] = bar
+        usage_compact.addStretch(1)
+        self.usage_expand_button = QPushButton("Expand")
+        self.usage_expand_button.setCheckable(True)
+        self.usage_expand_button.toggled.connect(self.set_usage_expanded)
+        usage_compact.addWidget(self.usage_expand_button)
+        layout.addLayout(usage_compact)
+
         usage_frame = QFrame()
         usage_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        usage_frame.setVisible(False)
+        self.usage_detail_frame = usage_frame
         usage_layout = QGridLayout(usage_frame)
         usage_layout.setContentsMargins(12, 8, 12, 8)
         usage_layout.setHorizontalSpacing(18)
@@ -6409,6 +6439,15 @@ class SessionHub(QMainWindow):
                     label.setVisible(enabled)
                     bar.setVisible(enabled)
                     detail.setVisible(enabled)
+            if provider in self.usage_compact_labels:
+                self.usage_compact_labels[provider].setVisible(enabled)
+                self.usage_compact_bars[provider].setVisible(enabled)
+
+    def set_usage_expanded(self, expanded: bool) -> None:
+        """Transient only - never written to settings, so every fresh
+        launch (or window reload) starts back in the compact view."""
+        self.usage_detail_frame.setVisible(expanded)
+        self.usage_expand_button.setText("Collapse" if expanded else "Expand")
 
     def update_new_provider_list(self) -> None:
         settings = self.settings()
@@ -6637,6 +6676,11 @@ class SessionHub(QMainWindow):
                 bar.setFormat("Loading…")
                 bar.setStyleSheet("")
                 detail.setText("")
+            if provider in self.usage_compact_bars:
+                compact_bar = self.usage_compact_bars[provider]
+                compact_bar.setValue(0)
+                compact_bar.setStyleSheet("")
+                compact_bar.setToolTip("Loading…")
             worker = UsageWorker(provider)
             worker.signals.finished.connect(self.usage_loaded)
             self.usage_workers[provider] = worker
@@ -6728,6 +6772,36 @@ class SessionHub(QMainWindow):
                     "QProgressBar { text-align: center; } "
                     f"QProgressBar::chunk {{ background-color: {color}; }}"
                 )
+        self._sync_usage_compact(provider, error)
+
+    def _sync_usage_compact(self, provider: str, error: str) -> None:
+        """Mirror the worst (most-used) visible window onto the compact
+        one-line bar; the reset/pace detail lives in its tooltip instead of
+        the always-visible full grid this replaces."""
+        compact_bar = self.usage_compact_bars.get(provider)
+        if compact_bar is None:
+            return
+        worst: tuple[int, str] | None = None
+        tooltip_lines = []
+        for label, bar, detail in self.usage_widgets[provider]:
+            if bar.isHidden():
+                continue
+            if "% left" in bar.format():
+                remaining = bar.value()
+                if worst is None or remaining < worst[0]:
+                    worst = (remaining, bar.styleSheet())
+                detail_text = detail.text().replace("\n", " · ")
+                tooltip_lines.append(f"{label.text()}: {bar.format()} ({detail_text})")
+            elif "requests" in bar.format():
+                tooltip_lines.append(f"{label.text()}: {bar.format()} ({detail.text()})")
+        if worst is not None:
+            compact_bar.setValue(worst[0])
+            compact_bar.setStyleSheet(worst[1])
+        elif error:
+            compact_bar.setValue(0)
+            compact_bar.setStyleSheet("")
+        compact_bar.setToolTip("\n".join(tooltip_lines) if tooltip_lines else (error or "Unavailable"))
+
     @staticmethod
     def set_usage_row_visible(
         row: tuple[QLabel, QProgressBar, QLabel], visible: bool

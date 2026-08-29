@@ -369,6 +369,79 @@ class SessionHubTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_usage_panel_starts_compact_with_no_saved_preference(self):
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertTrue(window.usage_detail_frame.isHidden())
+            self.assertEqual(window.usage_expand_button.text(), "Expand")
+            self.assertNotIn("usage_expanded", window.settings())
+        finally:
+            window.close()
+
+    def test_usage_expand_button_toggles_detail_frame_transiently(self):
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            window.usage_expand_button.setChecked(True)
+            self.assertFalse(window.usage_detail_frame.isHidden())
+            self.assertEqual(window.usage_expand_button.text(), "Collapse")
+            window.usage_expand_button.setChecked(False)
+            self.assertTrue(window.usage_detail_frame.isHidden())
+            self.assertNotIn("usage_expanded", window.settings())
+        finally:
+            window.close()
+
+    def test_usage_compact_bar_mirrors_worst_visible_window(self):
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            def make(name, pct):
+                return session_hub.UsageWindow(name, pct, "Resets later")
+
+            window.usage_loaded(
+                "Claude", [make("5-hour", 10), make("Weekly", 60)], ""
+            )
+            compact_bar = window.usage_compact_bars["Claude"]
+            # 5-hour is 10% used (90 remaining), Weekly is 60% used (40
+            # remaining) - the compact bar mirrors the worst (lowest
+            # remaining), and both windows' detail lives in its tooltip.
+            self.assertEqual(compact_bar.value(), 40)
+            self.assertIn("5-hour", compact_bar.toolTip())
+            self.assertIn("Weekly", compact_bar.toolTip())
+        finally:
+            window.close()
+
+    def test_usage_compact_widgets_follow_provider_enable_visibility(self):
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": False, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            window.update_usage_visibility()
+            self.assertTrue(window.usage_compact_bars["Codex"].isHidden())
+            self.assertFalse(window.usage_compact_bars["Claude"].isHidden())
+        finally:
+            window.close()
+
     def test_usage_pace_flags_usage_ahead_of_even_allocation(self):
         now = datetime(2026, 6, 19, 12, 0)
         reset = now + timedelta(days=5)
