@@ -2798,6 +2798,79 @@ def tmux_live_session_names() -> frozenset[str]:
     return frozenset(line for line in result.stdout.splitlines() if line)
 
 
+def tmux_pane_activity_snapshot() -> dict[str, tuple[str, str]]:
+    """One bounded `tmux list-panes -a` call: {session_name: (pane_id, window_activity)}.
+
+    `window_activity` is tmux's own last-output timestamp for the pane's window --
+    free (already tracked by the tmux server for every pane, no opt-in option
+    needed), so comparing it against a previous snapshot tells us whether a pane's
+    content changed since last look without ever calling capture-pane. task-2142's
+    "capture only changed panes" requirement is built on this: a session whose
+    window_activity is unchanged needs no fresh capture at all.
+    """
+    tmux = shutil.which("tmux")
+    if not tmux:
+        return {}
+    try:
+        result = subprocess.run(
+            [tmux, "list-panes", "-a", "-F", "#{session_name}\t#{pane_id}\t#{window_activity}"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if result.returncode != 0:
+        return {}
+    snapshot: dict[str, tuple[str, str]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        name, pane_id, activity = parts
+        # A tmux session can have several windows/panes; the group-row/standalone
+        # launch paths always create exactly one, but if more than one somehow
+        # exists for a name, keep the FIRST (list-panes' own window/pane order),
+        # not the last -- deterministic rather than whichever happened to sort last.
+        snapshot.setdefault(name, (pane_id, activity))
+    return snapshot
+
+
+def capture_changed_panes(pane_ids: dict[str, str]) -> dict[str, str]:
+    """Batch-capture several panes' text in ONE tmux client invocation.
+
+    `pane_ids` maps an arbitrary key (here, the tmux session name) to its %pane-id.
+    tmux's CLI accepts several commands chained by a literal ';' argv token in one
+    invocation; injecting a unique `display-message -p <marker>` between each
+    `capture-pane -p` gives an unambiguous split point in the combined stdout, so N
+    changed panes cost exactly one subprocess spawn -- never N -- matching the
+    brief's "batch all changed pane IDs into one bounded tmux client invocation."
+    """
+    tmux = shutil.which("tmux")
+    if not tmux or not pane_ids:
+        return {}
+    marker = f"@@@SHPANE-{uuid.uuid4().hex}@@@"
+    args = [tmux]
+    for index, pane_id in enumerate(pane_ids.values()):
+        if index > 0:
+            args += [";", "display-message", "-p", marker, ";"]
+        args += ["capture-pane", "-p", "-t", pane_id]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if result.returncode != 0:
+        return {}
+    parts = result.stdout.split(marker)
+    keys = list(pane_ids.keys())
+    if len(parts) != len(keys):
+        # A capture that failed mid-batch (a pane vanished between the census and
+        # this call) desynchronizes the split count -- fail closed to no update
+        # rather than mis-attributing one pane's text to another's cache entry.
+        return {}
+    return dict(zip(keys, parts))
+
+
 def tmux_session_alive(name: str, live_names: frozenset[str] | None = None) -> bool:
     """Is a tmux session named `name` currently alive.
 
@@ -6053,6 +6126,12 @@ class SessionHub(QMainWindow):
         self.usage_workers: dict[str, UsageWorker] = {}
         self.thread_pool = QThreadPool.globalInstance()
         self.group_dialogs: dict[str, "ManageGroupDialog"] = {}
+        # task-2142: per-tmux-session-name pane census cache, keyed by the same
+        # `row["name"]` the rest of the Running machinery already uses. Persists
+        # across refresh_running_tab calls so an unchanged pane costs zero
+        # capture-pane invocations (window_activity alone tells us it changed).
+        self._pane_activity_cache: dict[str, str] = {}
+        self._pane_block_cache: dict[str, str] = {}
         self.setWindowTitle("Session Hub")
         self.setWindowIcon(
             QIcon(str(APP_ICON)) if APP_ICON.is_file() else QIcon.fromTheme("utilities-terminal")
@@ -6080,8 +6159,29 @@ class SessionHub(QMainWindow):
         self._codex_notify_warned = False
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(2000)
-        self._status_timer.timeout.connect(self.refresh_running_tab)
+        self._status_timer.timeout.connect(self._on_running_status_tick)
         self._status_timer.start()
+
+    def _running_tab_visible(self) -> bool:
+        """task-2142: the tmux census (session-level list-sessions AND the pane-level
+        activity/capture below) only earns its cost while a human could actually see
+        the result -- window minimized or another tab selected means nobody is
+        looking, so skip the whole tick rather than just the capture step."""
+        return (
+            not self.isMinimized()
+            and self.main_tabs.currentIndex() == self.main_tabs.indexOf(self.running_page)
+        )
+
+    def _on_running_status_tick(self) -> None:
+        if self._running_tab_visible():
+            self.refresh_running_tab()
+
+    def _on_main_tab_changed(self, _index: int) -> None:
+        # Refresh immediately on becoming visible instead of leaving the table up to
+        # 2s stale after a tab switch -- cheap (one refresh), and it's exactly the
+        # moment a capture is now worth paying for.
+        if self._running_tab_visible():
+            self.refresh_running_tab()
 
     def build_ui(self) -> None:
         root = QWidget()
@@ -6260,6 +6360,9 @@ class SessionHub(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(all_sessions_page, "All Sessions")
         tabs.addTab(running_page, "Running")
+        self.main_tabs = tabs
+        self.running_page = running_page
+        tabs.currentChanged.connect(self._on_main_tab_changed)
         layout.addWidget(tabs, 1)
         self.setCentralWidget(root)
 
@@ -6876,6 +6979,24 @@ class SessionHub(QMainWindow):
                     {"name": name, "provider": session.provider}, session,
                 ))
 
+        # task-2142: Last-message census. One list-panes call for every row's
+        # window_activity; only names whose activity changed since the cached value
+        # get captured, and every changed name is captured in ONE batched tmux
+        # invocation (capture_changed_panes), not one spawn per row.
+        pane_snapshot = tmux_pane_activity_snapshot()
+        changed_pane_ids: dict[str, str] = {}
+        for _dn, _cwd, row, _m in running:
+            entry = pane_snapshot.get(row["name"])
+            if not entry:
+                continue
+            pane_id, activity = entry
+            if self._pane_activity_cache.get(row["name"]) != activity:
+                changed_pane_ids[row["name"]] = pane_id
+        captured = capture_changed_panes(changed_pane_ids)
+        for name, raw_text in captured.items():
+            self._pane_block_cache[name] = extract_last_meaningful_block(raw_text)
+            self._pane_activity_cache[name] = pane_snapshot[name][1]
+
         name_counts = collections.Counter(row["name"] for _dn, _cwd, row, _m in running)
         self.running_table.setRowCount(len(running))
         for index, (display_name, cwd, row, match) in enumerate(running):
@@ -6901,12 +7022,16 @@ class SessionHub(QMainWindow):
             # JSON verdicts for the same session. Read-only: refresh must never
             # write status itself (status_pipeline_plan.md's contract) - the
             # only writer is the hook pipeline (write_session_status).
-            state, detail = (
+            state, _detail = (
                 session_activity(match, tmux_enabled=True, tmux_name=row["name"], live_names=live_names)
                 if match else ("unknown", "")
             )
             self.running_table.setItem(index, 1, self._status_column_item(state))
-            self.running_table.setItem(index, 2, self._detail_column_item(detail))
+            # Last message is the latest meaningful terminal-output block (the pane
+            # census above), never session_activity's status detail -- the brief's
+            # explicit distinction (task-2142).
+            last_message = self._pane_block_cache.get(row["name"], "")
+            self.running_table.setItem(index, 2, self._detail_column_item(last_message))
 
     def _status_column_item(self, state: str) -> QTableWidgetItem:
         label, color = activity_label(state)

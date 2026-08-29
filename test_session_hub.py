@@ -7649,12 +7649,17 @@ class SessionActivityTests(unittest.TestCase):
             ):
                 self.assertTrue(session_hub.tmux_session_alive("VAMP-x"))
 
-    def test_refresh_running_tab_makes_one_tmux_subprocess_call_for_n_rows(self):
+    def test_refresh_running_tab_makes_o1_tmux_subprocess_calls_for_n_rows(self):
         """group_row_status and session_activity used to each call
         tmux_session_alive independently - 2 subprocess spawns per row, times
         N rows. refresh_running_tab must take one tmux_live_session_names()
         snapshot per refresh and every row reuses it (see the `live_names`
-        param threaded through group_row_status/session_activity)."""
+        param threaded through group_row_status/session_activity).
+
+        task-2142 adds a second bounded census (tmux_pane_activity_snapshot,
+        one list-panes -a call) and, on a cold cache where every row's pane
+        looks changed, ONE batched capture_changed_panes call covering all N
+        panes -- three tmux calls total for 5 rows, never 3*N."""
         rows = [
             {"name": f"VAMP-{i}", "provider": "Claude", "session_key": f"Claude:id-{i}"}
             for i in range(5)
@@ -7681,8 +7686,13 @@ class SessionActivityTests(unittest.TestCase):
             calls.append(list(argv))
             result = MagicMock()
             result.returncode = 0
+            result.stdout = ""
             if argv[1] == "list-sessions":
                 result.stdout = "\n".join(row["name"] for row in rows) + "\n"
+            elif argv[1] == "list-panes":
+                result.stdout = "".join(
+                    f"{row['name']}\t%{i}\t1788000000\n" for i, row in enumerate(rows)
+                )
             return result
 
         with (
@@ -7705,8 +7715,140 @@ class SessionActivityTests(unittest.TestCase):
             window.close()
 
         tmux_calls = [c for c in calls if c and c[0] == "/usr/bin/tmux"]
-        self.assertEqual(len(tmux_calls), 1)
+        self.assertEqual(len(tmux_calls), 3)
         self.assertEqual(tmux_calls[0][1], "list-sessions")
+        self.assertEqual(tmux_calls[1][1], "list-panes")
+        # The third call is capture_changed_panes' single batched invocation, not
+        # 5 separate ones -- one "capture-pane" per pane inside it, chained by
+        # literal ';' argv tokens, still exactly one subprocess.run().
+        self.assertEqual(tmux_calls[2][1], "capture-pane")
+        self.assertEqual(tmux_calls[2].count("capture-pane"), 5)
+
+    def test_refresh_running_tab_second_call_captures_nothing_when_unchanged(self):
+        """A second refresh with identical window_activity values must add no
+        capture-pane call at all -- the cached block is reused untouched."""
+        rows = [{"name": "VAMP-0", "provider": "Claude", "session_key": "Claude:id-0"}]
+        session_hub.METADATA_PATH.write_text(
+            json.dumps({
+                "settings": {},
+                "sessions": {},
+                "groups": {"/tmp/vamp": {"tmux": True, "rows": rows}},
+            }),
+            encoding="utf-8",
+        )
+        sessions = [
+            session_hub.Session(
+                "Claude", "id-0", "s0", "/tmp/vamp", "/tmp/vamp", 100, Path("/tmp/s0.jsonl"),
+            )
+        ]
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            if argv[1] == "list-sessions":
+                result.stdout = "VAMP-0\n"
+            elif argv[1] == "list-panes":
+                result.stdout = "VAMP-0\t%0\t1788000000\n"
+            elif argv[1] == "capture-pane":
+                result.stdout = "● first meaningful message\n"
+            return result
+
+        with (
+            patch.object(session_hub, "claude_sessions", return_value=sessions),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.shutil, "which", return_value="/usr/bin/tmux"),
+            patch.object(session_hub.subprocess, "run", side_effect=fake_run),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            window.refresh_running_tab()
+            first_message = window._pane_block_cache.get("VAMP-0")
+            calls.clear()
+            window.refresh_running_tab()
+            second_message = window._pane_block_cache.get("VAMP-0")
+            window.close()
+
+        capture_calls = [c for c in calls if c and c[0] == "/usr/bin/tmux" and "capture-pane" in c]
+        self.assertEqual(capture_calls, [])
+        self.assertEqual(first_message, second_message)
+        self.assertIn("first meaningful message", first_message)
+
+    def test_status_tick_skips_the_census_when_running_tab_not_current(self):
+        """task-2142: the periodic 2s tick must do NOTHING -- not even the cheap
+        list-sessions census -- while Running isn't the visible tab."""
+        with (
+            patch.object(session_hub, "claude_sessions", return_value=[]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            try:
+                window.main_tabs.setCurrentIndex(0)  # All Sessions, not Running
+                with patch.object(window, "refresh_running_tab") as refresh:
+                    window._on_running_status_tick()
+                refresh.assert_not_called()
+            finally:
+                window.close()
+
+    def test_status_tick_skips_the_census_when_window_minimized(self):
+        with (
+            patch.object(session_hub, "claude_sessions", return_value=[]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            try:
+                window.main_tabs.setCurrentIndex(1)  # Running IS current...
+                with (
+                    patch.object(window, "isMinimized", return_value=True),  # ...but minimized
+                    patch.object(window, "refresh_running_tab") as refresh,
+                ):
+                    window._on_running_status_tick()
+                refresh.assert_not_called()
+            finally:
+                window.close()
+
+    def test_status_tick_runs_the_census_when_running_tab_visible(self):
+        with (
+            patch.object(session_hub, "claude_sessions", return_value=[]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            try:
+                window.main_tabs.setCurrentIndex(1)
+                with (
+                    patch.object(window, "isMinimized", return_value=False),
+                    patch.object(window, "refresh_running_tab") as refresh,
+                ):
+                    window._on_running_status_tick()
+                refresh.assert_called_once()
+            finally:
+                window.close()
+
+    def test_switching_to_running_tab_refreshes_immediately(self):
+        """Becoming visible must not wait up to 2s for the next timer tick."""
+        with (
+            patch.object(session_hub, "claude_sessions", return_value=[]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            try:
+                window.main_tabs.setCurrentIndex(0)
+                with patch.object(window, "refresh_running_tab") as refresh:
+                    window.main_tabs.setCurrentIndex(1)
+                refresh.assert_called_once()
+            finally:
+                window.close()
 
 
 # Real `tmux capture-pane -p -t VAMP-worker1` dump, 2026-08-29 -- a live Claude Code
