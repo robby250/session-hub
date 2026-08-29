@@ -1,9 +1,11 @@
+import atexit
 import contextlib
 import io
 import os
 import json
 import subprocess
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -14,9 +16,33 @@ from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# task-2134: a per-test METADATA_PATH/PID_DIR patch is not a sufficient
+# safety boundary - a scope escape, a direct test-method invocation that
+# skips setUp(), or a delayed Qt close firing after the patch context has
+# exited can still resolve session_hub's module-level path constants to the
+# real, unpatched value (this is exactly how the row434 test overwrote the
+# user's live metadata.json). Forcing XDG_DATA_HOME to a fresh,
+# process-owned directory before session_hub is ever imported makes every
+# path constant derived from DATA_DIR (METADATA_PATH, PID_DIR, STATUS_DIR,
+# METADATA_BACKUP_DIR, TRASH_DIR, ...) sandboxed for the lifetime of this
+# process, independent of any later patch scope. Only the directory created
+# here is ever removed - a caller-provided XDG_DATA_HOME, if any, is
+# overridden in-process but never touched on disk.
+_TEST_XDG_DATA_HOME = tempfile.mkdtemp(prefix="session-hub-test-xdg-")
+os.environ["XDG_DATA_HOME"] = _TEST_XDG_DATA_HOME
+atexit.register(shutil.rmtree, _TEST_XDG_DATA_HOME, ignore_errors=True)
+
 from PyQt6.QtWidgets import QApplication
 
 import session_hub
+
+# Captured before any per-test patch.start() can shadow them (setUp() below
+# patches session_hub.METADATA_PATH/PID_DIR for defense-in-depth on every
+# test), so the sandbox-membership check has the module's true unpatched
+# default to compare against rather than whichever test happens to be
+# running.
+_ORIGINAL_METADATA_PATH = session_hub.METADATA_PATH
+_ORIGINAL_PID_DIR = session_hub.PID_DIR
 
 
 class SessionHubTests(unittest.TestCase):
@@ -3393,6 +3419,83 @@ class SessionHubTests(unittest.TestCase):
                     dialog.close()
             finally:
                 window.close()
+
+    def test_module_data_paths_all_share_the_forced_test_sandbox_root(self):
+        # task-2134: every module-level mutable data path must be born inside
+        # the process-wide XDG_DATA_HOME sandbox forced at import time (top of
+        # this file) - protecting METADATA_PATH alone while a sibling live
+        # path (e.g. the backup dir) stays exposed is the same class of bug.
+        sandbox = Path(_TEST_XDG_DATA_HOME)
+        for path in (
+            session_hub.DATA_DIR,
+            _ORIGINAL_METADATA_PATH,
+            _ORIGINAL_PID_DIR,
+            session_hub.STATUS_DIR,
+            session_hub.METADATA_BACKUP_DIR,
+            session_hub.TRASH_DIR,
+        ):
+            self.assertTrue(
+                path.is_relative_to(sandbox),
+                f"{path} escapes the forced test sandbox {sandbox}",
+            )
+
+    def test_metadata_writes_never_escape_the_test_process_sandbox(self):
+        # task-2134: replays the exact incident. The row434 leak was NOT a
+        # normal unittest run - setUp()'s METADATA_PATH patch was always the
+        # outer scope in that path and would have caught the write anyway.
+        # The brief names the real trigger: "a scope escape, direct
+        # test-method invocation ... can run after that mock ends" - i.e.
+        # the test method executed WITHOUT going through TestCase.run(), so
+        # setUp() (and its METADATA_PATH/PID_DIR patch) never fires and the
+        # dialog.close() write hits whatever session_hub.METADATA_PATH
+        # resolves to at import time. A caller/production XDG root ("live"
+        # data, sentinel below) is present in the child's environment; the
+        # harness script below instantiates the previously-leaking test
+        # and calls it directly, exactly reproducing that bypass. The
+        # top-of-file XDG_DATA_HOME override must force session_hub onto its
+        # own private sandbox at import time - before setUp ever would have
+        # run - so the sentinel stays byte-identical regardless.
+        sentinel_root = tempfile.mkdtemp(prefix="session-hub-test-sentinel-")
+        self.addCleanup(shutil.rmtree, sentinel_root, ignore_errors=True)
+        sentinel_metadata_dir = Path(sentinel_root) / "session-hub"
+        sentinel_metadata_dir.mkdir()
+        sentinel_metadata = sentinel_metadata_dir / "metadata.json"
+        sentinel_bytes = (
+            b'{"sessions": {"Claude:live-real": {"name": "the users real session"}}, '
+            b'"settings": {}, "sentinel": "must-stay-byte-identical"}'
+        )
+        sentinel_metadata.write_bytes(sentinel_bytes)
+
+        harness = (
+            "import os\n"
+            "os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')\n"
+            "import test_session_hub as m\n"
+            "from PyQt6.QtWidgets import QApplication\n"
+            "_app = QApplication.instance() or QApplication([])\n"
+            "tc = m.SessionHubTests(\n"
+            "    'test_matched_sessions_prefers_row_identity_over_stale_native_key_override'\n"
+            ")\n"
+            # Deliberately skip tc.setUp() - this is the direct
+            # test-method invocation the brief names as the real leak path.
+            "tc.test_matched_sessions_prefers_row_identity_over_stale_native_key_override()\n"
+        )
+
+        env = dict(os.environ)
+        env["XDG_DATA_HOME"] = sentinel_root
+        result = subprocess.run(
+            [sys.executable, "-c", harness],
+            cwd=str(Path(__file__).resolve().parent),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            sentinel_metadata.read_bytes(),
+            sentinel_bytes,
+            "the sentinel 'live' metadata.json was modified by the test subprocess",
+        )
 
     def test_matched_sessions_populates_linked_keys_from_metadata_links(self):
         # claude_sessions() is raw and never applies metadata["links"], so
