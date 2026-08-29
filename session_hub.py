@@ -1947,6 +1947,7 @@ def find_group_member_session(
     cwd: str,
     sessions: list[Session],
     exclude_keys: frozenset[str] = frozenset(),
+    linked_session_keys: frozenset[str] = frozenset(),
 ) -> Session | None:
     """The live session a saved group row refers to, if launched.
 
@@ -1959,6 +1960,14 @@ def find_group_member_session(
        already unambiguous identity, and a long-running agent's own cwd can
        legitimately drift (cd into a worktree, a subdirectory, etc.) without
        that meaning the row now belongs to a different session.
+    1b. If step 1 found nothing AND `session_key` is itself a member of some
+       link (`linked_session_keys`, from every metadata["links"] members
+       list), the row's identity is under link management, not a fresh
+       row - resolve_link_active having returned None for that link (every
+       member gone) means genuinely orphaned. Fail closed here rather than
+       falling through to step 2, or a same-cwd/same-agent-name sibling
+       that was never part of this row's link gets silently resumed in its
+       place.
     2. `--name` (Session.agent_name, parsed from the transcript's own agent-name
        record - see _scan_claude_file) plus cwd - the bootstrap match, used before
        any session_key has been recorded (a row's first launch). Claude-only:
@@ -2008,6 +2017,8 @@ def find_group_member_session(
         )
         if match:
             return match
+        if session_key in linked_session_keys:
+            return None
     if provider == "Claude":
         return next(
             (
@@ -2020,6 +2031,19 @@ def find_group_member_session(
             None,
         )
     return None
+
+
+def all_linked_member_keys(metadata: dict) -> frozenset[str]:
+    """Every native key named in ANY link's members list, alive or gone -
+    lets find_group_member_session tell a genuinely orphaned link (its
+    session_key was link-tracked, every member is now gone) from a row
+    that never had a link, so only the latter may fall back to the loose
+    name+cwd match."""
+    return frozenset(
+        key
+        for link in metadata.get("links", {}).values()
+        for key in link.get("members", [])
+    )
 
 
 def resolve_link_active(link: dict, by_key: dict[str, "Session"]) -> "Session | None":
@@ -2059,6 +2083,11 @@ def linked_aware_sessions(sessions: list["Session"], links: dict) -> list["Sessi
         hidden.update(members)
         active = resolve_link_active(link, by_key)
         if active:
+            # Mutates the link dict in place (a live reference into
+            # metadata["links"], not a copy) so a repaired active member
+            # survives past this one call - group_row_candidates persists
+            # it. Mirrors discover_sessions's own repair-write below.
+            link["active"] = active.native_key
             active.linked_keys = members
             active_sessions.append(active)
     return [
@@ -2082,7 +2111,16 @@ def group_row_candidates(metadata: dict, settings: dict) -> list[Session]:
         live += codex_sessions()
     if settings.get("enable_antigravity", True):
         live += antigravity_sessions()
-    return linked_aware_sessions(live, metadata.get("links", {}))
+    links = metadata.get("links", {})
+    before = {key: link.get("active") for key, link in links.items()}
+    candidates = linked_aware_sessions(live, links)
+    # A resume/launch invoked directly (CLI/TUI) may be the first call this
+    # process makes - it never goes through discover_sessions's own repair
+    # write, so linked_aware_sessions's in-place repair above must be
+    # persisted here or it re-derives from scratch, silently, every call.
+    if any(link.get("active") != before.get(key) for key, link in links.items()):
+        write_metadata(metadata)
+    return candidates
 
 
 def resolve_pending_codex_group_rows(metadata: dict, sessions: list[Session]) -> bool:
@@ -2138,18 +2176,28 @@ def discover_sessions(metadata: dict) -> list[Session]:
 
     hidden = set()
     visible_linked = []
+    links_changed = False
     for logical_key, link in metadata.setdefault("links", {}).items():
         members = tuple(link.get("members", []))
         active = resolve_link_active(link, by_key)
         hidden.update(members)
         if not active:
             continue
+        # resolve_link_active only SELECTS a repair; persist it here so the
+        # next read (a CLI resume with no prior discover_sessions call) sees
+        # the corrected member instead of re-deriving the same repair from
+        # scratch every time link["active"] itself is never updated.
+        if link.get("active") != active.native_key:
+            link["active"] = active.native_key
+            links_changed = True
         active.logical_key = logical_key
         active.linked_keys = members
         custom = overrides.get(logical_key, {})
         active.title = custom.get("name") or active.title
         active.cwd = custom.get("cwd") or active.cwd
         visible_linked.append(active)
+    if links_changed:
+        write_metadata(metadata)
     visible = [
         session for session in sessions if session.native_key not in hidden
     ] + visible_linked
@@ -7542,7 +7590,10 @@ class SessionHub(QMainWindow):
         # which used to fall through to "no history" and start a duplicate
         # fresh conversation instead of resuming the real one.
         candidates = group_row_candidates(self.metadata, self.settings())
-        history = find_group_member_session(row, cwd, candidates)
+        history = find_group_member_session(
+            row, cwd, candidates,
+            linked_session_keys=all_linked_member_keys(self.metadata),
+        )
         if history is not None:
             return self.resume_group_row(cwd, name)
         # No session_is_tracked_alive gate here: that "Running" read is only
@@ -7612,7 +7663,10 @@ class SessionHub(QMainWindow):
         # a link's current target, which is the "resume opens an older
         # linked rollout" bug this row exists to fix.
         candidates = group_row_candidates(self.metadata, self.settings())
-        live = find_group_member_session(row, cwd, candidates)
+        live = find_group_member_session(
+            row, cwd, candidates,
+            linked_session_keys=all_linked_member_keys(self.metadata),
+        )
         if not live:
             return {"status": "error", "message": f"{name!r} has no history to resume"}
         # live.provider, not row.get("provider"): a cross-provider link

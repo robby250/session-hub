@@ -2315,6 +2315,37 @@ class SessionHubTests(unittest.TestCase):
             )
         )
 
+    def test_find_group_member_session_falls_back_to_name_match_without_link_guard(self):
+        # Control for the audit rework: with no linked_session_keys passed,
+        # a session_key naming an orphaned link member (every member gone)
+        # still falls through to the loose name+cwd match below and wrongly
+        # picks an unrelated sibling that merely shares this row's
+        # agent_name - the exact old behavior the fail-closed test that
+        # follows replaces.
+        sibling = session_hub.Session(
+            "Claude", "sibling-id", "t", "/tmp/vamp", "/tmp/vamp", 500,
+            Path("/tmp/sibling.jsonl"), agent_name="vamp-s1",
+        )
+        match = session_hub.find_group_member_session(
+            {"provider": "Claude", "name": "vamp-s1", "session_key": "Claude:gone"},
+            "/tmp/vamp",
+            [sibling],
+        )
+        self.assertEqual(match.native_key, "Claude:sibling-id")
+
+    def test_find_group_member_session_fails_closed_when_session_key_is_orphaned_link_member(self):
+        sibling = session_hub.Session(
+            "Claude", "sibling-id", "t", "/tmp/vamp", "/tmp/vamp", 500,
+            Path("/tmp/sibling.jsonl"), agent_name="vamp-s1",
+        )
+        match = session_hub.find_group_member_session(
+            {"provider": "Claude", "name": "vamp-s1", "session_key": "Claude:gone"},
+            "/tmp/vamp",
+            [sibling],
+            linked_session_keys=frozenset({"Claude:gone"}),
+        )
+        self.assertIsNone(match)
+
     def test_find_group_member_session_filters_by_row_provider(self):
         sessions = [
             session_hub.Session(
@@ -4151,6 +4182,112 @@ class SessionHubTests(unittest.TestCase):
                     result = window.resume_group_row("/tmp/vamp", "VAMP-worker4")
                 launch.assert_not_called()
                 self.assertEqual(result["status"], "error")
+            finally:
+                window.close()
+
+    def test_resume_group_row_rejects_stale_name_duplicate_from_orphaned_link_sibling(self):
+        # Audit rework of test_resume_group_row_rejects_stale_name_duplicate_
+        # from_other_provider: that test keeps the real exact-match session
+        # present, so it passes on ordinary exact-key precedence without
+        # ever reaching the name+cwd fallback. Here the row's link has every
+        # member gone and the only live Claude session is an unrelated
+        # sibling sharing this row's agent_name/cwd - see the
+        # find_group_member_session control test proving the old fallback
+        # would have picked it.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "links": {
+                    "manual:s1": {
+                        "members": ["Claude:gone1", "Claude:gone2"],
+                        "active": "Claude:gone1",
+                    }
+                },
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [{
+                            "name": "vamp-s1",
+                            "provider": "Claude",
+                            "override_key": "group:/tmp/vamp#vamp-s1",
+                            "session_key": "Claude:gone1",
+                        }],
+                    }
+                },
+            }
+            sibling = session_hub.Session(
+                "Claude", "unrelated-sibling", "vamp-s1", "/tmp/vamp", "/tmp/vamp", 999,
+                Path("/tmp/sibling.jsonl"), agent_name="vamp-s1",
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.claude_sessions", return_value=[sibling]),
+                    patch("session_hub.codex_sessions", return_value=[]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    result = window.resume_group_row("/tmp/vamp", "vamp-s1")
+                launch.assert_not_called()
+                self.assertEqual(result["status"], "error")
+            finally:
+                window.close()
+
+    def test_resume_group_row_persists_repaired_link_active_to_metadata_file(self):
+        # Audit rework: resolve_link_active only SELECTS a repair; it was
+        # never written back, so metadata.json kept naming the deleted
+        # member forever and a CLI resume run (no prior GUI refresh)
+        # re-derived the same repair from scratch on every call. Assert by
+        # reloading the actual written file, not the in-memory dict.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata_path = Path(temp) / "metadata.json"
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "links": {
+                    "manual:worker": {
+                        "members": ["Codex:old-rollout", "Codex:deleted", "Codex:newest"],
+                        "active": "Codex:deleted",
+                    }
+                },
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [{
+                            "name": "VAMP-worker4",
+                            "provider": "Codex",
+                            "override_key": "group:/tmp/vamp#VAMP-worker4",
+                            "session_key": "Codex:old-rollout",
+                        }],
+                    }
+                },
+            }
+            old = session_hub.Session(
+                "Codex", "old-rollout", "VAMP-worker4", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/old.jsonl"),
+            )
+            newest = session_hub.Session(
+                "Codex", "newest", "VAMP-worker4", "/tmp/vamp", "/tmp/vamp", 900,
+                Path("/tmp/newest.jsonl"),
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch.object(session_hub.SessionHub, "launch"),
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.codex_sessions", return_value=[old, newest]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", metadata_path),
+                ):
+                    window.resume_group_row("/tmp/vamp", "VAMP-worker4")
+                on_disk = json.loads(metadata_path.read_text())
+                self.assertEqual(
+                    on_disk["links"]["manual:worker"]["active"], "Codex:newest"
+                )
             finally:
                 window.close()
 
