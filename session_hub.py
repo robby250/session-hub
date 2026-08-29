@@ -542,6 +542,22 @@ def sanitize_tmux_session_name(name: str) -> str:
     return _TMUX_NAME_UNSAFE.sub("_", name)
 
 
+def tmux_exact_target(name: str) -> str:
+    """A tmux `-t` target spec that matches `name` EXACTLY, never as a prefix.
+
+    Real isolated-tmux control (row447 second rework): with only session
+    `foo2` live, `tmux has-session -t foo` exits 0 - tmux's default target
+    resolution accepts an unambiguous PREFIX match, so a stale/wrong name
+    can still see, stop, inspect, rename or attach to a live session it
+    only starts with. The `=` prefix on a target's session-name component
+    (tmux's own exact-match syntax) disables that: `-t =foo` does NOT match
+    `foo2`. Every `-t` argument built from a canonicalized name must go
+    through this, or canonicalizing the name alone still leaves target
+    resolution fuzzy.
+    """
+    return f"={name}"
+
+
 def suggest_session_name(
     directory: Path | None, model_alias: str | None, existing_names: set[str]
 ) -> str:
@@ -1976,10 +1992,12 @@ def rename_tmux_session(old: str, new: str) -> bool:
     if not tmux or old == new:
         return False
     try:
-        has = subprocess.run([tmux, "has-session", "-t", old], capture_output=True, timeout=5)
+        has = subprocess.run(
+            [tmux, "has-session", "-t", tmux_exact_target(old)], capture_output=True, timeout=5
+        )
         if has.returncode != 0:
             return False
-        done = subprocess.run([tmux, "rename-session", "-t", old, new],
+        done = subprocess.run([tmux, "rename-session", "-t", tmux_exact_target(old), new],
                               capture_output=True, timeout=5)
         return done.returncode == 0
     except (OSError, subprocess.SubprocessError):
@@ -2516,14 +2534,20 @@ def tmux_group_launch_command(name: str, cwd: str, claude_args: list[str]) -> li
     # by ctrl-click-launching two group rows together (VAMPULSE-orchestrator + a worker), where the
     # window ended up titled for one row while actually attached to the other's tmux session. The
     # non-tmux path (terminal_command) already forces this for the same reason.
+    # `-t "=$2"`, not `-t "$2"`: tmux's default target resolution accepts an
+    # unambiguous PREFIX match (real isolated-tmux control, row447 second
+    # rework: with only "foo2" live, `has-session -t foo` exits 0) - the `=`
+    # prefix forces an exact match, so this script's has-session/attach never
+    # silently binds to a DIFFERENT, merely-prefixed session. See
+    # tmux_exact_target.
     return [
         "bash",
         "-c",
-        '"$1" has-session -t "$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
+        '"$1" has-session -t "=$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
         ' "$1" set-option -g set-titles on >/dev/null;'
         ' "$1" set-option -g set-titles-string "#S" >/dev/null;'
         ' "$1" set-option -g focus-events on >/dev/null;'
-        ' exec "$5" --window -- "$1" attach -t "$2"',
+        ' exec "$5" --window -- "$1" attach -t "=$2"',
         "session-hub",
         tmux,
         name,
@@ -2672,7 +2696,7 @@ def tmux_session_alive(name: str, live_names: frozenset[str] | None = None) -> b
         return False
     try:
         result = subprocess.run(
-            [tmux, "has-session", "-t", name],
+            [tmux, "has-session", "-t", tmux_exact_target(name)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=2,
@@ -2711,7 +2735,7 @@ def codex_tmux_native_key(
         return None
     try:
         panes = subprocess.run(
-            [tmux, "list-panes", "-t", name, "-F", "#{pane_pid}"],
+            [tmux, "list-panes", "-t", tmux_exact_target(name), "-F", "#{pane_pid}"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -2772,7 +2796,7 @@ def stop_tmux_session(name: str) -> None:
     if not tmux:
         return
     subprocess.run(
-        [tmux, "kill-session", "-t", name],
+        [tmux, "kill-session", "-t", tmux_exact_target(name)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

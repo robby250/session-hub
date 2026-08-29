@@ -1454,11 +1454,15 @@ class SessionHubTests(unittest.TestCase):
             [
                 "bash",
                 "-c",
-                '"$1" has-session -t "$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
+                # row447 second rework: `-t "=$2"`, not `-t "$2"` - tmux's
+                # default target resolution accepts an unambiguous PREFIX
+                # match, so a bare name could bind to a different,
+                # merely-prefixed session (see tmux_exact_target).
+                '"$1" has-session -t "=$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
                 ' "$1" set-option -g set-titles on >/dev/null;'
                 ' "$1" set-option -g set-titles-string "#S" >/dev/null;'
                 ' "$1" set-option -g focus-events on >/dev/null;'
-                ' exec "$5" --window -- "$1" attach -t "$2"',
+                ' exec "$5" --window -- "$1" attach -t "=$2"',
                 "session-hub",
                 "/usr/bin/tmux",
                 "vamp-sonnet1",
@@ -1679,7 +1683,11 @@ class SessionHubTests(unittest.TestCase):
             fake_tmux.write_text(
                 "#!/bin/bash\n"
                 "substitute() { echo \"$1\" | tr '.:' '__'; }\n"
-                "session_part() { echo \"$1\" | sed -E 's/[.:].*//'; }\n"
+                # Strips a leading '=' (tmux_exact_target's exact-match marker,
+                # row447 second rework) before the existing dot/colon-target
+                # truncation, so this stub still parses the -t value the same
+                # way the real tmux target-spec grammar does.
+                "session_part() { echo \"$1\" | sed -E 's/^=//; s/[.:].*//'; }\n"
                 'case "$1" in\n'
                 '  has-session) t=$(session_part "$3");'
                 f'    [ -f "{state}" ] && [ "$(cat "{state}")" = "$t" ] && exit 0 || exit 1 ;;\n'
@@ -1867,7 +1875,11 @@ class SessionHubTests(unittest.TestCase):
             fake_tmux = fakebin / "tmux"
             fake_tmux.write_text(
                 "#!/bin/bash\n"
-                "session_part() { echo \"$1\" | sed -E 's/[.:].*//'; }\n"
+                # Strips a leading '=' (tmux_exact_target's exact-match marker,
+                # row447 second rework) before the existing dot/colon-target
+                # truncation, so this stub still parses the -t value the same
+                # way the real tmux target-spec grammar does.
+                "session_part() { echo \"$1\" | sed -E 's/^=//; s/[.:].*//'; }\n"
                 'case "$1" in\n'
                 '  kill-session) t=$(session_part "$3");'
                 f'    [ -f "{state}" ] && [ "$(cat "{state}")" = "$t" ] && rm -f "{state}" && exit 0 || exit 1 ;;\n'
@@ -1899,6 +1911,74 @@ class SessionHubTests(unittest.TestCase):
                 # case exits 1 regardless of target, so this only proves no
                 # crash on the unsafe literal and a clean None result).
                 self.assertIsNone(session_hub.codex_tmux_native_key("foo.bar"))
+
+    def test_tmux_exact_target_prevents_a_stale_prefix_name_from_matching_a_live_session(self):
+        """Behavioral control, row447 SECOND rework: real isolated-tmux control
+        (orchestrator) - with only session "foo2" live, the REAL
+        `tmux has-session -t foo` exits 0, because tmux's default target
+        resolution accepts an unambiguous PREFIX match. Every identity
+        primitive must therefore send an EXACT target (tmux_exact_target's
+        leading '=', not a bare name), or a stale/wrong "foo" can still see,
+        stop, rename, or inspect a live "foo2" it only happens to prefix.
+
+        The fake tmux below implements BOTH resolution rules (bare target =
+        prefix match, "=target" = exact match only) - proven against itself
+        first (the `real_tmux_probe` sanity check), so this is a genuine
+        control on the mechanism, not a tautology that only exercises
+        whatever this test itself assumes. has-session/attach share one
+        script line in tmux_group_launch_command (see
+        test_tmux_group_launch_command_matches_name_to_tmux_session for its
+        exact-string proof), so this covers attach structurally rather than
+        by spawning a second live session here.
+        """
+        with tempfile.TemporaryDirectory() as fakebin_dir:
+            fakebin = Path(fakebin_dir)
+            state = fakebin / "created_name.txt"
+            state.write_text("foo2")
+
+            fake_tmux = fakebin / "tmux"
+            fake_tmux.write_text(
+                "#!/bin/bash\n"
+                'live=$(cat "%s" 2>/dev/null)\n'
+                'target="$3"\n'
+                'case "$target" in\n'
+                '  =*) [ "${target#=}" = "$live" ] && ok=1 || ok=0 ;;\n'
+                '  *) case "$live" in "$target"*) ok=1 ;; *) ok=0 ;; esac ;;\n'
+                "esac\n"
+                'case "$1" in\n'
+                '  has-session) [ "$ok" = 1 ] && exit 0 || exit 1 ;;\n'
+                '  kill-session) if [ "$ok" = 1 ]; then rm -f "%s"; exit 0; else exit 1; fi ;;\n'
+                '  rename-session) if [ "$ok" = 1 ]; then echo "$4" > "%s"; exit 0; else exit 1; fi ;;\n'
+                '  list-panes) [ "$ok" = 1 ] && printf "1234\\n" || exit 1 ;;\n'
+                "  *) exit 0 ;;\n"
+                "esac\n" % (state, state, state)
+            )
+            fake_tmux.chmod(0o755)
+
+            with patch.object(
+                session_hub.shutil, "which",
+                side_effect=lambda n: {"tmux": str(fake_tmux)}.get(n),
+            ):
+                # Sanity: this fake tmux really does prefix-match a bare
+                # target, exactly like the real binary the orchestrator
+                # tested - a control that can't reproduce the bug proves
+                # nothing about the fix.
+                probe = subprocess.run(
+                    [str(fake_tmux), "has-session", "-t", "foo"], capture_output=True,
+                )
+                self.assertEqual(probe.returncode, 0)
+
+                # Production code always sends the exact form - "foo" must
+                # not see, stop, rename or (via list-panes) inspect "foo2".
+                self.assertFalse(session_hub.tmux_session_alive("foo"))
+                session_hub.stop_tmux_session("foo")
+                self.assertTrue(state.exists(), "stale 'foo' must not kill live 'foo2'")
+                self.assertFalse(session_hub.rename_tmux_session("foo", "bar"))
+                self.assertEqual(state.read_text(), "foo2")
+                self.assertIsNone(session_hub.codex_tmux_native_key("foo"))
+
+                # The real session is still reachable under its own exact name.
+                self.assertTrue(session_hub.tmux_session_alive("foo2"))
 
     def test_register_group_row_canonicalizes_the_stored_name(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1975,7 +2055,11 @@ class SessionHubTests(unittest.TestCase):
             fake_tmux.write_text(
                 "#!/bin/bash\n"
                 "substitute() { echo \"$1\" | tr '.:' '__'; }\n"
-                "session_part() { echo \"$1\" | sed -E 's/[.:].*//'; }\n"
+                # Strips a leading '=' (tmux_exact_target's exact-match marker,
+                # row447 second rework) before the existing dot/colon-target
+                # truncation, so this stub still parses the -t value the same
+                # way the real tmux target-spec grammar does.
+                "session_part() { echo \"$1\" | sed -E 's/^=//; s/[.:].*//'; }\n"
                 'case "$1" in\n'
                 '  has-session) t=$(session_part "$3");'
                 f'    [ -f "{state}" ] && [ "$(cat "{state}")" = "$t" ] && exit 0 || exit 1 ;;\n'
@@ -2130,16 +2214,19 @@ class SessionHubTests(unittest.TestCase):
             state = fakebin / "created_name.txt"
             state.write_text("projects")
 
+            # `${3#=}` strips tmux_exact_target's leading '=' before comparing
+            # (row447 second rework) - `-t` targets now always arrive here as
+            # "=name", not a bare name.
             fake_tmux = fakebin / "tmux"
             fake_tmux.write_text(
                 "#!/bin/bash\n"
                 'case "$1" in\n'
-                f'  list-sessions) [ -f "{state}" ] && cat "{state}"; exit 0 ;;\n'
-                '  has-session) [ -f "%s" ] && [ "$(cat "%s")" = "$3" ] && exit 0 || exit 1 ;;\n'
-                '  rename-session)'
-                f'    [ -f "{state}" ] && [ "$(cat "{state}")" = "$3" ] && echo "$4" > "{state}" && exit 0 || exit 1 ;;\n'
+                '  list-sessions) [ -f "%s" ] && cat "%s"; exit 0 ;;\n'
+                '  has-session) [ -f "%s" ] && [ "$(cat "%s")" = "${3#=}" ] && exit 0 || exit 1 ;;\n'
+                '  rename-session) [ -f "%s" ] && [ "$(cat "%s")" = "${3#=}" ]'
+                ' && echo "$4" > "%s" && exit 0 || exit 1 ;;\n'
                 "  *) exit 0 ;;\n"
-                "esac\n" % (state, state)
+                "esac\n" % (state, state, state, state, state, state, state)
             )
             fake_tmux.chmod(0o755)
 
