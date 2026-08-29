@@ -1852,8 +1852,15 @@ def rename_group_row_in(metadata: dict, cwd: str, old: str, new: str) -> dict:
     its live session goes by session_key first (find_group_member_session), so
     an already-launched row survives the rename; a fresh launch passes the new
     --name.
+
+    `new` is canonicalized (sanitize_tmux_session_name) before any check or
+    write - row447 rework: a dedup/collision check run against the raw text
+    would miss two different raw names that canonicalize to the same tmux
+    identity, and the stored row["name"] must equal what tmux actually calls
+    the session or every downstream reader (group_row_status, launch/stop/
+    resume, pending Codex links) drifts from it again.
     """
-    new = " ".join(str(new).strip().split())
+    new = sanitize_tmux_session_name(" ".join(str(new).strip().split()))
     if not new:
         return {"status": "error", "message": "Row name must not be empty"}
     group = metadata.get("groups", {}).get(cwd)
@@ -1955,7 +1962,16 @@ def sync_group_row_names(metadata: dict) -> bool:
 def rename_tmux_session(old: str, new: str) -> bool:
     """`tmux rename-session old new` if a session called `old` exists; the
     terminal title follows on its own (set-titles-string "#S"). False when
-    tmux is absent or no such session -- nothing to rename is not an error."""
+    tmux is absent or no such session -- nothing to rename is not an error.
+
+    Both names are canonicalized through sanitize_tmux_session_name first -
+    a caller that still holds a pre-fix unsafe stored name (row447 rework:
+    legacy metadata, or a value that skipped an upstream choke point) would
+    otherwise target `old`/`new` literals tmux itself never used, the same
+    has-session/attach target-spec mismatch tmux_group_launch_command's own
+    fix addresses for launch."""
+    old = sanitize_tmux_session_name(old)
+    new = sanitize_tmux_session_name(new)
     tmux = shutil.which("tmux")
     if not tmux or old == new:
         return False
@@ -1968,6 +1984,49 @@ def rename_tmux_session(old: str, new: str) -> bool:
         return done.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def reconcile_tmux_rename(
+    old_name: str, new_name: str, live_names: frozenset[str] | None = None
+) -> dict:
+    """Rename the live tmux session `old_name` to `new_name` and report what
+    happened, instead of leaving the caller with rename_tmux_session's bare
+    True/False - a metadata rename that already committed while the tmux
+    rename silently failed is exactly the split identity row447 rework
+    reported live (Codex renamed to "Music Download", tmux stayed "projects").
+
+    Both names are canonicalized (rename_tmux_session does this too, but the
+    collision check below needs the canonical form up front). Refuses with
+    an `error` message - and touches nothing - when `new_name` already names
+    a DIFFERENT live tmux session: tmux's own `rename-session` would fail
+    for the same reason, but this gives a caller a message to show instead
+    of a bare False indistinguishable from "nothing needed renaming".
+
+    A caller should run this BEFORE writing its own metadata, so an `error`
+    result leaves the two identities exactly as consistent as they were
+    before the rename was attempted (atomic, not "renamed the label, tmux
+    disagrees").
+    """
+    old_name = sanitize_tmux_session_name(old_name)
+    new_name = sanitize_tmux_session_name(new_name)
+    if old_name == new_name:
+        return {"tmux_renamed": False, "error": None}
+    names = tmux_live_session_names() if live_names is None else live_names
+    if new_name in names:
+        return {
+            "tmux_renamed": False,
+            "error": f"A tmux session named {new_name!r} already exists.",
+        }
+    if old_name not in names:
+        # Nothing live under the old name (not yet launched, or already
+        # stopped) - no tmux rename needed, and none attempted.
+        return {"tmux_renamed": False, "error": None}
+    if rename_tmux_session(old_name, new_name):
+        return {"tmux_renamed": True, "error": None}
+    return {
+        "tmux_renamed": False,
+        "error": f"Renaming the live tmux session {old_name!r} to {new_name!r} failed.",
+    }
 
 
 def find_group_member_session(
@@ -2598,7 +2657,14 @@ def tmux_session_alive(name: str, live_names: frozenset[str] | None = None) -> b
     one whenever checking more than one name per refresh so this does a plain
     membership test instead of its own subprocess. Omitted only by isolated
     callers that just want one name's answer.
+
+    `name` is canonicalized here (see rename_tmux_session) so a caller that
+    still holds a stored-but-unsafe name (row447 rework: e.g. group_row_status
+    passing a legacy row["name"] straight through) is checked against the
+    same substituted form `live_names`/the real tmux daemon actually use,
+    instead of a literal that was never the session's real name.
     """
+    name = sanitize_tmux_session_name(name)
     if live_names is not None:
         return name in live_names
     tmux = shutil.which("tmux")
@@ -2635,7 +2701,11 @@ def codex_tmux_native_key(
     The rollout file descriptor is authoritative for both a fresh `codex`
     process (whose argv has no session id) and `codex resume`. Descendant
     traversal also covers tmux panes that launch through a shell wrapper.
+
+    `name` is canonicalized (see rename_tmux_session) so an unsafe stored
+    name still resolves to the real tmux session's panes.
     """
+    name = sanitize_tmux_session_name(name)
     tmux = shutil.which("tmux")
     if not tmux:
         return None
@@ -2691,7 +2761,13 @@ def codex_tmux_native_key(
 
 
 def stop_tmux_session(name: str) -> None:
-    """Kill the tmux session named `name`, if any. A no-op if already gone."""
+    """Kill the tmux session named `name`, if any. A no-op if already gone.
+
+    `name` is canonicalized (see rename_tmux_session) so an unsafe stored
+    name still targets the real tmux session instead of being parsed as a
+    session:window.pane target-spec and hitting the wrong thing or nothing.
+    """
+    name = sanitize_tmux_session_name(name)
     tmux = shutil.which("tmux")
     if not tmux:
         return
@@ -4655,9 +4731,14 @@ class LaunchNewGroupSessionsDialog(QDialog):
             effort_widget = self.table.cellWidget(row, 2)
             account_widget = self.table.cellWidget(row, 3)
             name_edit = self.table.cellWidget(row, 4)
-            name = name_edit.text().strip() if name_edit else ""
-            if not name:
+            raw_name = name_edit.text().strip() if name_edit else ""
+            if not raw_name:
                 continue
+            # Canonicalized here, before accept()'s own duplicate-name check
+            # below - two rows typed as "a.b" and "a:b" must collide there
+            # (row447 rework), not silently mint two rows sharing one real
+            # tmux identity.
+            name = sanitize_tmux_session_name(raw_name)
             provider = provider_combo.currentData() if provider_combo else "Claude"
             if provider == "Codex":
                 model = codex_combo_value(model_widget) if model_widget else None
@@ -7054,7 +7135,36 @@ class SessionHub(QMainWindow):
             self, "Rename session", "Display name:", text=session.title
         )
         if accepted and name.strip():
-            self.save_override(session, "name", name.strip())
+            result = self.rename_session_name(session, name.strip())
+            if result["status"] == "error":
+                QMessageBox.warning(self, "Rename session", result["message"])
+
+    def rename_session_name(self, session: Session, new_name: str) -> dict:
+        """Rename one (non-group) session's display name AND its live tmux
+        session together, atomically.
+
+        Before this, "Rename session" (a plain save_override("name", ...))
+        never touched tmux at all - the exact live repro row447 rework
+        reported: a Codex conversation renamed to "Music Download" while its
+        tmux session (and therefore every peer/phone address for it) stayed
+        "projects", silently split. Canonicalized the same way a group row
+        name is (sanitize_tmux_session_name) and reconciled/refused the same
+        way rename_group_row is - see reconcile_tmux_rename.
+        """
+        sanitized = sanitize_tmux_session_name(" ".join(str(new_name).strip().split()))
+        if not sanitized:
+            return {"status": "error", "message": "Name must not be empty"}
+        overrides = (self.metadata.get("sessions") or {}).get(session.key, {})
+        tmux_enabled, old_name, _status = standalone_tmux_status(
+            session, overrides, self.settings()
+        )
+        reconciled = {"tmux_renamed": False, "error": None}
+        if tmux_enabled and old_name and old_name != sanitized:
+            reconciled = reconcile_tmux_rename(old_name, sanitized)
+            if reconciled["error"]:
+                return {"status": "error", "message": reconciled["error"]}
+        self.save_override(session, "name", sanitized)
+        return {"status": "renamed", "name": sanitized, "tmux_renamed": reconciled["tmux_renamed"]}
 
     def change_directory(self) -> None:
         session = self.selected()
@@ -7203,11 +7313,6 @@ class SessionHub(QMainWindow):
                     "live status until you clear or replace that `notify` line yourself.",
                 )
         try:
-            flags = (
-                self.launch_flags(session_key, flag_overrides)
-                if provider == "Claude"
-                else []
-            )
             if use_tmux and provider in ("Claude", "Codex"):
                 # tmux_name, not flag_overrides["--name"]: resuming a group
                 # row (session_id set) never passes --name at all - Claude
@@ -7217,6 +7322,21 @@ class SessionHub(QMainWindow):
                 name = tmux_name or (flag_overrides or {}).get("--name")
                 if not name:
                     raise RuntimeError("Launching into tmux requires a session name.")
+                # Canonicalized BEFORE launch_flags below builds claude_args -
+                # Claude's own --name flag must equal the exact name
+                # tmux_group_launch_command creates the tmux session under
+                # (it canonicalizes independently), or the two identities
+                # split the way row447 rework's live repro found: Claude
+                # reports one name, the tmux/peer address is a different one.
+                name = sanitize_tmux_session_name(name)
+                if flag_overrides and flag_overrides.get("--name"):
+                    flag_overrides = {**flag_overrides, "--name": name}
+            flags = (
+                self.launch_flags(session_key, flag_overrides)
+                if provider == "Claude"
+                else []
+            )
+            if use_tmux and provider in ("Claude", "Codex"):
                 if provider == "Codex":
                     # Codex has no --name; the tmux session name IS its address
                     # (VAMPULSE peers reach it with `session_ctl.py send <name>`).
@@ -7910,12 +8030,18 @@ class SessionHub(QMainWindow):
         )
         existing_names = {row["name"] for row in group["rows"]}
         for row in rows:
-            if row["name"] in existing_names:
+            # Canonicalize before the dedup check, not just inside
+            # register_group_row below - two different raw names ("a.b",
+            # "a:b") that sanitize to the same tmux identity must collide
+            # here, or both mint a row and the second silently overwrites
+            # the first's override_key bucket (row447 rework).
+            name = sanitize_tmux_session_name(" ".join(str(row["name"]).strip().split()))
+            if name in existing_names:
                 continue
             provider = row.get("provider", "Claude")
             registered = self.register_group_row(
                 cwd,
-                row["name"],
+                name,
                 provider,
                 row.get("model"),
                 row.get("reasoning_effort"),
@@ -7942,7 +8068,12 @@ class SessionHub(QMainWindow):
         override, the same way a real session's own `session.key` does - it
         never changes for the life of the row, whether or not it's currently
         matched to a live session (see find_group_member_session, ManageGroupDialog).
+
+        `name` is canonicalized here too (idempotent alongside a caller that
+        already did it) - this is the row's one durable minting site, and its
+        own docstring said so before any caller actually enforced it.
         """
+        name = sanitize_tmux_session_name(" ".join(str(name).strip().split()))
         override_key = f"group:{cwd}#{name}"
         if model_alias or reasoning_effort or account_config_dir:
             entry = self.metadata.setdefault("sessions", {}).setdefault(override_key, {})
@@ -8040,11 +8171,23 @@ class SessionHub(QMainWindow):
     def rename_group_row(self, cwd: str, old: str, new: str) -> dict:
         """Rename a group row everywhere it is named: metadata (row + override
         bucket) and the live tmux session, so the terminal title follows.
-        See rename_group_row_in for why there is one name and not two."""
+        See rename_group_row_in for why there is one name and not two.
+
+        The tmux side is reconciled BEFORE the metadata write commits (see
+        reconcile_tmux_rename) - a target that collides with a different
+        live tmux session is refused visibly here instead of leaving the row
+        renamed in metadata while tmux never agreed (row447 rework).
+        """
+        sanitized = sanitize_tmux_session_name(" ".join(str(new).strip().split()))
+        reconciled = {"tmux_renamed": False, "error": None}
+        if sanitized and sanitized != old:
+            reconciled = reconcile_tmux_rename(old, sanitized)
+            if reconciled["error"]:
+                return {"status": "error", "message": reconciled["error"]}
         result = rename_group_row_in(self.metadata, cwd, old, new)
         if result["status"] == "renamed":
             write_metadata(self.metadata)
-            result["tmux_renamed"] = rename_tmux_session(old, result["name"])
+            result["tmux_renamed"] = reconciled["tmux_renamed"]
             self.refresh()
         return result
 

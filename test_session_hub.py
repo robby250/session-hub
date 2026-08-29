@@ -1734,12 +1734,24 @@ class SessionHubTests(unittest.TestCase):
             self.assertEqual(fixed_result.returncode, 0, fixed_result.stderr)
 
     def test_codex_launch_args_reach_the_real_child_for_default_and_every_custom_model_effort(self):
-        """Table-driven per the row447 brief: Default plus representative custom
-        Codex model/effort pairs (gpt-5.6-luna/high is the user's exact report),
-        proven at the real child argv boundary - the full tmux_group_launch_command
-        script (shlex.join -> a real shell re-parse), not just this process's own
-        string-shape assertions on the built list - via a fake `codex` that
-        records the argv it actually received.
+        """Table-driven per the row447 REWORK: not 3 representative pairs (the
+        orchestrator's finding #2) but every model/effort combination the UI
+        actually offers, DERIVED from the real local ~/.codex/models_cache.json
+        via session_hub.codex_models() rather than hardcoded - so a model
+        added or dropped from the cache changes what this test covers without
+        anyone having to remember to update a literal list. For each offered
+        model: Default effort and every one of its supported_reasoning_levels
+        (this is also where "custom-model+Default-effort" lives - the (model,
+        None) entry). Also covers the "Default-model+custom-effort" boundary
+        the UI itself never actually offers (populate_codex_effort_combo has
+        no levels for a None model slug) but codex_launch_args must still
+        handle sanely, since it is a plain function callable with any args.
+
+        Proven at the real child argv boundary - the full
+        tmux_group_launch_command script (shlex.join -> a real shell
+        re-parse), not just this process's own string-shape assertions on the
+        built list - via a fake `codex` that records the argv it actually
+        received.
         """
         with tempfile.TemporaryDirectory() as fakebin_dir:
             fakebin = Path(fakebin_dir)
@@ -1768,11 +1780,27 @@ class SessionHubTests(unittest.TestCase):
 
             spawn_env = dict(os.environ, PATH=f"{fakebin}:{os.environ.get('PATH', '')}")
 
-            cases = [
-                ("Default", None, None),
-                ("reported failing pair", "gpt-5.6-luna", "high"),
-                ("another dotted model", "gpt-5.5", "xhigh"),
-            ]
+            cases = [("Default", None, None)]
+            offered_models = session_hub.codex_models()
+            for model_entry in offered_models:
+                slug = model_entry["slug"]
+                cases.append((f"{slug} / Default effort", slug, None))
+                for level in model_entry.get("supported_reasoning_levels", []):
+                    effort = level.get("effort")
+                    if effort:
+                        cases.append((f"{slug} / {effort}", slug, effort))
+            # The user's exact report must be in the derived set on this
+            # machine (row447's original repro), not just structurally covered.
+            self.assertIn(
+                ("gpt-5.6-luna / high", "gpt-5.6-luna", "high"), cases,
+                "the reported failing pair is missing from the local models "
+                "cache this test derived its coverage from",
+            )
+            if offered_models:
+                # Boundary case no combo box actually offers (Default model
+                # has no slug to look up supported levels for) but the plain
+                # function must still handle without crashing or mismatching.
+                cases.append(("Default model / custom effort", None, "high"))
             for label, model, effort in cases:
                 with self.subTest(label):
                     marker.unlink(missing_ok=True)
@@ -1799,6 +1827,348 @@ class SessionHubTests(unittest.TestCase):
                         self.assertIn(model, recorded)
                     if effort:
                         self.assertIn(f"model_reasoning_effort={effort}", recorded)
+
+    def test_group_row_status_canonicalizes_a_legacy_unsafe_stored_name(self):
+        # The orchestrator's own row447 rework repro, verbatim: a row whose
+        # stored name predates this fix (or slipped past it) must still read
+        # correctly against the real tmux daemon's actual (substituted) name.
+        row = {"name": "foo.bar"}
+        self.assertEqual(
+            session_hub.group_row_status(row, None, True, frozenset({"foo_bar"})),
+            "Running",
+        )
+        self.assertEqual(
+            session_hub.group_row_status(row, None, True, frozenset({"foo.bar"})),
+            "Stopped",
+        )
+
+    def test_standalone_tmux_status_canonicalizes_an_unsafe_override_name(self):
+        session = session_hub.Session(
+            "Codex", "s1", "title", "/tmp/vamp", "/tmp/vamp", 0, Path("/tmp/x.jsonl"),
+        )
+        overrides = {"tmux": True, "name": "foo.bar"}
+        enabled, name, status = session_hub.standalone_tmux_status(
+            session, overrides, {}, frozenset({"foo_bar"}),
+        )
+        self.assertTrue(enabled)
+        self.assertEqual(status, "Running")
+
+    def test_tmux_primitives_canonicalize_unsafe_names(self):
+        """stop_tmux_session, rename_tmux_session and codex_tmux_native_key
+        all target the real (substituted) tmux session even when handed a
+        stored-but-unsafe name - not just tmux_session_alive/
+        tmux_group_launch_command, which row447's first pass already fixed.
+        """
+        with tempfile.TemporaryDirectory() as fakebin_dir:
+            fakebin = Path(fakebin_dir)
+            state = fakebin / "created_name.txt"
+            state.write_text("foo_bar")
+
+            fake_tmux = fakebin / "tmux"
+            fake_tmux.write_text(
+                "#!/bin/bash\n"
+                "session_part() { echo \"$1\" | sed -E 's/[.:].*//'; }\n"
+                'case "$1" in\n'
+                '  kill-session) t=$(session_part "$3");'
+                f'    [ -f "{state}" ] && [ "$(cat "{state}")" = "$t" ] && rm -f "{state}" && exit 0 || exit 1 ;;\n'
+                '  has-session) t=$(session_part "$3");'
+                f'    [ -f "{state}" ] && [ "$(cat "{state}")" = "$t" ] && exit 0 || exit 1 ;;\n'
+                '  rename-session) t=$(session_part "$3"); n="$4";'
+                f'    [ -f "{state}" ] && [ "$(cat "{state}")" = "$t" ] && echo "$n" > "{state}" && exit 0 || exit 1 ;;\n'
+                "  list-panes) exit 1 ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n"
+            )
+            fake_tmux.chmod(0o755)
+            with patch.object(
+                session_hub.shutil, "which",
+                side_effect=lambda n: {"tmux": str(fake_tmux)}.get(n),
+            ):
+                # kill-session -t "foo.bar" must resolve to the real
+                # "foo_bar" session (the stub only accepts a target session
+                # part equal to what's in `state`).
+                session_hub.stop_tmux_session("foo.bar")
+                self.assertFalse(state.exists(), "kill-session never reached the real session")
+
+                state.write_text("foo_bar")
+                self.assertTrue(session_hub.rename_tmux_session("foo.bar", "baz.qux"))
+                self.assertEqual(state.read_text().strip(), "baz_qux")
+
+                # codex_tmux_native_key's own list-panes call must also be
+                # targeted at the sanitized name (the stub's list-panes
+                # case exits 1 regardless of target, so this only proves no
+                # crash on the unsafe literal and a clean None result).
+                self.assertIsNone(session_hub.codex_tmux_native_key("foo.bar"))
+
+    def test_register_group_row_canonicalizes_the_stored_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {"sessions": {}, "settings": {}, "groups": {}}
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            self.addCleanup(window.close)
+            with patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"):
+                registered = window.register_group_row(
+                    "/tmp/vamp", "gpt-5.6-luna", "Codex", None
+                )
+            self.assertEqual(registered["name"], "gpt-5_6-luna")
+            self.assertEqual(
+                registered["override_key"], "group:/tmp/vamp#gpt-5_6-luna"
+            )
+
+    def test_rename_group_row_in_canonicalizes_and_rejects_a_same_group_collision(self):
+        metadata = {
+            "groups": {
+                "/tmp/vamp": {
+                    "cwd": "/tmp/vamp",
+                    "rows": [
+                        {"name": "a", "override_key": "group:/tmp/vamp#a"},
+                        {"name": "b_c", "override_key": "group:/tmp/vamp#b_c"},
+                    ],
+                }
+            },
+            "sessions": {}, "links": {}, "pending_links": [],
+        }
+        result = session_hub.rename_group_row_in(metadata, "/tmp/vamp", "a", "x.y")
+        self.assertEqual(result, {"status": "renamed", "old": "a", "name": "x_y"})
+        self.assertEqual(metadata["groups"]["/tmp/vamp"]["rows"][0]["name"], "x_y")
+
+        # "b:c" canonicalizes to "b_c", which already names the OTHER row in
+        # this group - must collide post-sanitization, not silently mint a
+        # second row sharing that identity.
+        collision = session_hub.rename_group_row_in(metadata, "/tmp/vamp", "x_y", "b:c")
+        self.assertEqual(collision["status"], "error")
+
+    def test_launch_new_group_sessions_dialog_rejects_a_post_sanitization_name_collision(self):
+        # Sibling of test_launch_new_group_sessions_dialog_rejects_duplicate_names:
+        # "a.b" and "a:b" are different RAW text but the same tmux identity
+        # once canonicalized - the dialog's own duplicate check must catch
+        # this, not just a byte-identical raw match.
+        dialog = session_hub.LaunchNewGroupSessionsDialog("/tmp/vamp", set(), False)
+        dialog.add_row()
+        name_edit_0 = dialog.table.cellWidget(0, 4)
+        name_edit_1 = dialog.table.cellWidget(1, 4)
+        name_edit_0.setText("a.b")
+        name_edit_0.auto_suggested = False
+        name_edit_1.setText("a:b")
+        name_edit_1.auto_suggested = False
+        with patch("session_hub.QMessageBox.warning") as warning:
+            dialog.accept()
+        warning.assert_called_once()
+        self.assertEqual(dialog.group_rows, [])
+        dialog.close()
+
+    def test_launch_canonicalizes_tmux_name_and_claude_name_flag_together(self):
+        """Full row447-rework chain: a row minted from an unsafe raw name is
+        launched, and the tmux session launch() creates, the --name flag
+        baked into the real Claude argv, and the status/stop readers
+        afterwards all agree on the ONE canonical name - never the raw one
+        in one place and the substituted one in another.
+        """
+        with tempfile.TemporaryDirectory() as fakebin_dir, tempfile.TemporaryDirectory() as temp:
+            fakebin = Path(fakebin_dir)
+            state = fakebin / "created_name.txt"
+            marker = fakebin / "claude_argv.txt"
+            cwd_dir = Path(temp) / "vamp"
+            cwd_dir.mkdir()
+
+            fake_tmux = fakebin / "tmux"
+            fake_tmux.write_text(
+                "#!/bin/bash\n"
+                "substitute() { echo \"$1\" | tr '.:' '__'; }\n"
+                "session_part() { echo \"$1\" | sed -E 's/[.:].*//'; }\n"
+                'case "$1" in\n'
+                '  has-session) t=$(session_part "$3");'
+                f'    [ -f "{state}" ] && [ "$(cat "{state}")" = "$t" ] && exit 0 || exit 1 ;;\n'
+                '  new-session) n=$(substitute "$4"); echo "$n" > "%s";'
+                '    sh -c "${@: -1}"; exit 0 ;;\n'
+                '  attach) t=$(session_part "$3");'
+                f'    [ -f "{state}" ] && [ "$(cat "{state}")" = "$t" ] && exit 0 || exit 1 ;;\n'
+                '  kill-session) t=$(session_part "$3");'
+                f'    [ -f "{state}" ] && [ "$(cat "{state}")" = "$t" ] && rm -f "{state}" && exit 0 || exit 1 ;;\n'
+                "  set-option) exit 0 ;;\n"
+                "  *) exit 0 ;;\n"
+                "esac\n" % state
+            )
+            fake_tmux.chmod(0o755)
+
+            fake_terminal = fakebin / "gnome-terminal"
+            fake_terminal.write_text(
+                "#!/bin/bash\n"
+                'while [ "$1" != "--" ]; do shift; done\n'
+                "shift\n"
+                'exec "$@"\n'
+            )
+            fake_terminal.chmod(0o755)
+
+            fake_claude = fakebin / "claude"
+            fake_claude.write_text(f'#!/bin/bash\nprintf "%s\\n" "$@" > "{marker}"\n')
+            fake_claude.chmod(0o755)
+
+            metadata = {"sessions": {}, "settings": {}, "groups": {}}
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            self.addCleanup(window.close)
+
+            raw_name = "gpt-5.6-luna"
+            canonical = "gpt-5_6-luna"
+            with patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"):
+                registered = window.register_group_row(
+                    str(cwd_dir), raw_name, "Claude", None
+                )
+            self.assertEqual(registered["name"], canonical)
+
+            spawn_env = dict(os.environ, PATH=f"{fakebin}:{os.environ.get('PATH', '')}")
+            captured = {}
+
+            def fake_spawn(command, *args, **kwargs):
+                captured["command"] = command
+                subprocess.run(command, env=spawn_env, timeout=5, check=True)
+
+            with (
+                patch.object(window, "spawn", side_effect=fake_spawn),
+                patch.object(session_hub, "executable", return_value=str(fake_claude)),
+                patch.object(
+                    session_hub.shutil, "which",
+                    side_effect=lambda n: {
+                        "tmux": str(fake_tmux), "gnome-terminal": str(fake_terminal),
+                    }.get(n),
+                ),
+            ):
+                window.launch(
+                    "Claude", None, str(cwd_dir),
+                    session_key=registered["override_key"],
+                    flag_overrides={"--name": registered["name"]},
+                    use_tmux=True,
+                )
+
+            command = captured["command"]
+            self.assertEqual(command[5], canonical)  # the tmux session name
+            claude_command = command[7]
+            self.assertIn(f"--name {canonical}", claude_command)
+            self.assertNotIn(raw_name, claude_command)
+
+            recorded = marker.read_text(encoding="utf-8").splitlines()
+            self.assertIn(canonical, recorded)  # Claude's own --name, at the real child
+
+            row = {"name": registered["name"]}
+            with patch.object(
+                session_hub.shutil, "which",
+                side_effect=lambda n: {"tmux": str(fake_tmux)}.get(n),
+            ):
+                self.assertEqual(session_hub.group_row_status(row, None, True), "Running")
+                session_hub.stop_tmux_session(row["name"])
+                self.assertEqual(session_hub.group_row_status(row, None, True), "Stopped")
+
+    def test_rename_group_row_reconciles_live_tmux_atomically_and_refuses_a_collision(self):
+        with tempfile.TemporaryDirectory() as fakebin_dir, tempfile.TemporaryDirectory() as temp:
+            fakebin = Path(fakebin_dir)
+            live = {"old-row", "taken"}
+
+            fake_tmux = fakebin / "tmux"
+            fake_tmux.write_text(
+                "#!/bin/bash\n"
+                'case "$1" in\n'
+                '  list-sessions) printf "%s\\n" ' + " ".join(f'"{n}"' for n in live) + ' ;;\n'
+                "  *) exit 0 ;;\n"
+                "esac\n"
+            )
+            fake_tmux.chmod(0o755)
+
+            metadata = {
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {"name": "old-row", "override_key": "group:/tmp/vamp#old-row"},
+                        ],
+                    }
+                },
+                "sessions": {}, "links": {}, "pending_links": [],
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            self.addCleanup(window.close)
+
+            with (
+                patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                patch.object(session_hub, "rename_tmux_session") as fake_rename,
+                patch.object(
+                    session_hub.shutil, "which",
+                    side_effect=lambda n: {"tmux": str(fake_tmux)}.get(n),
+                ),
+            ):
+                # Refused: "taken" already names a DIFFERENT live tmux
+                # session. Metadata must be untouched - atomic, not
+                # renamed-in-metadata-but-tmux-disagrees.
+                blocked = window.rename_group_row("/tmp/vamp", "old-row", "taken")
+                self.assertEqual(blocked["status"], "error")
+                fake_rename.assert_not_called()
+                self.assertEqual(
+                    metadata["groups"]["/tmp/vamp"]["rows"][0]["name"], "old-row"
+                )
+
+                # Allowed: no collision, so both the metadata AND the live
+                # tmux session are renamed together.
+                fake_rename.return_value = True
+                ok = window.rename_group_row("/tmp/vamp", "old-row", "new-row")
+                self.assertEqual(ok["status"], "renamed")
+                self.assertTrue(ok["tmux_renamed"])
+                fake_rename.assert_called_once_with("old-row", "new-row")
+                self.assertEqual(
+                    metadata["groups"]["/tmp/vamp"]["rows"][0]["name"], "new-row"
+                )
+
+    def test_rename_session_name_reconciles_a_codex_conversation_rename_to_tmux(self):
+        """The orchestrator's own live repro, reproduced hermetically: a
+        Codex row renamed via Session Hub's "Rename session" while its tmux
+        session was still named "projects" must rename BOTH together, not
+        leave the tmux/peer address stuck on the old name the way plain
+        save_override("name", ...) used to (row447 rework finding #3).
+        """
+        with tempfile.TemporaryDirectory() as fakebin_dir, tempfile.TemporaryDirectory() as temp:
+            fakebin = Path(fakebin_dir)
+            state = fakebin / "created_name.txt"
+            state.write_text("projects")
+
+            fake_tmux = fakebin / "tmux"
+            fake_tmux.write_text(
+                "#!/bin/bash\n"
+                'case "$1" in\n'
+                f'  list-sessions) [ -f "{state}" ] && cat "{state}"; exit 0 ;;\n'
+                '  has-session) [ -f "%s" ] && [ "$(cat "%s")" = "$3" ] && exit 0 || exit 1 ;;\n'
+                '  rename-session)'
+                f'    [ -f "{state}" ] && [ "$(cat "{state}")" = "$3" ] && echo "$4" > "{state}" && exit 0 || exit 1 ;;\n'
+                "  *) exit 0 ;;\n"
+                "esac\n" % (state, state)
+            )
+            fake_tmux.chmod(0o755)
+
+            metadata = {"sessions": {}, "settings": {}, "groups": {}}
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            self.addCleanup(window.close)
+
+            session = session_hub.Session(
+                "Codex", "worker9", "old title", "/tmp/vamp", "/tmp/vamp", 0,
+                Path("/tmp/worker9.jsonl"),
+            )
+            metadata.setdefault("sessions", {})[session.key] = {"tmux": True, "name": "projects"}
+
+            with (
+                patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                patch.object(
+                    session_hub.shutil, "which",
+                    side_effect=lambda n: {"tmux": str(fake_tmux)}.get(n),
+                ),
+            ):
+                result = window.rename_session_name(session, "Music Download")
+
+            self.assertEqual(result["status"], "renamed")
+            self.assertTrue(result["tmux_renamed"])
+            self.assertEqual(state.read_text().strip(), "Music Download")
+            self.assertEqual(
+                metadata["sessions"][session.key]["name"], "Music Download"
+            )
 
     def _make_vampulse_fixture(self):
         """A REAL temp git repo standing in for the canonical VAMPULSE-game
