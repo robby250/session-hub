@@ -1896,6 +1896,51 @@ class SessionHubTests(unittest.TestCase):
         (link,) = metadata["links"].values()
         self.assertEqual(set(link["members"]), {"Claude:old-id", "Claude:new-id"})
 
+    def test_resolve_clear_continuations_sibling_absorption_is_independent_of_glob_order(self):
+        # task-2127 root cause: PID_DIR.glob() order is filesystem-dependent,
+        # not sorted. The bug this discriminates: sibling-id's own tracked
+        # PID has a live self-match (no /clear at all for it) but, if its
+        # tracking entry was resolved BEFORE old-id's (whose session
+        # genuinely vanished), the two competed for the same unclaimed
+        # "new-id" and max(updated_ms) could hand new-id to sibling-id
+        # instead of old-id - silently absorbing an unrelated, still-active
+        # sibling into a continuation that wasn't its own. Same fixture as
+        # the sibling test above, but with the tracking files created in
+        # the OPPOSITE order (sibling's file first) - this must still land
+        # on the same correct link, proving the fix (resolving genuinely-
+        # vanished PIDs before still-live ones) doesn't depend on creation/
+        # glob order.
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / "222222.json").write_text(
+                json.dumps({"cwd": "/home/user/vamp", "session_id": "sibling-id"})
+            )
+            (pid_dir / "111111.json").write_text(
+                json.dumps({"cwd": "/home/user/vamp", "session_id": "old-id"})
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "sibling-id", "title", "/home/user/vamp",
+                    "/home/user/vamp", 100_000, Path("/tmp/sibling.jsonl"),
+                ),
+                session_hub.Session(
+                    "Claude", "new-id", "title", "/home/user/vamp",
+                    "/home/user/vamp", 999_000, Path("/tmp/new.jsonl"),
+                ),
+            ]
+            metadata = {}
+            with (
+                patch("session_hub.PID_DIR", pid_dir),
+                patch("session_hub.process_alive", return_value=True),
+            ):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+            sibling_tracking = json.loads((pid_dir / "222222.json").read_text())
+        self.assertTrue(changed)
+        (link,) = metadata["links"].values()
+        self.assertEqual(set(link["members"]), {"Claude:old-id", "Claude:new-id"})
+        # sibling-id must never be repointed at new-id, regardless of order.
+        self.assertEqual(sibling_tracking["session_id"], "sibling-id")
+
     def test_resolve_clear_continuations_excludes_idle_group_sibling_sessions(self):
         # The bug that actually corrupted a real VAMPULSE group: opus's row
         # had a session_key, but opus's own process had already exited (no
@@ -3269,17 +3314,23 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_matched_sessions_prefers_override_key_name_over_native_key(self):
-        # Rename (routed through row_session, see row_context_menu) writes
-        # the display name under the row's override_key. A stale native-key
-        # override left over from an old restart or a manual link must not
-        # shadow it - override_key is the row's stable identity, the native
-        # key changes every restart.
+    def test_matched_sessions_prefers_row_identity_over_stale_native_key_override(self):
+        # task-2127: superseded contract. "ONE name per row" (rename_group_
+        # row_in, sync_group_row_name - user 2026-08-22) means the
+        # override_key bucket's name is always kept equal to row["name"] on
+        # every refresh - a fixture pinning a DIFFERENT value under
+        # override_key (the old shape of this test) is unreachable state;
+        # sync_group_row_names, called every refresh via discover_sessions,
+        # silently overwrites it back to row["name"] before matched_sessions
+        # ever runs. What row-identity precedence still has to prove: a
+        # STALE rename left under the session's NATIVE key (a leftover from
+        # before the session was grouped, or from a previous restart's
+        # native key) must never leak through and override the row's own
+        # current name.
         with tempfile.TemporaryDirectory() as temp:
             metadata = {
                 "sessions": {
                     "Claude:abc123": {"name": "stale leftover name"},
-                    "group:/tmp/vamp#vamp-s1": {"name": "VAMPULSE-orchestrator"},
                 },
                 "settings": {},
                 "groups": {
@@ -3306,7 +3357,7 @@ class SessionHubTests(unittest.TestCase):
                 try:
                     with patch("session_hub.claude_sessions", return_value=[live]):
                         pairs = dialog.matched_sessions()
-                    self.assertEqual(pairs[0][1].title, "VAMPULSE-orchestrator")
+                    self.assertEqual(pairs[0][1].title, "vamp-s1")
                 finally:
                     dialog.close()
             finally:
@@ -4209,10 +4260,16 @@ class SessionHubTests(unittest.TestCase):
                 window.close()
 
     def test_launch_new_group_sessions_dialog_rejects_duplicate_names(self):
+        # Column 4 is Name - column 3 is Account, inserted by 78981ee (per-row
+        # Claude account picker) between the old Effort/Name columns. This
+        # test targeted the pre-78981ee index and had been silently writing
+        # into the (usually hidden) Account QLabel ever since, so the real
+        # Name field kept its unique auto-suggested default and no duplicate
+        # was ever actually formed - warning() was never called for real.
         dialog = session_hub.LaunchNewGroupSessionsDialog("/tmp/vamp", set(), False)
         dialog.add_row()
-        name_edit_0 = dialog.table.cellWidget(0, 3)
-        name_edit_1 = dialog.table.cellWidget(1, 3)
+        name_edit_0 = dialog.table.cellWidget(0, 4)
+        name_edit_1 = dialog.table.cellWidget(1, 4)
         name_edit_0.setText("same-name")
         name_edit_0.auto_suggested = False
         name_edit_1.setText("same-name")
@@ -4224,16 +4281,37 @@ class SessionHubTests(unittest.TestCase):
         dialog.close()
 
     def test_launch_new_group_sessions_dialog_rejects_name_already_in_group(self):
+        # Column 4 is Name; see the sibling duplicate-name test for why 3 is wrong.
         dialog = session_hub.LaunchNewGroupSessionsDialog(
             "/tmp/vamp", {"vampulse-fable"}, False
         )
-        name_edit = dialog.table.cellWidget(0, 3)
+        name_edit = dialog.table.cellWidget(0, 4)
         name_edit.setText("vampulse-fable")
         name_edit.auto_suggested = False
         with patch("session_hub.QMessageBox.warning") as warning:
             dialog.accept()
         warning.assert_called_once()
         self.assertEqual(dialog.group_rows, [])
+        dialog.close()
+
+    def test_launch_new_group_sessions_dialog_wrong_name_column_never_admits_duplicates(self):
+        # Negative control for the two duplicate-name tests above: writing
+        # into column 3 (Account) instead of the real Name field (4) is
+        # exactly the pre-78981ee bug shape those tests silently had - the
+        # real Name field keeps its unique auto-suggested default, so no
+        # duplicate ever actually forms and warning() is never called. This
+        # must fail for that reason while the corrected tests (column 4)
+        # pass, proving the column-index fix is what discriminates.
+        dialog = session_hub.LaunchNewGroupSessionsDialog("/tmp/vamp", set(), False)
+        dialog.add_row()
+        wrong_widget_0 = dialog.table.cellWidget(0, 3)
+        wrong_widget_1 = dialog.table.cellWidget(1, 3)
+        wrong_widget_0.setText("same-name")
+        wrong_widget_1.setText("same-name")
+        with patch("session_hub.QMessageBox.warning") as warning:
+            dialog.accept()
+        warning.assert_not_called()
+        self.assertEqual(len(dialog.group_rows), 2)
         dialog.close()
 
     def test_launch_new_group_sessions_dialog_per_row_provider_switch(self):
@@ -4254,7 +4332,8 @@ class SessionHubTests(unittest.TestCase):
                 [None, "low", "medium", "high"],
             )
             effort_combo.setCurrentIndex(effort_combo.findData("medium"))
-            name_edit = dialog.table.cellWidget(0, 3)
+            # Column 4 is Name; see test_launch_new_group_sessions_dialog_rejects_duplicate_names.
+            name_edit = dialog.table.cellWidget(0, 4)
             name_edit.setText("vampulse-codex")
             name_edit.auto_suggested = False
             rows = dialog.rows()
@@ -4265,12 +4344,26 @@ class SessionHubTests(unittest.TestCase):
                     "provider": "Codex",
                     "model": "gpt-5.6-sol",
                     "reasoning_effort": "medium",
+                    # account_config_dir: shipped by 78981ee (per-row Claude
+                    # account picker) - always present in rows(), None for a
+                    # Codex row (Account is a Claude-only concept there).
+                    "account_config_dir": None,
                 },
             )
             # Switching a Claude row's combo back keeps the existing combo behavior.
             provider_combo.setCurrentIndex(provider_combo.findData("Claude"))
             self.assertIsInstance(dialog.table.cellWidget(0, 1), session_hub.QComboBox)
             self.assertIsInstance(dialog.table.cellWidget(0, 2), session_hub.QLabel)
+            # Provider-switch state left stale: switching back must
+            # actually replace the row's Model/Effort widgets
+            # (set_model_widget, called from on_provider_changed), not
+            # just swap the type check above - a widget reference kept
+            # from the Codex leg would leak "gpt-5.6-sol"/"medium" into a
+            # row rows() now reports as Claude.
+            rows = dialog.rows()
+            self.assertEqual(rows[0]["provider"], "Claude")
+            self.assertIsNone(rows[0]["reasoning_effort"])
+            self.assertNotEqual(rows[0]["model"], "gpt-5.6-sol")
             dialog.close()
 
     def test_launch_new_rows_into_group_launches_all_rows_and_saves_group(self):

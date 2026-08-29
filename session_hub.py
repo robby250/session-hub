@@ -3331,6 +3331,30 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
                 group_session_keys.add(session_key)
 
     session_overrides = metadata.get("sessions", {})
+
+    # task-2127: a tracked PID whose own session_id is STILL live (no
+    # /clear at all - just a leftover old transcript some OTHER cwd
+    # sibling's search might otherwise steal a newer session away from) has
+    # a strictly weaker claim on any unclaimed newer sibling than a PID
+    # whose session_id has genuinely disappeared - the vanished one has no
+    # alternative at all, the still-live one always has itself. Resolving
+    # genuinely-vanished PIDs first means a still-live PID's own candidate
+    # search only ever sees whatever's left over, instead of racing an
+    # equally-eligible vanished PID for the same target purely by
+    # PID_DIR.glob() iteration order (glob order is filesystem-dependent,
+    # not sorted) - that race is what let an unnamed, ungrouped sibling
+    # whose own session was still perfectly present get relinked into an
+    # unrelated newer same-cwd session that a genuinely /clear'd sibling
+    # needed. A lone still-live, unnamed PID (no vanished competitor at
+    # all) is unaffected and keeps jumping to a newer sibling exactly as
+    # before - see test_resolve_clear_continuations_copies_organic_title_with_no_explicit_override.
+    def _has_self_match(item: tuple[Path, dict]) -> bool:
+        _, entry = item
+        cwd_sessions = by_cwd.get(entry.get("cwd"), [])
+        return any(session.session_id == entry.get("session_id") for session in cwd_sessions)
+
+    tracked.sort(key=_has_self_match)
+
     changed = False
     for tracking_file, entry in tracked:
         old_session_id = entry.get("session_id")
