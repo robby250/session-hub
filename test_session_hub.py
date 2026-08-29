@@ -7839,11 +7839,10 @@ class SessionActivityTests(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_running_context_menu_bring_up_window_resolves_exact_duplicate_name_row(self):
-        # task-2137: right-click a Running row with a name shared by another
-        # row in a different cwd - "Bring up window" must resolve the exact
-        # row clicked, the same identity Running's own double-click uses,
-        # never a different same-name sibling.
+    def test_running_context_menu_open_externally_resolves_exact_duplicate_name_row(self):
+        # task-2137/task-2142: right-click a Running row with a name shared by another
+        # row in a different cwd - "Open externally" must resolve the exact
+        # row clicked, never a different same-name sibling.
         claude_a = session_hub.Session(
             "Claude", "id-a", "t", "/tmp/vamp2137a", "/tmp/vamp2137a", 100,
             Path("/tmp/2137a.jsonl"), agent_name="vamp-shared",
@@ -7883,7 +7882,7 @@ class SessionActivityTests(unittest.TestCase):
                     added = [call.args[0] for call in menu_instance.addAction.call_args_list]
                     self.assertEqual(
                         [action.text() for action in added],
-                        ["Bring up window", "Stop session"],
+                        ["Open externally", "Stop session"],
                     )
                     with patch.object(window, "_focus_or_resume_session") as focus_mock:
                         added[0].trigger()
@@ -8308,6 +8307,335 @@ class ExtractLastMeaningfulBlockTests(unittest.TestCase):
         colored = "\x1b[38;5;231m● Something happened\x1b[39m\n\x1b[38;5;246m❯\x1b[39m\n"
         block = session_hub.extract_last_meaningful_block(colored)
         self.assertEqual(block, "● Something happened")
+
+
+class _FakeXtermProcess:
+    """Stands in for a real xterm subprocess.Popen handle. `.terminate()`/`.kill()` only flip
+    local flags -- there is nothing here that could ever reach tmux, which is the point: any test
+    asserting "no tmux kill" only has to prove this fake was never asked to run a tmux command."""
+
+    def __init__(self, argv):
+        self.argv = argv
+        self._alive = True
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return None if self._alive else 0
+
+    def terminate(self):
+        self.terminated = True
+        self._alive = False
+
+    def kill(self):
+        self.killed = True
+        self._alive = False
+
+    def wait(self, timeout=None):
+        return 0
+
+
+class _FakeWinIdContainer:
+    def __init__(self, winid):
+        self._winid = winid
+
+    def winId(self):
+        return self._winid
+
+
+class EmbedPrecheckTests(unittest.TestCase):
+    """task-2142 row453: _embed_precheck is pure -- table-tested with no Qt widget, X server,
+    xterm binary or tmux session involved at all."""
+
+    def test_table(self):
+        cases = [
+            (("xcb", "/usr/bin/xterm", 999), None),
+            (("wayland", "/usr/bin/xterm", 999), "X11"),
+            (("offscreen", "/usr/bin/xterm", 999), "X11"),
+            (("xcb", None, 999), "xterm"),
+            (("xcb", "/usr/bin/xterm", 0), "window id"),
+            (("xcb", "/usr/bin/xterm", None), "window id"),
+        ]
+        for args, expect_substr in cases:
+            reason = session_hub._embed_precheck(*args)
+            if expect_substr is None:
+                self.assertIsNone(reason, args)
+            else:
+                self.assertIsNotNone(reason, args)
+                self.assertIn(expect_substr, reason, args)
+
+
+class EmbeddedTerminalControllerTests(unittest.TestCase):
+    """task-2142 row453: hermetic fake-xterm/fake-tmux proof for exact argv/target, one-child
+    replacement, and that nothing here can ever touch tmux -- popen/which/platform_name are fully
+    injected, so none of this needs a real X server, xterm binary or tmux session."""
+
+    def _controller(self, xterm_path="/usr/bin/xterm", platform="xcb", winid=999):
+        container = _FakeWinIdContainer(winid)
+        calls = []
+
+        def fake_popen(argv):
+            calls.append(argv)
+            return _FakeXtermProcess(argv)
+
+        ctl = session_hub.EmbeddedTerminalController(
+            container, popen=fake_popen, which=lambda name: xterm_path,
+            platform_name=lambda: platform,
+        )
+        return ctl, calls
+
+    def test_attach_exact_argv_and_target(self):
+        ctl, calls = self._controller(winid=999)
+        ok, _detail = ctl.attach("vamp-worker2")
+        self.assertTrue(ok)
+        self.assertEqual(
+            calls, [["xterm", "-into", "999", "-e", "tmux", "attach-session", "-t", "vamp-worker2"]]
+        )
+        self.assertEqual(ctl.current_name, "vamp-worker2")
+
+    def test_switching_sessions_replaces_the_one_child_and_never_touches_tmux(self):
+        ctl, calls = self._controller()
+        ctl.attach("a")
+        first_proc = ctl.process
+        ctl.attach("b")
+        self.assertTrue(first_proc.terminated)
+        self.assertFalse(first_proc.killed)  # graceful terminate, not a hard kill
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(ctl.current_name, "b")
+        self.assertIsNot(ctl.process, first_proc)
+        for argv in calls:
+            self.assertNotIn("kill-session", argv)
+            self.assertNotIn("kill-server", argv)
+
+    def test_reattaching_the_same_alive_session_is_a_no_op_at_the_controller_level(self):
+        # (the widget-level no-op short-circuit lives in _switch_embedded_terminal; this proves
+        # the controller itself is safe to call attach() twice in a row regardless.)
+        ctl, calls = self._controller()
+        ctl.attach("a")
+        first_proc = ctl.process
+        ctl.attach("a")
+        self.assertTrue(first_proc.terminated)
+        self.assertEqual(len(calls), 2)
+
+    def test_not_x11_fails_closed_and_launches_nothing(self):
+        ctl, calls = self._controller(platform="offscreen")
+        ok, detail = ctl.attach("a")
+        self.assertFalse(ok)
+        self.assertIn("X11", detail)
+        self.assertEqual(calls, [])
+        self.assertIsNone(ctl.process)
+
+    def test_xterm_missing_fails_closed_and_launches_nothing(self):
+        ctl, calls = self._controller(xterm_path=None)
+        ok, detail = ctl.attach("a")
+        self.assertFalse(ok)
+        self.assertIn("xterm", detail)
+        self.assertEqual(calls, [])
+
+    def test_invalid_window_id_fails_closed_and_launches_nothing(self):
+        ctl, calls = self._controller(winid=0)
+        ok, detail = ctl.attach("a")
+        self.assertFalse(ok)
+        self.assertEqual(calls, [])
+
+    def test_detach_terminates_the_xterm_client_only_never_tmux(self):
+        ctl, _calls = self._controller()
+        ctl.attach("a")
+        proc = ctl.process
+        ctl.detach()
+        self.assertTrue(proc.terminated)
+        self.assertIsNone(ctl.process)
+        self.assertIsNone(ctl.current_name)
+
+    def test_detach_with_nothing_attached_is_a_safe_no_op(self):
+        ctl, _calls = self._controller()
+        ctl.detach()  # must not raise
+        self.assertIsNone(ctl.process)
+
+    def test_poll_alive_true_while_child_is_running(self):
+        ctl, _calls = self._controller()
+        ctl.attach("a")
+        self.assertTrue(ctl.poll_alive())
+        self.assertEqual(ctl.current_name, "a")  # unaffected by a live poll
+
+    def test_poll_alive_clears_state_without_touching_tmux_when_child_exits(self):
+        ctl, _calls = self._controller()
+        ctl.attach("a")
+        ctl.process._alive = False  # the child exited on its own (tmux session gone, crash, ...)
+        self.assertFalse(ctl.poll_alive())
+        self.assertIsNone(ctl.process)
+        self.assertIsNone(ctl.current_name)
+
+    def test_launch_oserror_fails_closed_without_raising(self):
+        container = _FakeWinIdContainer(999)
+
+        def raising_popen(argv):
+            raise OSError("xterm not executable")
+
+        ctl = session_hub.EmbeddedTerminalController(
+            container, popen=raising_popen, which=lambda name: "/usr/bin/xterm",
+            platform_name=lambda: "xcb",
+        )
+        ok, detail = ctl.attach("a")
+        self.assertFalse(ok)
+        self.assertIn("xterm", detail)
+        self.assertIsNone(ctl.process)
+
+
+class MetadataShrinkGuardTests(unittest.TestCase):
+    """task-2142 row453 incident, 2026-08-30: write_metadata must refuse to silently replace a
+    substantially-larger existing metadata.json with an implausibly small write -- see the
+    docstring at session_hub._refuse_drastic_metadata_shrink for the incident this backstops
+    (an ad-hoc unsandboxed debug script overwrote the real file via discover_sessions())."""
+
+    def test_fresh_install_no_existing_file_never_refuses(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(session_hub, "METADATA_PATH", Path(temp) / "metadata.json"):
+                session_hub._refuse_drastic_metadata_shrink({"sessions": {}})  # must not raise
+
+    def test_existing_file_below_min_bytes_never_refuses(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "metadata.json"
+            path.write_text("{}")
+            with patch.object(session_hub, "METADATA_PATH", path):
+                session_hub._refuse_drastic_metadata_shrink({"sessions": {}})  # must not raise
+
+    def test_drastic_shrink_refuses_and_leaves_the_file_untouched(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "metadata.json"
+            big = json.dumps({"sessions": {f"s{i}": {"x": "y" * 50} for i in range(200)}})
+            path.write_text(big)
+            before = path.read_text()
+            with patch.object(session_hub, "METADATA_PATH", path):
+                with self.assertRaises(RuntimeError):
+                    session_hub._refuse_drastic_metadata_shrink({"sessions": {}})
+            self.assertEqual(path.read_text(), before)
+
+    def test_modest_shrink_within_ratio_does_not_refuse(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "metadata.json"
+            data = {"sessions": {f"s{i}": {"x": "y" * 50} for i in range(20)}}
+            path.write_text(json.dumps(data))
+            with patch.object(session_hub, "METADATA_PATH", path):
+                trimmed = dict(data)
+                trimmed["sessions"] = dict(list(data["sessions"].items())[:16])  # ~80% remains
+                session_hub._refuse_drastic_metadata_shrink(trimmed)  # must not raise
+
+    def test_explicit_override_env_var_permits_a_drastic_shrink(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "metadata.json"
+            big = json.dumps({"sessions": {f"s{i}": {"x": "y" * 50} for i in range(200)}})
+            path.write_text(big)
+            with (
+                patch.object(session_hub, "METADATA_PATH", path),
+                patch.dict(os.environ, {"SESSION_HUB_ALLOW_METADATA_SHRINK": "1"}),
+            ):
+                session_hub._refuse_drastic_metadata_shrink({"sessions": {}})  # must not raise
+
+    def test_write_metadata_itself_refuses_end_to_end(self):
+        """Not just the pure helper -- write_metadata's real call path refuses too."""
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "metadata.json"
+            big = json.dumps({"sessions": {f"s{i}": {"x": "y" * 50} for i in range(200)}})
+            path.write_text(big)
+            before = path.read_text()
+            with (
+                patch.object(session_hub, "METADATA_PATH", path),
+                patch.object(session_hub, "DATA_DIR", Path(temp)),
+            ):
+                with self.assertRaises(RuntimeError):
+                    session_hub.write_metadata({"sessions": {}})
+            self.assertEqual(path.read_text(), before)
+
+
+class RunningTabEmbeddedTerminalTests(unittest.TestCase):
+    """task-2142 row453: widget-level proof that single click, Enter and double-click all converge
+    on the same exact embedded switch, and that a systemic embedding failure shows in-panel and
+    falls back to external attachment without silently doing nothing."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _window_with_one_running_session(self):
+        # Same fixture shape as the passing running_context_menu tests above: a tmux GROUP row
+        # (not a bare standalone Session) is what refresh_running_tab's group branch recognizes
+        # without a full self.sessions population.
+        session = session_hub.Session(
+            "Claude", "id-embed1", "t", "/tmp/vampembed", "/tmp/vampembed", 100,
+            Path("/tmp/vampembed.jsonl"), agent_name="vamp-embed",
+        )
+        metadata = {
+            "settings": {}, "sessions": {},
+            "groups": {"/tmp/vampembed": {"tmux": True, "rows": [{"name": "vamp-embed"}]}},
+        }
+        ctx = (
+            patch.object(session_hub, "read_metadata", return_value=metadata),
+            patch.object(session_hub, "claude_sessions", return_value=[session]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub, "tmux_session_alive", return_value=True),
+        )
+        for c in ctx:
+            c.start()
+        window = session_hub.SessionHub()
+        window.refresh_running_tab()
+        self.addCleanup(window.close)
+        for c in ctx:
+            self.addCleanup(c.stop)
+        return window
+
+    def test_click_enter_and_double_click_all_embed_the_exact_same_target(self):
+        window = self._window_with_one_running_session()
+        item = window.running_table.item(0, 0)
+        calls = []
+
+        def fake_popen(argv):
+            calls.append(argv)
+            return _FakeXtermProcess(argv)
+
+        # The controller instance already exists (built in SessionHub.__init__ with the real
+        # subprocess.Popen/shutil.which bound as early-evaluated default arguments), so patching
+        # the subprocess/shutil MODULES here would never reach it -- substitute its own injected
+        # seams directly instead, exactly what production code would pass at construction time.
+        window._embedded_terminal._popen = fake_popen
+        window._embedded_terminal._which = lambda name: "/usr/bin/xterm"
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            # single click (itemClicked)
+            window._activate_running_row(item)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][-1], "vamp-embed")
+            self.assertEqual(
+                window._running_terminal_stack.currentWidget(), window.running_terminal_container
+            )
+            # Enter/double-click on the SAME still-alive session (itemActivated) -- no new child
+            window._activate_running_row(item)
+            self.assertEqual(len(calls), 1)
+
+    def test_embedding_failure_shows_in_panel_and_falls_back_externally(self):
+        window = self._window_with_one_running_session()
+        item = window.running_table.item(0, 0)
+        with (
+            patch.object(session_hub.QApplication, "platformName", return_value="offscreen"),
+            patch.object(window, "_focus_or_resume_session") as focus_mock,
+        ):
+            window._activate_running_row(item)
+        self.assertEqual(
+            window._running_terminal_stack.currentWidget(), window.running_terminal_failure
+        )
+        self.assertIn("X11", window.running_terminal_failure.text())
+        focus_mock.assert_called_once_with("/tmp/vampembed", "vamp-embed", "id-embed1")
+
+    def test_close_ends_only_the_embedded_client_never_tmux(self):
+        window = self._window_with_one_running_session()
+        fake = _FakeXtermProcess(["xterm"])
+        window._embedded_terminal.process = fake
+        window._embedded_terminal.current_name = "vamp-embed"
+        with patch.object(session_hub, "QApplication") as qapp_cls:
+            qapp_cls.platformName.return_value = "offscreen"
+            window.close()
+        self.assertTrue(fake.terminated)
+        self.assertFalse(fake.killed)
 
 
 if __name__ == "__main__":

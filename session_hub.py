@@ -58,6 +58,8 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSlider,
     QSpinBox,
+    QSplitter,
+    QStackedLayout,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -1166,6 +1168,85 @@ def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | N
     return f"{expected_percent:.1f}% expected · {relative_percent:.1f}% {direction} pace"
 
 
+def _embed_precheck(platform_name: str, xterm_path: str | None, winid: int | None) -> str | None:
+    """Pure: the reason an embedded terminal cannot be attached right now, or None if every
+    precondition holds (task-2142 row453). Kept separate from EmbeddedTerminalController so every
+    branch is a plain string-in/string-out unit test with no Qt widget, X server or subprocess."""
+    if platform_name != "xcb":
+        return f"embedded terminal requires X11 (platform is {platform_name!r})"
+    if not xterm_path:
+        return "xterm is not installed"
+    if not winid or winid <= 0:
+        return "no valid native window id for the terminal container"
+    return None
+
+
+class EmbeddedTerminalController:
+    """Owns AT MOST ONE embedded xterm client (`xterm -into <winid> -e tmux attach-session -t
+    <name>`) attached to one container widget's native window (task-2142 row453). Switching
+    sessions gracefully ends only the OLD xterm client -- `detach()` never sends anything to tmux,
+    so the session a client was attached to keeps running headless exactly as before, the same
+    contract as a user manually detaching a real tmux client.
+
+    `popen`/`which`/`platform_name` are injectable so a hermetic test can drive every precheck,
+    switch, failure and one-child-replacement path without a real X server, xterm binary or tmux
+    session -- it only needs a fake with `.winId()`."""
+
+    def __init__(self, container, popen=subprocess.Popen, which=shutil.which,
+                 platform_name=lambda: QApplication.platformName()):
+        self._container = container
+        self._popen = popen
+        self._which = which
+        self._platform_name = platform_name
+        self.process: subprocess.Popen | None = None
+        self.current_name: str | None = None
+
+    def attach(self, name: str) -> tuple[bool, str]:
+        """Precheck BEFORE touching any existing client: a systemic failure (no X11, no xterm)
+        must never tear down an already-working embedded session just because the user clicked a
+        different row -- it fails the same way every time regardless, so check first."""
+        try:
+            winid = int(self._container.winId())
+        except (TypeError, ValueError):
+            winid = None
+        reason = _embed_precheck(self._platform_name(), self._which("xterm"), winid)
+        if reason:
+            return False, reason
+        self.detach()
+        argv = ["xterm", "-into", str(winid), "-e", "tmux", "attach-session", "-t", name]
+        try:
+            self.process = self._popen(argv)
+        except OSError as e:
+            self.process = None
+            return False, f"failed to launch xterm: {e}"
+        self.current_name = name
+        return True, "attached"
+
+    def detach(self) -> None:
+        if self.process is not None:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=2)
+        self.process = None
+        self.current_name = None
+
+    def poll_alive(self) -> bool:
+        """True if a client is currently attached and still running. Clears state -- without
+        touching tmux -- the moment the child has exited on its own, so the caller's next poll
+        tick shows the failure and can fall back to external attachment."""
+        if self.process is None:
+            return False
+        if self.process.poll() is not None:
+            self.process = None
+            self.current_name = None
+            return False
+        return True
+
+
 def format_reset_timestamp(timestamp: int | None) -> str:
     if not timestamp:
         return "Reset time unavailable"
@@ -1677,7 +1758,44 @@ def backup_metadata_once_per_day() -> None:
             old.unlink()
 
 
+
+# task-2142 row453 incident, 2026-08-30: an ad-hoc debug script imported session_hub without the
+# test-only XDG_DATA_HOME sandbox (see the comment atop test_session_hub.py, task-2134) and, via
+# discover_sessions() -> write_metadata(), clobbered the real ~13KB metadata.json with a throwaway
+# ~1KB test fixture. The once-per-day backup below made it recoverable, but a write this much
+# smaller than what is already on disk is itself a strong signal something upstream is wrong --
+# refuse by default. A real, intentional large purge (e.g. years of trashed-session cleanup) sets
+# SESSION_HUB_ALLOW_METADATA_SHRINK=1 to proceed anyway.
+METADATA_SHRINK_REFUSAL_RATIO = 0.25
+METADATA_SHRINK_REFUSAL_MIN_BYTES = 2000
+
+
+def _refuse_drastic_metadata_shrink(new_data: dict) -> None:
+    """Pure enough to unit test directly: raises if `new_data` would replace an existing on-disk
+    metadata.json with something implausibly smaller. No-ops on a fresh install (nothing to
+    protect) and on an already-tiny existing file (too noisy to be worth guarding)."""
+    if os.environ.get("SESSION_HUB_ALLOW_METADATA_SHRINK"):
+        return
+    if not METADATA_PATH.exists():
+        return
+    try:
+        current_size = METADATA_PATH.stat().st_size
+    except OSError:
+        return
+    if current_size < METADATA_SHRINK_REFUSAL_MIN_BYTES:
+        return
+    new_size = len(json.dumps(new_data, ensure_ascii=False).encode("utf-8"))
+    if new_size < current_size * METADATA_SHRINK_REFUSAL_RATIO:
+        raise RuntimeError(
+            f"write_metadata refused: new metadata is {new_size}B, under "
+            f"{METADATA_SHRINK_REFUSAL_RATIO:.0%} of the {current_size}B already at "
+            f"{METADATA_PATH} -- this looks like an accidental overwrite, not an intended purge. "
+            "Set SESSION_HUB_ALLOW_METADATA_SHRINK=1 to proceed anyway."
+        )
+
+
 def write_metadata(data: dict) -> None:
+    _refuse_drastic_metadata_shrink(data)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     backup_metadata_once_per_day()
     temp = METADATA_PATH.with_suffix(".tmp")
@@ -6462,24 +6580,65 @@ class SessionHub(QMainWindow):
         running_page = QWidget()
         running_layout = QVBoxLayout(running_page)
         running_layout.setContentsMargins(0, 0, 0, 0)
+
+        running_list_page = QWidget()
+        running_list_layout = QVBoxLayout(running_list_page)
+        running_list_layout.setContentsMargins(0, 0, 0, 0)
         self.running_table = QTableWidget(0, 3)
         self.running_table.setHorizontalHeaderLabels(["Name", "Status", "Last message"])
+        self.running_table.setToolTip(
+            "Click, Enter or double-click a row to attach the embedded terminal on the right.\n"
+            "Ctrl+Shift+O or right-click → Open externally opens that row's terminal in its "
+            "own window."
+        )
         self.running_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.running_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.running_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.running_table.setAlternatingRowColors(True)
         self.running_table.verticalHeader().setVisible(False)
         self.running_table.horizontalHeader().setStretchLastSection(True)
-        self.running_table.cellDoubleClicked.connect(self.reveal_running_row)
+        # task-2142 row453: single click, Enter and double-click all converge on the same exact
+        # embedded-terminal switch -- itemActivated already fires for both Enter and double-click
+        # in Qt, so only itemClicked (single click) needs a second connection.
+        self.running_table.itemClicked.connect(self._activate_running_row)
+        self.running_table.itemActivated.connect(self._activate_running_row)
         self.running_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.running_table.customContextMenuRequested.connect(self.running_context_menu)
-        running_layout.addWidget(self.running_table, 1)
+        running_list_layout.addWidget(self.running_table, 1)
         running_actions = QHBoxLayout()
         running_actions.addStretch(1)
         stop_button = QPushButton("Stop")
         stop_button.clicked.connect(self.stop_selected_running)
         running_actions.addWidget(stop_button)
-        running_layout.addLayout(running_actions)
+        running_list_layout.addLayout(running_actions)
+
+        running_terminal_page = QWidget()
+        running_terminal_stack = QStackedLayout(running_terminal_page)
+        self.running_terminal_placeholder = QLabel("Select a session to attach a terminal.")
+        self.running_terminal_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.running_terminal_failure = QLabel()
+        self.running_terminal_failure.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.running_terminal_failure.setWordWrap(True)
+        self.running_terminal_container = QWidget()
+        running_terminal_stack.addWidget(self.running_terminal_placeholder)
+        running_terminal_stack.addWidget(self.running_terminal_failure)
+        running_terminal_stack.addWidget(self.running_terminal_container)
+        self._running_terminal_stack = running_terminal_stack
+        self._embedded_terminal = EmbeddedTerminalController(self.running_terminal_container)
+        self._embedded_terminal_poll = QTimer(self)
+        self._embedded_terminal_poll.setInterval(1000)
+        self._embedded_terminal_poll.timeout.connect(self._poll_embedded_terminal)
+
+        running_splitter = QSplitter(Qt.Orientation.Horizontal)
+        running_splitter.addWidget(running_list_page)
+        running_splitter.addWidget(running_terminal_page)
+        running_splitter.setStretchFactor(0, 0)
+        running_splitter.setStretchFactor(1, 1)
+        running_layout.addWidget(running_splitter, 1)
+
+        external_shortcut = QShortcut(QKeySequence("Ctrl+Shift+O"), running_page)
+        external_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        external_shortcut.activated.connect(self.open_selected_running_externally)
 
         tabs = QTabWidget()
         tabs.addTab(all_sessions_page, "All Sessions")
@@ -6511,6 +6670,10 @@ class SessionHub(QMainWindow):
             self.settings().pop("window_geometry", None)
 
     def closeEvent(self, event) -> None:
+        # task-2142 row453: end only the embedded xterm CLIENT process -- detach() never touches
+        # tmux, so the session it was attached to (if any) stays running headless exactly as if
+        # the user had detached it themselves.
+        self._embedded_terminal.detach()
         if QApplication.platformName() != "offscreen":
             latest = read_metadata()
             latest.setdefault("settings", {}).update(self.settings())
@@ -7274,12 +7437,63 @@ class SessionHub(QMainWindow):
         threading.Thread(target=focus_window_by_title, args=(name,), daemon=True).start()
 
     def reveal_running_row(self, row: int, _column: int = 0) -> None:
-        """Double-click a Running row: bring its terminal to the front."""
+        """Open externally: bring a Running row's own terminal window to the front (or open one),
+        never the embedded panel. Reachable via the context menu action and the Ctrl+Shift+O
+        shortcut (task-2142 row453) -- single click/Enter/double-click switch the embedded panel
+        instead, see `_activate_running_row`."""
         item = self.running_table.item(row, 0)
         if not item:
             return
         cwd, name, session_id = item.data(Qt.ItemDataRole.UserRole)
         self._focus_or_resume_session(cwd, name, session_id)
+
+    def open_selected_running_externally(self) -> None:
+        """Ctrl+Shift+O: `reveal_running_row` for the currently selected row."""
+        row = self.running_table.currentRow()
+        if row < 0:
+            return
+        self.reveal_running_row(row)
+
+    def _activate_running_row(self, item) -> None:
+        """Single click, Enter or double-click on a Running row (task-2142 row453): switch the
+        embedded terminal panel to that exact tmux session. `itemActivated` already fires for both
+        Enter and double-click in Qt, so this one handler covers all three gestures."""
+        row = item.row()
+        name_item = self.running_table.item(row, 0)
+        if not name_item:
+            return
+        cwd, name, session_id = name_item.data(Qt.ItemDataRole.UserRole)
+        self._switch_embedded_terminal(cwd, name, session_id)
+
+    def _switch_embedded_terminal(self, cwd: str, name: str, session_id: str | None) -> None:
+        if (self._embedded_terminal.current_name == name
+                and self._embedded_terminal.poll_alive()):
+            return  # already attached to this exact session -- no needless restart
+        ok, detail = self._embedded_terminal.attach(name)
+        if ok:
+            self._embedded_terminal_poll.start()
+            self._running_terminal_stack.setCurrentWidget(self.running_terminal_container)
+            return
+        self._embedded_terminal_poll.stop()
+        self.running_terminal_failure.setText(
+            f"Could not embed a terminal for {name!r}: {detail}\n"
+            "Falling back to an external terminal window."
+        )
+        self._running_terminal_stack.setCurrentWidget(self.running_terminal_failure)
+        self._focus_or_resume_session(cwd, name, session_id)
+
+    def _poll_embedded_terminal(self) -> None:
+        """The embedded xterm child can exit on its own (tmux session ended, xterm crashed) --
+        caught here rather than only at the next explicit switch, so the panel never silently
+        keeps showing a dead terminal as if it were still attached."""
+        name = self._embedded_terminal.current_name
+        if self._embedded_terminal.poll_alive():
+            return
+        self._embedded_terminal_poll.stop()
+        if name is None:
+            return
+        self.running_terminal_failure.setText(f"The embedded terminal for {name!r} exited.")
+        self._running_terminal_stack.setCurrentWidget(self.running_terminal_failure)
 
     def running_context_menu(self, point) -> None:
         """Right-click a Running row: the same exact-identity focus/stop
@@ -7291,9 +7505,9 @@ class SessionHub(QMainWindow):
         row = item.row()
         self.running_table.setCurrentCell(row, 0)
         menu = QMenu(self)
-        bring_up_action = QAction("Bring up window", self)
-        bring_up_action.triggered.connect(lambda: self.reveal_running_row(row))
-        menu.addAction(bring_up_action)
+        external_action = QAction("Open externally", self)
+        external_action.triggered.connect(lambda: self.reveal_running_row(row))
+        menu.addAction(external_action)
         stop_action = QAction("Stop session", self)
         stop_action.triggered.connect(self.stop_selected_running)
         menu.addAction(stop_action)
