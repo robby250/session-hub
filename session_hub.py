@@ -2862,14 +2862,33 @@ def _codex_tail_turn_state(path: Path) -> tuple[str, float] | None:
     return result
 
 
+_CODEX_MAX_MARKER_LINE_BYTES = 4096  # a task_started/task_complete/
+# turn_aborted event_msg record is a tiny fixed-shape object (timestamp,
+# type, payload.type only) - it never carries a turn's actual tool output,
+# so a candidate line longer than this cannot be one. Gates both the
+# parser (cheap, avoids json.loads on a multi-megabyte string) and the
+# reverse-chunk walk's carried fragment (round-3 rework - see `oversized`
+# in _codex_scan_range_for_turn_marker).
+
+
 def _codex_parse_turn_marker_line(line: bytes) -> tuple[str, float] | None:
+    if len(line) > _CODEX_MAX_MARKER_LINE_BYTES:
+        return None
     try:
         record = json.loads(line)
     except ValueError:
         return None
-    if record.get("type") != "event_msg":
+    # json.loads can validly return a list/str/int/bool/None for a
+    # malformed or unrelated line, not just a dict - and even a genuine
+    # event_msg record's "payload" key can hold a non-dict value from a
+    # payload shape this code doesn't otherwise care about. Both used to
+    # crash on the following .get() call.
+    if not isinstance(record, dict) or record.get("type") != "event_msg":
         return None
-    kind = (record.get("payload") or {}).get("type")
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    kind = payload.get("type")
     if kind not in _CODEX_TURN_EVENTS:
         return None
     try:
@@ -2899,11 +2918,26 @@ def _codex_scan_range_for_turn_marker(
     must go - a round-2 rework fix. The prior version doubled a SINGLE
     read's size on every escalation with no cap, so a cold scan of a large
     rollout with no nearby marker could allocate a read approaching the
-    entire scanned range (observed: ~1.68GB). Reading in constant-size,
-    non-overlapping, strictly-backward chunks instead means the largest
-    single allocation is one chunk plus whatever partial line is still
-    unterminated (see `tail_fragment` below) - bounded by the size of the
-    one JSONL record straddling a chunk boundary, not by the file or range.
+    entire scanned range (observed: ~1.68GB).
+
+    A round-3 rework bounds the OTHER growth path: the carried
+    `tail_fragment` (a still-open, not-yet-newline-terminated candidate
+    line) used to be re-concatenated with every new chunk with no size
+    check, so one giant unterminated non-marker record (the >1MB/>20MB
+    tool-output case, same as the read-size bug but via string
+    concatenation instead of a single read) still grew to the record's
+    full size and copied it again on every iteration - O(n^2) for a single
+    n-byte line. Markers are tiny fixed-shape records, so a candidate
+    fragment longer than `_CODEX_MAX_MARKER_LINE_BYTES` can never become
+    one: once crossed, the fragment is dropped (not truncated-and-kept -
+    its bytes are worthless either way) and the walk switches to
+    `oversized` mode, which finds the boundary newline that starts the
+    giant line using only the freshly-read chunk (a `tail_fragment`, by
+    construction, never itself contains an embedded newline, so a new one
+    can only appear in a fresh chunk) without ever concatenating or
+    re-scanning the discarded bytes. Once that boundary is found, normal
+    parsing resumes on the (bounded) data before it - the giant line's own
+    remaining bytes are discarded, never rejoining `tail_fragment`.
 
     Also returns `resume_from`: the offset where the LAST (possibly
     incomplete) line within [floor, end) begins, as measured from the FIRST
@@ -2928,11 +2962,11 @@ def _codex_scan_range_for_turn_marker(
         # The still-incomplete line at the START of the most-recently-read
         # (more EOF-ward) chunk - its true start lies further back in the
         # file, so it is prefixed onto the NEXT (earlier) chunk's data
-        # rather than parsed on its own. Can grow past one chunk only when
-        # a single JSONL record itself straddles more than one chunk
-        # boundary (the giant tool-output-blob case) - bounded by that
-        # record's own size, not by the range being scanned.
+        # rather than parsed on its own. Bounded to
+        # _CODEX_MAX_MARKER_LINE_BYTES - beyond that, `oversized` takes
+        # over and this is left empty/unused (see docstring).
         tail_fragment = b""
+        oversized = False
         resume_from = end
         first_chunk = True
         while True:
@@ -2943,20 +2977,41 @@ def _codex_scan_range_for_turn_marker(
                 chunk = handle.read(read_size)
             except OSError:
                 return None, floor
-            combined = chunk + tail_fragment
             if first_chunk:
                 last_newline = chunk.rfind(b"\n")
                 resume_from = (
                     position if last_newline == -1 else position + last_newline + 1
                 )
                 first_chunk = False
+
+            if oversized:
+                boundary = chunk.rfind(b"\n")
+                if boundary == -1:
+                    # Still inside the oversized line - nothing worth
+                    # parsing or keeping in this chunk; walk further back
+                    # without growing any buffer.
+                    if position <= floor:
+                        return None, resume_from
+                    continue
+                # `boundary` is the newline that STARTS the oversized line
+                # (everything after it, still part of that line, is
+                # discarded); everything before it is fresh, normal data.
+                combined = chunk[:boundary]
+                oversized = False
+            else:
+                combined = chunk + tail_fragment
+                tail_fragment = b""
+
             if position <= floor:
                 lines = combined.split(b"\n")
-                tail_fragment = b""
             else:
                 parts = combined.split(b"\n")
-                tail_fragment = parts[0]  # may still be incomplete; carried back
+                prefix = parts[0]  # may still be incomplete; carried back
                 lines = parts[1:]
+                if len(prefix) > _CODEX_MAX_MARKER_LINE_BYTES:
+                    oversized = True
+                else:
+                    tail_fragment = prefix
             latest: tuple[str, float] | None = None
             for line in lines:
                 marker = _codex_parse_turn_marker_line(line)

@@ -6262,6 +6262,70 @@ class SessionActivityTests(unittest.TestCase):
         for size in read_sizes:
             self.assertLessEqual(size, session_hub._CODEX_TAIL_BYTES)
 
+    def test_codex_scan_skips_an_oversized_non_marker_line_without_unbounded_carry(self):
+        """Round-3 rework: markers are tiny fixed-shape records, so a
+        candidate line longer than _CODEX_MAX_MARKER_LINE_BYTES can never
+        be one - the carried tail_fragment must be dropped once it crosses
+        that bound (`oversized` mode), never grown further by re-reading
+        and re-concatenating a giant line's remaining bytes. Proven
+        black-box: no line ever handed to the parser exceeds the bound,
+        however large the underlying record actually is, and a normal
+        marker further back (itself straddling a chunk boundary) is still
+        found."""
+        chunk = 64
+        max_marker = 512
+        with patch.object(session_hub, "_CODEX_TAIL_BYTES", chunk), patch.object(
+            session_hub, "_CODEX_MAX_MARKER_LINE_BYTES", max_marker
+        ):
+            marker_line = json.dumps(self._event(time.time(), "task_started"))
+            self.assertGreater(len(marker_line), chunk)  # guarantees straddling
+            self.assertLessEqual(len(marker_line), max_marker)  # still recognizable
+            huge_non_marker = "n" * (chunk * 400)  # far past max_marker
+            content = "z" * 5 + "\n" + marker_line + "\n" + huge_non_marker + "\n"
+            path = self.temp / "oversized.jsonl"
+            path.write_text(content, encoding="utf-8")
+
+            seen_lengths: list[int] = []
+            real_parse = session_hub._codex_parse_turn_marker_line
+
+            def spy_parse(line):
+                seen_lengths.append(len(line))
+                return real_parse(line)
+
+            read_sizes: list[int] = []
+            with self._spy_on_path_reads(read_sizes), patch.object(
+                session_hub, "_codex_parse_turn_marker_line", side_effect=spy_parse
+            ):
+                result, resume_from = session_hub._codex_scan_range_for_turn_marker(
+                    path, 0, path.stat().st_size
+                )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "task_started")
+        for size in read_sizes:
+            self.assertLessEqual(size, chunk)
+        self.assertGreater(len(seen_lengths), 0)
+        for length in seen_lengths:
+            self.assertLessEqual(length, max_marker)
+        self.assertEqual(resume_from, path.stat().st_size)
+
+    def test_codex_parse_turn_marker_line_survives_non_dict_json(self):
+        """json.loads validly returns a list/str/int/bool/None for a
+        malformed or unrelated line, not just a dict - record.get() used
+        to crash on any of those instead of just reporting no marker."""
+        for bad in (b"[1, 2, 3]", b'"just a string"', b"null", b"42", b"true"):
+            self.assertIsNone(session_hub._codex_parse_turn_marker_line(bad))
+
+    def test_codex_parse_turn_marker_line_survives_non_dict_payload(self):
+        """A genuine event_msg record whose "payload" key holds a non-dict
+        value (a shape this code doesn't otherwise care about) used to
+        crash on `.get("type")` against that non-dict value."""
+        for bad_payload in (["task_started"], "task_started", None, 7):
+            line = json.dumps(
+                {"timestamp": _iso(time.time()), "type": "event_msg", "payload": bad_payload}
+            ).encode("utf-8")
+            self.assertIsNone(session_hub._codex_parse_turn_marker_line(line))
+
     def test_codex_tail_cache_evicts_oldest_path_once_over_the_bound(self):
         """codex_sessions() lists every thread ever recorded (no LIMIT), so a
         long-running GUI can be asked about far more distinct rollout paths
