@@ -1300,6 +1300,13 @@ class EmbeddedTerminalController:
         self.current_name: str | None = None
         self._child_winid: int | None = None
         self._pending_name: str | None = None
+        # Bumped on every successful launch (task-2142 row453 REWORK -- reviewer
+        # rework, stale-attach race: selecting session B while A's XID is still
+        # outstanding must not let A's late notifier/timeout callback finish or
+        # fail B's attach). The GUI layer snapshots `generation` right after
+        # `begin_attach` and passes it back into `finish_attach`; a mismatch
+        # means a newer attach has already superseded this one.
+        self.generation = 0
 
     def begin_attach(self, name: str) -> tuple[bool, str]:
         """Phase 1 of attaching: precheck + launch the helper ONLY -- does not block waiting for
@@ -1331,11 +1338,22 @@ class EmbeddedTerminalController:
             self.process = None
             return False, f"failed to launch the embedded terminal helper: {e}"
         self._pending_name = name
+        self.generation += 1
         return True, "launching"
 
-    def finish_attach(self, line: str | None) -> tuple[bool, str]:
+    def finish_attach(self, line: str | None, generation: int | None = None) -> tuple[bool | None, str]:
         """Phase 2: complete (or fail) the attach `begin_attach` started, given ONE stdout line
-        the caller already read (or None on timeout/EOF) (task-2142 row453 REWORK)."""
+        the caller already read (or None on timeout/EOF) (task-2142 row453 REWORK).
+
+        `generation` is the value `self.generation` held right after the matching
+        `begin_attach` call (reviewer rework: A->B stale-attach race). A mismatch means a
+        NEWER attach has since started and superseded this one -- return `(None, ...)` and
+        touch NOTHING (no detach, no `_pending_name`, no `current_name`/`_child_winid`),
+        since `self.process`/`self._pending_name` already belong to that newer attach.
+        `generation=None` (the `attach()` convenience wrapper, which is synchronous and
+        cannot race) always passes the check."""
+        if generation is not None and generation != self.generation:
+            return None, "a newer attach superseded this one"
         name = self._pending_name
         self._pending_name = None
         child_winid = None
@@ -1365,7 +1383,8 @@ class EmbeddedTerminalController:
         if not ok:
             return False, reason
         line = self._read_xid_line(self.process, 3.0)
-        return self.finish_attach(line)
+        ok, detail = self.finish_attach(line)
+        return bool(ok), detail
 
     def resize_to_container(self) -> None:
         """Re-fill the container on every resize (window resize, splitter drag) -- must be
@@ -6524,6 +6543,11 @@ class SessionHub(QMainWindow):
         # capture-pane invocations (window_activity alone tells us it changed).
         self._pane_activity_cache: dict[str, str] = {}
         self._pane_block_cache: dict[str, str] = {}
+        # task-2142 row453 REWORK (orchestrator search REWORK): every saved group row's
+        # identity, rebuilt once per refresh() straight from already-loaded metadata (no
+        # subprocess) -- what apply_filter's All Sessions branch searches to surface a
+        # matching member as its own directly-activatable row.
+        self._search_member_rows: list[tuple[str, str, str | None, str, str]] = []
         self.setWindowTitle("Session Hub")
         self.setWindowIcon(
             QIcon(str(APP_ICON)) if APP_ICON.is_file() else QIcon.fromTheme("utilities-terminal")
@@ -6572,9 +6596,15 @@ class SessionHub(QMainWindow):
     def _on_main_tab_changed(self, _index: int) -> None:
         # Refresh immediately on becoming visible instead of leaving the table up to
         # 2s stale after a tab switch -- cheap (one refresh), and it's exactly the
-        # moment a capture is now worth paying for.
+        # moment a capture is now worth paying for. refresh_running_tab() reapplies
+        # the current query itself; the All Sessions branch needs an explicit
+        # apply_filter() since nothing else refreshes it on tab switch (task-2142
+        # row453 REWORK -- orchestrator search REWORK: "filters whichever tab is
+        # visible" must also cover switching TO a tab with a query already typed).
         if self._running_tab_visible():
             self.refresh_running_tab()
+        else:
+            self.apply_filter()
 
     def build_ui(self) -> None:
         root = QWidget()
@@ -6622,7 +6652,12 @@ class SessionHub(QMainWindow):
             bar = QProgressBar()
             bar.setRange(0, 100)
             bar.setValue(0)
-            bar.setTextVisible(False)
+            # Centered remaining-% text at the SAME fixed size (task-2142 row453
+            # REWORK -- orchestrator visual REWORK): setAlignment/setFormat change
+            # what's drawn inside the existing 60x8 rect, never its geometry.
+            bar.setTextVisible(True)
+            bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            bar.setFormat("…")
             bar.setFixedSize(60, 8)
             bar.setToolTip("Loading…")
             usage_compact.addWidget(label)
@@ -6631,10 +6666,15 @@ class SessionHub(QMainWindow):
             self.usage_compact_bars[provider] = bar
         usage_compact.addStretch(1)
         self.usage_expand_button = QPushButton("Expand")
-        self.usage_expand_button.setCheckable(True)
-        self.usage_expand_button.toggled.connect(self.set_usage_expanded)
+        self.usage_expand_button.clicked.connect(lambda: self.set_usage_expanded(True))
         usage_compact.addWidget(self.usage_expand_button)
-        layout.addLayout(usage_compact)
+        # Wrapped in a QWidget (task-2142 row453 REWORK -- orchestrator visual
+        # REWORK) so the WHOLE compact strip -- labels, bars, Expand button --
+        # can be hidden as one unit once expanded; a bare QHBoxLayout has no
+        # setVisible of its own.
+        self.usage_compact_row = QWidget()
+        self.usage_compact_row.setLayout(usage_compact)
+        layout.addWidget(self.usage_compact_row)
 
         usage_frame = QFrame()
         usage_frame.setFrameShape(QFrame.Shape.StyledPanel)
@@ -6644,6 +6684,17 @@ class SessionHub(QMainWindow):
         usage_layout.setContentsMargins(12, 8, 12, 8)
         usage_layout.setHorizontalSpacing(18)
         usage_layout.setVerticalSpacing(4)
+        # Collapse lives in the expanded panel's OWN header row (top-right,
+        # alongside the per-provider header labels below), never a separate
+        # row of its own (task-2142 row453 REWORK -- orchestrator visual
+        # REWORK). Being a child of usage_frame, it hides for free whenever
+        # usage_frame does.
+        self.usage_collapse_button = QPushButton("Collapse")
+        self.usage_collapse_button.clicked.connect(lambda: self.set_usage_expanded(False))
+        usage_layout.addWidget(
+            self.usage_collapse_button, 0, len(PROVIDERS) * 2, 1, 1,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
+        )
         for column, provider in enumerate(PROVIDERS):
             offset = column * 2
             header = QLabel(f"<b>{provider} usage</b>")
@@ -6830,10 +6881,11 @@ class SessionHub(QMainWindow):
         refresh_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F5), self)
         refresh_shortcut.activated.connect(self.refresh_all)
 
-        settings_menu = self.menuBar().addMenu("Settings")
-        permissions_action = QAction("Launch permissions…", self)
-        permissions_action.triggered.connect(self.open_settings)
-        settings_menu.addAction(permissions_action)
+        # No top-left menubar (task-2142 row453 REWORK -- orchestrator layout REWORK): it only
+        # ever held a "Launch permissions…" entry wired to the exact same `open_settings` the
+        # toolbar's own Settings button (below, top-right of the toolbar row) already calls --
+        # a redundant blank row for a duplicate entry point. `self.menuBar()` is never called at
+        # all now, so QMainWindow never allocates one.
 
     def settings(self) -> dict:
         return self.metadata.setdefault("settings", {})
@@ -6880,9 +6932,14 @@ class SessionHub(QMainWindow):
 
     def set_usage_expanded(self, expanded: bool) -> None:
         """Transient only - never written to settings, so every fresh
-        launch (or window reload) starts back in the compact view."""
+        launch (or window reload) starts back in the compact view. Mutual
+        exclusion both directions (task-2142 row453 REWORK -- orchestrator
+        visual REWORK): expanding hides the compact strip entirely (labels,
+        bars, Expand button) so only the detailed per-window bars remain;
+        collapsing (via the button living inside the expanded panel's own
+        header) restores only the compact strip."""
         self.usage_detail_frame.setVisible(expanded)
-        self.usage_expand_button.setText("Collapse" if expanded else "Expand")
+        self.usage_compact_row.setVisible(not expanded)
 
     def update_new_provider_list(self) -> None:
         settings = self.settings()
@@ -7115,6 +7172,7 @@ class SessionHub(QMainWindow):
                 compact_bar = self.usage_compact_bars[provider]
                 compact_bar.setValue(0)
                 compact_bar.setStyleSheet("")
+                compact_bar.setFormat("…")
                 compact_bar.setToolTip("Loading…")
             worker = UsageWorker(provider)
             worker.signals.finished.connect(self.usage_loaded)
@@ -7232,9 +7290,11 @@ class SessionHub(QMainWindow):
         if worst is not None:
             compact_bar.setValue(worst[0])
             compact_bar.setStyleSheet(worst[1])
+            compact_bar.setFormat(f"{worst[0]}%")
         elif error:
             compact_bar.setValue(0)
             compact_bar.setStyleSheet("")
+            compact_bar.setFormat("—")
         compact_bar.setToolTip("\n".join(tooltip_lines) if tooltip_lines else (error or "Unavailable"))
 
     @staticmethod
@@ -7433,6 +7493,12 @@ class SessionHub(QMainWindow):
     def refresh(self) -> None:
         self.metadata = read_metadata()
         self.sessions = discover_sessions(self.metadata)
+        self._search_member_rows = [
+            (cwd, row["name"], row.get("session_key"), row.get("provider", "Claude"),
+             group.get("display_name") or Path(cwd).name or cwd)
+            for cwd, group in self.metadata.get("groups", {}).items()
+            for row in group.get("rows", [])
+        ]
         self.populate_session_table(self.table, self.sessions, self.SESSION_TABLE_COLUMNS)
         self.table.sortItems(
             self.SESSION_TABLE_COLUMNS.index("Last updated"), Qt.SortOrder.DescendingOrder
@@ -7541,6 +7607,10 @@ class SessionHub(QMainWindow):
             # explicit distinction (task-2142).
             last_message = self._pane_block_cache.get(row["name"], "")
             self.running_table.setItem(index, 2, self._detail_column_item(last_message))
+        # Reapply whatever query is currently typed (task-2142 row453 REWORK -- orchestrator
+        # search REWORK): this repopulates every 2s via _on_running_status_tick, and a search
+        # must keep filtering the live rows rather than reverting to unfiltered on the next tick.
+        self._apply_running_filter(self.search.text().strip().lower())
 
     def _status_column_item(self, state: str) -> QTableWidgetItem:
         label, color = activity_label(state)
@@ -7658,6 +7728,7 @@ class SessionHub(QMainWindow):
         bounded 3s singleShot (never periodic/recurring) timeout fallback -- never a blocking read
         on the GUI thread (task-2142 row453 REWORK -- orchestrator audit, 2026-08-30)."""
         process = self._embedded_terminal.process
+        generation = self._embedded_terminal.generation
         notifier = QSocketNotifier(process.stdout.fileno(), QSocketNotifier.Type.Read, self)
         timeout_timer = QTimer(self)
         timeout_timer.setSingleShot(True)
@@ -7671,7 +7742,7 @@ class SessionHub(QMainWindow):
             notifier.deleteLater()
             timeout_timer.stop()
             timeout_timer.deleteLater()
-            self._finish_embed_attach(cwd, name, session_id, line)
+            self._finish_embed_attach(cwd, name, session_id, line, generation)
 
         notifier.activated.connect(lambda _fd: finish(process.stdout.readline()))
         timeout_timer.timeout.connect(lambda: finish(None))
@@ -7682,8 +7753,14 @@ class SessionHub(QMainWindow):
         self._embed_await_timer = timeout_timer
 
     def _finish_embed_attach(self, cwd: str, name: str, session_id: str | None,
-                              line: str | None) -> None:
-        ok, detail = self._embedded_terminal.finish_attach(line)
+                              line: str | None, generation: int | None = None) -> None:
+        ok, detail = self._embedded_terminal.finish_attach(line, generation)
+        if ok is None:
+            # A newer attach (a different row clicked before this one's XID/timeout
+            # arrived) already superseded this generation -- the current controller
+            # state belongs to that newer attach; touch nothing here (task-2142
+            # row453 REWORK -- reviewer rework, stale-attach race).
+            return
         if ok:
             # finish_attach() already resized the child to the container's exact current size --
             # no need for a second _on_terminal_container_resize() call here.
@@ -7743,15 +7820,85 @@ class SessionHub(QMainWindow):
         menu.exec(self.running_table.viewport().mapToGlobal(point))
 
     def apply_filter(self) -> None:
+        """The search box filters whichever tab is visible (task-2142 row453 REWORK --
+        orchestrator search REWORK): Running gets `_apply_running_filter` (live rows, cached
+        data only, no rescan); All Sessions gets `_apply_all_sessions_filter` (also exposes
+        matching saved group members as directly-activatable rows)."""
         query = self.search.text().strip().lower()
+        if self.main_tabs.currentWidget() is self.running_page:
+            self._apply_running_filter(query)
+        else:
+            self._apply_all_sessions_filter(query)
+
+    def _apply_running_filter(self, query: str) -> None:
+        """Filters `running_table`'s already-populated rows by name, status, last-message
+        text, AND the hidden identity fields (cwd/exact tmux name/session id) carried in
+        column 0's UserRole data -- entirely from what's already rendered/cached, never a new
+        discovery or capture pass (task-2142 row453 REWORK -- orchestrator search REWORK)."""
+        for row in range(self.running_table.rowCount()):
+            name_item = self.running_table.item(row, 0)
+            if not name_item:
+                continue
+            cwd, name, session_id = name_item.data(Qt.ItemDataRole.UserRole)
+            status_item = self.running_table.item(row, 1)
+            detail_item = self.running_table.item(row, 2)
+            haystack = " ".join(
+                str(part) for part in (
+                    name_item.text(), status_item.text() if status_item else "",
+                    detail_item.text() if detail_item else "", cwd, name, session_id,
+                ) if part
+            ).lower()
+            self.running_table.setRowHidden(row, bool(query) and query not in haystack)
+
+    def _apply_all_sessions_filter(self, query: str) -> None:
+        """Text-filters the ordinary grouped rows; a non-empty query additionally surfaces
+        matching saved group members (from `_search_member_rows`, rebuilt once per refresh()
+        with no subprocess) as their own directly-activatable rows, while the group's own
+        collapsed summary row hides during search -- the member row already represents it,
+        and showing both would be the "duplicate" the brief asks to avoid. Clearing the query
+        drops every synthetic row and restores the plain grouped table exactly (task-2142
+        row453 REWORK -- orchestrator search REWORK)."""
+        base_rows = len(self.sessions)
+        if self.table.rowCount() > base_rows:
+            self.table.setRowCount(base_rows)  # drop synthetic member rows from a prior query
+        by_key = {session.key: session for session in self.sessions}
         shown = 0
-        for row in range(self.table.rowCount()):
+        for row in range(base_rows):
+            item0 = self.table.item(row, 0)
+            session = by_key.get(item0.data(Qt.ItemDataRole.UserRole + 1)) if item0 else None
             text = " ".join(
                 self.table.item(row, column).text() for column in range(self.table.columnCount())
             ).lower()
-            visible = not query or query in text
+            if query and session is not None and self.is_group_session(session):
+                visible = False
+            else:
+                visible = not query or query in text
             self.table.setRowHidden(row, not visible)
             shown += int(visible)
+        if query:
+            self.table.setSortingEnabled(False)
+            seen_identities = set()
+            columns = self.SESSION_TABLE_COLUMNS
+            for cwd, name, session_key, provider, display_name in self._search_member_rows:
+                haystack = " ".join(
+                    str(part) for part in (cwd, name, session_key, provider, display_name) if part
+                ).lower()
+                if query not in haystack or (cwd, name) in seen_identities:
+                    continue
+                seen_identities.add((cwd, name))
+                values = {
+                    "Agent": provider, "Model": "", "Name": f"{name}  ({display_name})",
+                    "Working directory": cwd, "Last updated": "", "Session ID": session_key or "",
+                }
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                for col, column in enumerate(columns):
+                    cell = QTableWidgetItem(values.get(column, ""))
+                    if col == 0:
+                        cell.setData(Qt.ItemDataRole.UserRole + 2, (cwd, name, session_key))
+                    self.table.setItem(row, col, cell)
+                shown += 1
+            self.table.setSortingEnabled(True)
         self.status.setText(f"{shown} of {len(self.sessions)} sessions")
 
     def selected(self) -> Session | None:
@@ -8248,7 +8395,22 @@ class SessionHub(QMainWindow):
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(self, "Could not launch session", str(error))
 
+    def _selected_search_member(self) -> tuple[str, str, str | None] | None:
+        """(cwd, name, session_id) if the currently-selected All Sessions row is a search-
+        surfaced group member (task-2142 row453 REWORK -- orchestrator search REWORK), else
+        None. Column 0's UserRole+2 data is only ever set on those synthetic rows."""
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        item = self.table.item(row, 0)
+        return item.data(Qt.ItemDataRole.UserRole + 2) if item else None
+
     def resume_selected(self) -> None:
+        member = self._selected_search_member()
+        if member:
+            cwd, name, session_id = member
+            self._focus_or_resume_session(cwd, name, session_id)
+            return
         session = self.selected()
         if not session:
             return
@@ -9396,10 +9558,22 @@ class SessionHub(QMainWindow):
             return
         self.table.setCurrentCell(item.row(), item.column())
         menu = QMenu(self)
-        for label, slot in self.context_menu_actions():
-            action = QAction(label, self)
-            action.triggered.connect(slot)
+        member = self._selected_search_member()
+        if member:
+            # A search-surfaced group member (task-2142 row453 REWORK -- orchestrator search
+            # REWORK) isn't a full Session -- the rest of context_menu_actions() assumes one.
+            # One action, wired to the same exact-identity launch Enter/double-click use.
+            cwd, name, session_id = member
+            action = QAction("Open", self)
+            action.triggered.connect(
+                lambda: self._focus_or_resume_session(cwd, name, session_id)
+            )
             menu.addAction(action)
+        else:
+            for label, slot in self.context_menu_actions():
+                action = QAction(label, self)
+                action.triggered.connect(slot)
+                menu.addAction(action)
         menu.exec(self.table.viewport().mapToGlobal(point))
 
 

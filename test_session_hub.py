@@ -35,7 +35,7 @@ atexit.register(shutil.rmtree, _TEST_XDG_DATA_HOME, ignore_errors=True)
 
 from PyQt6.QtCore import QPoint
 from PyQt6.QtGui import QResizeEvent
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMenuBar
 
 import session_hub
 import session_hub_tui
@@ -602,6 +602,10 @@ class SessionHubTests(unittest.TestCase):
             window.close()
 
     def test_usage_expand_button_toggles_detail_frame_transiently(self):
+        """task-2142 row453 REWORK (orchestrator visual REWORK): Expand/Collapse are two
+        separate fixed-label buttons now, not one checkable button that renames itself -- see
+        the mutual-exclusion tests below for the compact-strip-hides / collapse-lives-in-header
+        halves of this."""
         metadata = {
             "sessions": {},
             "settings": {"enable_codex": True, "enable_claude": True,
@@ -610,12 +614,77 @@ class SessionHubTests(unittest.TestCase):
         with patch("session_hub.read_metadata", return_value=metadata):
             window = session_hub.SessionHub()
         try:
-            window.usage_expand_button.setChecked(True)
+            window.usage_expand_button.click()
             self.assertFalse(window.usage_detail_frame.isHidden())
-            self.assertEqual(window.usage_expand_button.text(), "Collapse")
-            window.usage_expand_button.setChecked(False)
+            window.usage_collapse_button.click()
             self.assertTrue(window.usage_detail_frame.isHidden())
             self.assertNotIn("usage_expanded", window.settings())
+        finally:
+            window.close()
+
+    def test_expanding_hides_the_whole_compact_strip_not_just_relabels_a_button(self):
+        """Expand must hide the compact strip (labels/bars/Expand button) so only the detailed
+        per-window bars remain (task-2142 row453 REWORK -- orchestrator visual REWORK)."""
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertFalse(window.usage_compact_row.isHidden())
+            window.set_usage_expanded(True)
+            self.assertTrue(window.usage_compact_row.isHidden())
+            self.assertFalse(window.usage_detail_frame.isHidden())
+            window.set_usage_expanded(False)
+            self.assertFalse(window.usage_compact_row.isHidden())
+            self.assertTrue(window.usage_detail_frame.isHidden())
+        finally:
+            window.close()
+
+    def test_collapse_button_lives_inside_the_expanded_panel_own_header(self):
+        """Not a separate row of its own -- the Collapse button is a child of
+        `usage_detail_frame` itself (task-2142 row453 REWORK -- orchestrator visual REWORK), so
+        it is hidden/shown for free by the same setVisible call as the rest of the panel."""
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertIs(window.usage_collapse_button.parentWidget(), window.usage_detail_frame)
+            self.assertIsNot(
+                window.usage_collapse_button.parentWidget(), window.usage_compact_row
+            )
+        finally:
+            window.close()
+
+    def test_no_menubar_no_duplicate_settings_entry_remaining_button_still_opens_settings(self):
+        """task-2142 row453 REWORK (orchestrator layout REWORK): the redundant top-left
+        Settings menubar/menu is gone -- QMainWindow never allocates a QMenuBar (no blank
+        row), there's exactly one "Settings" entry point left (the toolbar button), and it
+        still reaches `open_settings` exactly as before."""
+        metadata = {"sessions": {}, "settings": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertIsNone(window.findChild(QMenuBar))
+            settings_buttons = [
+                w for w in window.findChildren(session_hub.QPushButton)
+                if w.text() == "Settings"
+            ]
+            self.assertEqual(len(settings_buttons), 1)
+            # Qt's clicked.connect(self.open_settings) bound to the REAL method at connect
+            # time -- patch.object(window, "open_settings") afterwards wouldn't retarget it,
+            # so mock the dialog class itself and let the real open_settings run, with
+            # SettingsDialog.exec() returning immediately instead of blocking on a real modal.
+            with patch("session_hub.SettingsDialog") as dialog_cls:
+                dialog_cls.return_value.exec.return_value = session_hub.QDialog.DialogCode.Rejected
+                settings_buttons[0].click()
+            dialog_cls.assert_called_once()
         finally:
             window.close()
 
@@ -641,6 +710,12 @@ class SessionHubTests(unittest.TestCase):
             self.assertEqual(compact_bar.value(), 40)
             self.assertIn("5-hour", compact_bar.toolTip())
             self.assertIn("Weekly", compact_bar.toolTip())
+            # Centered remaining-% text at the SAME fixed size, not an added row
+            # (task-2142 row453 REWORK -- orchestrator visual REWORK).
+            self.assertTrue(compact_bar.isTextVisible())
+            self.assertEqual(compact_bar.alignment(), session_hub.Qt.AlignmentFlag.AlignCenter)
+            self.assertEqual(compact_bar.format(), "40%")
+            self.assertEqual((compact_bar.width(), compact_bar.height()), (60, 8))
         finally:
             window.close()
 
@@ -8756,6 +8831,64 @@ class EmbeddedTerminalControllerTests(unittest.TestCase):
         self.assertIsNone(ctl.current_name)
         self.assertEqual(embedder.calls, [])
 
+    def _stale_generation_controller(self):
+        """A->B selection before A's XID ever arrives (task-2142 row453 REWORK -- reviewer
+        rework: session_hub.py:7646-7677 stale notifier/timeout race). No `_controller()` fixture
+        reuse here -- this needs two independently-controlled fake processes, one per
+        begin_attach call, which the shared fixture's single `xid_line` can't express."""
+        container = _FakeWinIdContainer(999, 640, 480)
+        embedder = _FakeEmbedder()
+        ctl = session_hub.EmbeddedTerminalController(
+            container, popen=lambda argv, **kw: _FakeEmbedProcess(argv, stdout_lines=()),
+            which=lambda name: f"/usr/bin/{name}", platform_name=lambda: "xcb",
+            embedder=embedder, read_xid_line=lambda proc, timeout: None,
+            helper_ready=lambda: True, profile_uuid=lambda: None,
+        )
+        return ctl, embedder
+
+    def test_stale_generation_late_xid_never_overwrites_a_newer_attach(self):
+        """A's helper answers late, AFTER B is already attached -- A's XID must never be
+        recorded as B's (the "misattributes B" half of the reviewer finding)."""
+        ctl, embedder = self._stale_generation_controller()
+        ok, _detail = ctl.begin_attach("session-a")
+        self.assertTrue(ok)
+        generation_a = ctl.generation
+        ok, _detail = ctl.begin_attach("session-b")
+        self.assertTrue(ok)
+        generation_b = ctl.generation
+        self.assertNotEqual(generation_a, generation_b)
+        ok, _detail = ctl.finish_attach("XID=777\n", generation_b)
+        self.assertTrue(ok)
+        self.assertEqual(ctl.current_name, "session-b")
+        # A's late (and, in this scenario, otherwise-valid-looking) XID line arrives after B
+        # already attached -- stale generation must be silently ignored: no state mutation.
+        ok, _detail = ctl.finish_attach("XID=111\n", generation_a)
+        self.assertIsNone(ok)
+        self.assertEqual(ctl.current_name, "session-b")
+        self.assertEqual(embedder.calls, [(777, 640, 480)])
+
+    def test_stale_generation_late_timeout_never_detaches_a_newer_attach(self):
+        """A's timeout/EOF fires late, AFTER B is already attached -- it must never call
+        `detach()` and kill B's live process (the "detaches the live B process" half of the
+        reviewer finding)."""
+        ctl, embedder = self._stale_generation_controller()
+        ok, _detail = ctl.begin_attach("session-a")
+        self.assertTrue(ok)
+        generation_a = ctl.generation
+        ok, _detail = ctl.begin_attach("session-b")
+        self.assertTrue(ok)
+        generation_b = ctl.generation
+        ok, _detail = ctl.finish_attach("XID=777\n", generation_b)
+        self.assertTrue(ok)
+        b_process = ctl.process
+        self.assertIsNotNone(b_process)
+        ok, _detail = ctl.finish_attach(None, generation_a)  # A's stale timeout/EOF
+        self.assertIsNone(ok)
+        self.assertEqual(ctl.current_name, "session-b")
+        self.assertIs(ctl.process, b_process)
+        self.assertFalse(b_process.terminated)
+        self.assertEqual(embedder.calls, [(777, 640, 480)])
+
 
 class MetadataShrinkGuardTests(unittest.TestCase):
     """task-2142 row453 incident, 2026-08-30: write_metadata must refuse to silently replace a
@@ -9016,6 +9149,140 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
             window.close()
         self.assertTrue(fake.terminated)
         self.assertFalse(fake.killed)
+
+
+class SearchFilterTests(unittest.TestCase):
+    """task-2142 row453 REWORK (orchestrator search REWORK): the search box filters whichever
+    tab is visible. Running gets a cached-data-only filter over its already-populated rows
+    (name/status/last-message plus hidden identity fields); All Sessions additionally surfaces
+    matching saved group members as their own directly-activatable rows."""
+
+    def _window(self, metadata=None):
+        metadata = metadata or {"sessions": {}, "settings": {}, "groups": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        self.addCleanup(window.close)
+        return window
+
+    def test_running_search_matches_name_status_last_message_and_hidden_identity_field(self):
+        window = self._window()
+        window.running_table.setRowCount(2)
+        item_a = session_hub.QTableWidgetItem("alpha")
+        item_a.setData(session_hub.Qt.ItemDataRole.UserRole, ("/tmp/alpha", "alpha", "sess-alpha-id"))
+        window.running_table.setItem(0, 0, item_a)
+        window.running_table.setItem(0, 1, session_hub.QTableWidgetItem("Working"))
+        window.running_table.setItem(0, 2, session_hub.QTableWidgetItem("building the widget"))
+        item_b = session_hub.QTableWidgetItem("beta")
+        item_b.setData(session_hub.Qt.ItemDataRole.UserRole, ("/tmp/beta", "beta", "sess-beta-id"))
+        window.running_table.setItem(1, 0, item_b)
+        window.running_table.setItem(1, 1, session_hub.QTableWidgetItem("Idle"))
+        window.running_table.setItem(1, 2, session_hub.QTableWidgetItem("waiting"))
+
+        window._apply_running_filter("beta")  # name
+        self.assertTrue(window.running_table.isRowHidden(0))
+        self.assertFalse(window.running_table.isRowHidden(1))
+
+        window._apply_running_filter("working")  # status
+        self.assertFalse(window.running_table.isRowHidden(0))
+        self.assertTrue(window.running_table.isRowHidden(1))
+
+        window._apply_running_filter("waiting")  # last message
+        self.assertTrue(window.running_table.isRowHidden(0))
+        self.assertFalse(window.running_table.isRowHidden(1))
+
+        window._apply_running_filter("sess-alpha-id")  # hidden identity field, never shown text
+        self.assertFalse(window.running_table.isRowHidden(0))
+        self.assertTrue(window.running_table.isRowHidden(1))
+
+        window._apply_running_filter("")  # cleared
+        self.assertFalse(window.running_table.isRowHidden(0))
+        self.assertFalse(window.running_table.isRowHidden(1))
+
+    def test_running_tab_search_never_triggers_a_rescan_per_keystroke(self):
+        # Exercises `_apply_running_filter` directly (never a real tab switch, which would
+        # itself trigger refresh_running_tab()'s own -- separate, expected -- discovery pass)
+        # so this control isolates exactly what the perf requirement covers: the search
+        # keystrokes themselves, not tab activation.
+        window = self._window()
+        window.running_table.setRowCount(1)
+        item = session_hub.QTableWidgetItem("alpha")
+        item.setData(session_hub.Qt.ItemDataRole.UserRole, ("/tmp/alpha", "alpha", None))
+        window.running_table.setItem(0, 0, item)
+        window.running_table.setItem(0, 1, session_hub.QTableWidgetItem("Idle"))
+        window.running_table.setItem(0, 2, session_hub.QTableWidgetItem(""))
+        with patch("session_hub.codex_sessions") as codex, \
+                patch("session_hub.claude_sessions") as claude, \
+                patch("session_hub.antigravity_sessions") as antigravity, \
+                patch("session_hub.tmux_live_session_names") as live_names, \
+                patch("session_hub.tmux_pane_activity_snapshot") as pane_snapshot:
+            window._apply_running_filter("a")
+            window._apply_running_filter("al")
+            window._apply_running_filter("alpha")
+        codex.assert_not_called()
+        claude.assert_not_called()
+        antigravity.assert_not_called()
+        live_names.assert_not_called()
+        pane_snapshot.assert_not_called()
+
+    def test_all_sessions_search_surfaces_matching_member_excludes_sibling_no_duplicate(self):
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": False, "enable_claude": False, "enable_antigravity": False},
+            "groups": {
+                "/tmp/proj": {
+                    "cwd": "/tmp/proj", "display_name": "proj",
+                    "rows": [
+                        {"name": "matching-row", "provider": "Claude"},
+                        {"name": "other-row", "provider": "Claude"},
+                    ],
+                }
+            },
+            "links": {},
+        }
+        window = self._window(metadata)
+        base_rows = window.table.rowCount()
+        self.assertEqual(base_rows, 1)  # the group's one collapsed summary row
+
+        window.search.setText("matching")
+        self.assertEqual(window.table.rowCount(), base_rows + 1)
+        self.assertTrue(window.table.isRowHidden(0))  # collapsed summary hides during search
+        self.assertFalse(window.table.isRowHidden(base_rows))
+        name_column = window.SESSION_TABLE_COLUMNS.index("Name")
+        names = [window.table.item(row, name_column).text() for row in range(window.table.rowCount())]
+        self.assertEqual(sum("matching-row" in n for n in names), 1)  # exactly once, no duplicate
+        self.assertFalse(any("other-row" in n for n in names))  # nonmatching sibling excluded
+
+        member_item = window.table.item(base_rows, 0)
+        self.assertEqual(
+            member_item.data(session_hub.Qt.ItemDataRole.UserRole + 2),
+            ("/tmp/proj", "matching-row", None),
+        )
+        window.table.setCurrentCell(base_rows, 0)
+        with patch.object(window, "_focus_or_resume_session") as focus_or_resume:
+            window.resume_selected()
+        focus_or_resume.assert_called_once_with("/tmp/proj", "matching-row", None)
+
+        window.search.setText("")  # cleared -- restores the ordinary grouped table exactly
+        self.assertEqual(window.table.rowCount(), base_rows)
+        self.assertFalse(window.table.isRowHidden(0))
+
+    def test_all_sessions_search_never_triggers_a_rescan_per_keystroke(self):
+        metadata = {
+            "sessions": {}, "settings": {}, "groups": {
+                "/tmp/proj": {"cwd": "/tmp/proj", "display_name": "proj",
+                              "rows": [{"name": "row-a", "provider": "Claude"}]},
+            },
+        }
+        window = self._window(metadata)
+        with patch("session_hub.codex_sessions") as codex, \
+                patch("session_hub.claude_sessions") as claude, \
+                patch("session_hub.antigravity_sessions") as antigravity:
+            window.search.setText("r")
+            window.search.setText("ro")
+            window.search.setText("row-a")
+        codex.assert_not_called()
+        claude.assert_not_called()
+        antigravity.assert_not_called()
 
 
 @unittest.skipUnless(shutil.which("Xvfb"), "Xvfb not installed")
