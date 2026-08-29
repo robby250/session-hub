@@ -6753,7 +6753,49 @@ class SessionActivityTests(unittest.TestCase):
             "notification_type": "permission_prompt",
             "message": "approve?",
         })
-        self.assertEqual(mapped, ("needs_input", "approve?"))
+        self.assertEqual(mapped, ("needs_input", "approve?", "permission_prompt"))
+
+    def test_claude_idle_prompt_notification_maps_to_idle_not_needs_input(self):
+        mapped = session_hub.hook_event_to_status({
+            "hook_event_name": "Notification",
+            "notification_type": "idle_prompt",
+            "message": "waiting",
+        })
+        self.assertEqual(mapped, ("idle", "waiting", ""))
+
+    def test_needs_input_record_with_no_reason_fails_closed_to_idle(self):
+        session_id = "id-legacy-needs-input"
+        # Simulates a status file written before "reason" existed, or by any
+        # non-blocking path - state alone must never be trusted as evidence
+        # of a real blocker.
+        session_hub.write_session_status(session_id, "needs_input", "waiting")
+        session = session_hub.Session(
+            "Claude", session_id, "t", "/tmp", "/tmp", 0, Path("/tmp/x.jsonl")
+        )
+        with patch.object(session_hub, "session_is_tracked_alive", return_value=True):
+            state, _ = session_hub.session_activity(session)
+        self.assertEqual(state, "idle")
+
+    def test_needs_input_record_with_blocking_reason_stays_needs_input(self):
+        session_id = "id-real-needs-input"
+        session_hub.write_session_status(
+            session_id, "needs_input", "approve?", reason="permission_prompt"
+        )
+        session = session_hub.Session(
+            "Claude", session_id, "t", "/tmp", "/tmp", 0, Path("/tmp/x.jsonl")
+        )
+        with patch.object(session_hub, "session_is_tracked_alive", return_value=True):
+            state, _ = session_hub.session_activity(session)
+        self.assertEqual(state, "needs_input")
+
+    def test_live_claude_session_with_no_status_file_reads_idle(self):
+        session_id = "id-just-launched"
+        session = session_hub.Session(
+            "Claude", session_id, "t", "/tmp", "/tmp", 0, Path("/tmp/x.jsonl")
+        )
+        with patch.object(session_hub, "session_is_tracked_alive", return_value=True):
+            state, _ = session_hub.session_activity(session)
+        self.assertEqual(state, "idle")
 
     def test_codex_notify_never_produces_needs_input(self):
         # Documented, deliberate limitation (hook_event_to_status_codex):
@@ -6834,7 +6876,9 @@ class SessionActivityTests(unittest.TestCase):
     # --- two same-cwd sessions => exact ids, no cross-talk --------------
     def test_two_same_cwd_sessions_get_independent_activity_states(self):
         session_hub.write_session_status("id-a", "working", "")
-        session_hub.write_session_status("id-b", "needs_input", "pick one")
+        session_hub.write_session_status(
+            "id-b", "needs_input", "pick one", reason="permission_prompt"
+        )
         a = session_hub.Session("Claude", "id-a", "a", "/tmp/vamp", "/tmp/vamp", 100, Path("/tmp/a.jsonl"))
         b = session_hub.Session("Claude", "id-b", "b", "/tmp/vamp", "/tmp/vamp", 200, Path("/tmp/b.jsonl"))
         with patch.object(session_hub, "session_is_tracked_alive", return_value=True):
@@ -7279,7 +7323,9 @@ class SessionActivityTests(unittest.TestCase):
             "Claude", "id-shared", "shared", "/tmp/vamp", "/tmp/vamp", 100,
             Path("/tmp/shared.jsonl"),
         )
-        session_hub.write_session_status("id-shared", "needs_input", "approve the plan?")
+        session_hub.write_session_status(
+            "id-shared", "needs_input", "approve the plan?", reason="permission_prompt"
+        )
         row = {"name": "VAMP-shared", "provider": "Claude", "session_key": "Claude:id-shared"}
         session_hub.METADATA_PATH.write_text(
             json.dumps({

@@ -2860,11 +2860,13 @@ def hook_notify_command() -> list[str]:
     return [sys.executable, str(Path(__file__).resolve()), "--hook-notify"]
 
 
-def write_session_status(session_id: str, state: str, detail: str = "") -> None:
+def write_session_status(session_id: str, state: str, detail: str = "", reason: str = "") -> None:
     STATUS_DIR.mkdir(parents=True, exist_ok=True)
     path = STATUS_DIR / f"{session_id}.json"
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"state": state, "ts": time.time(), "detail": detail}))
+    tmp.write_text(
+        json.dumps({"state": state, "ts": time.time(), "detail": detail, "reason": reason})
+    )
     tmp.replace(path)
 
 
@@ -2894,15 +2896,22 @@ def all_session_statuses() -> list[tuple[str, dict]]:
     return entries
 
 
-_NEEDS_INPUT_NOTIFICATION_TYPES = {"idle_prompt", "permission_prompt", "agent_needs_input"}
+# Notification types that are a genuine blocker on the agent - the ONLY
+# reasons a status file may legitimately carry state="needs_input". A record
+# with state="needs_input" and a reason outside this set (or no "reason" key
+# at all - every file written before this set existed) is not trustworthy
+# evidence of a real blocker and must fail closed to Idle; see
+# _resolve_claude_state.
+_BLOCKING_NOTIFICATION_TYPES = {"permission_prompt", "agent_needs_input"}
 
 
-def hook_event_to_status(payload: dict) -> tuple[str, str] | None:
-    """(state, detail) for one hook stdin payload, or None if this event
-    doesn't change status - see hook_notify_cli."""
+def hook_event_to_status(payload: dict) -> tuple[str, str, str] | None:
+    """(state, detail, reason) for one hook stdin payload, or None if this
+    event doesn't change status - see hook_notify_cli. `reason` is the raw
+    notification_type behind a "needs_input" state, "" otherwise."""
     event = payload.get("hook_event_name")
     if event == "UserPromptSubmit":
-        return "working", ""
+        return "working", "", ""
     if event == "SessionStart":
         # Fires for plain "startup" too, but also for "resume"/"compact"/
         # "clear" - a /compact or a scheduled wakeup resume isn't the agent
@@ -2912,13 +2921,18 @@ def hook_event_to_status(payload: dict) -> tuple[str, str] | None:
         return None
     if event == "Notification":
         notification_type = payload.get("notification_type", "")
-        if notification_type in _NEEDS_INPUT_NOTIFICATION_TYPES:
-            return "needs_input", str(payload.get("message", ""))
+        message = str(payload.get("message", ""))
+        if notification_type == "idle_prompt":
+            # A live agent sitting at its own idle prompt is Idle, never
+            # Needs input - there is no actual blocker here.
+            return "idle", message, ""
+        if notification_type in _BLOCKING_NOTIFICATION_TYPES:
+            return "needs_input", message, notification_type
         if notification_type == "agent_completed":
-            return "done", str(payload.get("message", ""))
+            return "done", message, ""
         return None
     if event == "Stop":
-        return "done", str(payload.get("last_assistant_message", ""))
+        return "done", str(payload.get("last_assistant_message", "")), ""
     return None
 
 
@@ -3303,8 +3317,21 @@ def session_activity(
     if session.provider == "Codex":
         return _codex_activity(session, status)
     if not status:
-        return "unknown", ""
-    return status.get("state", "unknown"), status.get("detail", "")
+        # Live Claude session, no status file yet (just launched, no hook
+        # event has fired) - "no submitted work" is Idle, not Unknown.
+        return "idle", ""
+    return _resolve_claude_state(status), status.get("detail", "")
+
+
+def _resolve_claude_state(status: dict) -> str:
+    """The status file's state, with a needs_input record lacking an
+    explicit blocking reason failed closed to idle - see
+    _BLOCKING_NOTIFICATION_TYPES. Covers both a legacy record written before
+    "reason" existed (no key at all) and any other non-blocking reason."""
+    state = status.get("state", "unknown")
+    if state == "needs_input" and status.get("reason") not in _BLOCKING_NOTIFICATION_TYPES:
+        return "idle"
+    return state
 
 
 ACTIVITY_LABELS = {
