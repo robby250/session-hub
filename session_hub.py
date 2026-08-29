@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import collections
 import concurrent.futures
 import fcntl
 import os
@@ -2660,7 +2661,16 @@ _CODEX_TAIL_MAX_BYTES = 8 * 1024 * 1024  # escalation ceiling - a turn's own
 # means a genuinely-unchanged file is never reparsed, AND a file that changed
 # between two calls (a turn actually advancing mid-refresh) is still read
 # fresh rather than serving a stale cached verdict.
-_codex_tail_cache: dict[str, tuple[int, int, tuple[str, float] | None]] = {}
+#
+# codex_sessions() lists every thread ever recorded in the Codex state DB
+# (no LIMIT), each with its own rollout_path, so a plain dict here grows one
+# entry per historical session forever over a long-running GUI process.
+# Bounded LRU instead: only the most recently *looked up* paths (i.e. the
+# ones actually shown in a refresh) stay cached.
+_CODEX_TAIL_CACHE_MAX = 256
+_codex_tail_cache: "collections.OrderedDict[str, tuple[int, int, tuple[str, float] | None]]" = (
+    collections.OrderedDict()
+)
 
 
 def _codex_tail_turn_state(path: Path) -> tuple[str, float] | None:
@@ -2671,18 +2681,23 @@ def _codex_tail_turn_state(path: Path) -> tuple[str, float] | None:
     after it is durable evidence of an in-progress turn; "task_complete"/
     "turn_aborted" is durable evidence the last turn already ended - see
     hook_event_to_status_codex's own docstring for why Codex's `notify` alone
-    can't tell the difference. Cached per path by (mtime, size) - see
-    _codex_tail_cache.
+    can't tell the difference. Cached per path by (mtime, size), bounded LRU -
+    see _codex_tail_cache.
     """
     try:
         stat = path.stat()
     except OSError:
         return None
-    cached = _codex_tail_cache.get(str(path))
+    key = str(path)
+    cached = _codex_tail_cache.get(key)
     if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+        _codex_tail_cache.move_to_end(key)
         return cached[2]
     result = _codex_tail_turn_state_scan(path, stat.st_size)
-    _codex_tail_cache[str(path)] = (stat.st_mtime_ns, stat.st_size, result)
+    _codex_tail_cache[key] = (stat.st_mtime_ns, stat.st_size, result)
+    _codex_tail_cache.move_to_end(key)
+    if len(_codex_tail_cache) > _CODEX_TAIL_CACHE_MAX:
+        _codex_tail_cache.popitem(last=False)
     return result
 
 

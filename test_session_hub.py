@@ -5,6 +5,7 @@ import json
 import subprocess
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -807,6 +808,16 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def _assert_no_live_spawned_threads(self, before: set) -> None:
+        """Join every thread that appeared since `before` (bounded, not a
+        sleep - a real focus_window_by_title poller blocked on wmctrl would
+        still be alive after this and fail the assertion) and assert none
+        are still running."""
+        spawned = set(threading.enumerate()) - before
+        for thread in spawned:
+            thread.join(timeout=1)
+        self.assertFalse(any(thread.is_alive() for thread in spawned))
+
     def test_continue_with_other_agent_sets_correct_target_provider(self):
         real_cwd = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, real_cwd, ignore_errors=True)
@@ -858,11 +869,21 @@ class SessionHubTests(unittest.TestCase):
                     patch("session_hub.claude_sessions", return_value=[]),
                     patch("session_hub.antigravity_sessions", return_value=[]),
                     patch("session_hub.subprocess.Popen"),
+                    patch("session_hub.focus_window_by_title") as focus_antigravity,
                 ):
+                    threads_before = set(threading.enumerate())
                     window.continue_with_other_agent()
                 pending = window.metadata.get("pending_links", [])
                 self.assertEqual(len(pending), 1)
                 self.assertEqual(pending[0]["target_provider"], "Antigravity")
+                # The real focus_window_by_title polls wmctrl on a daemon
+                # thread for up to 3s; asserting it was CALLED proves the
+                # launch path still reaches that seam (not silently skipped),
+                # and joining every thread it spawned proves the fake seam -
+                # not a real background poller - is what ran (a real poller
+                # would still be alive/blocked on wmctrl after this join).
+                focus_antigravity.assert_called_once()
+                self._assert_no_live_spawned_threads(threads_before)
 
                 window.metadata["pending_links"] = []
                 with (
@@ -875,11 +896,15 @@ class SessionHubTests(unittest.TestCase):
                     patch("session_hub.claude_sessions", return_value=[]),
                     patch("session_hub.antigravity_sessions", return_value=[]),
                     patch("session_hub.subprocess.Popen"),
+                    patch("session_hub.focus_window_by_title") as focus_codex,
                 ):
+                    threads_before = set(threading.enumerate())
                     window.continue_with_other_agent()
                 pending = window.metadata.get("pending_links", [])
                 self.assertEqual(len(pending), 1)
                 self.assertEqual(pending[0]["target_provider"], "Codex")
+                focus_codex.assert_called_once()
+                self._assert_no_live_spawned_threads(threads_before)
                 window.close()
 
     def test_parses_antigravity_model_group_quotas(self):
@@ -4933,6 +4958,23 @@ class SessionActivityTests(unittest.TestCase):
             third = session_hub._codex_tail_turn_state(path)
             self.assertEqual(scan.call_count, 2)
             self.assertEqual(third[0], "task_complete")
+
+    def test_codex_tail_cache_evicts_oldest_path_once_over_the_bound(self):
+        """codex_sessions() lists every thread ever recorded (no LIMIT), so a
+        long-running GUI can be asked about far more distinct rollout paths
+        than are ever concurrently relevant. The cache must stay bounded by
+        LRU eviction, not grow with total historical path count."""
+        session_hub._codex_tail_cache.clear()
+        cap = session_hub._CODEX_TAIL_CACHE_MAX
+        paths = [
+            self._rollout([self._event(time.time(), "task_started")])
+            for _ in range(cap + 1)
+        ]
+        for path in paths:
+            session_hub._codex_tail_turn_state(path)
+        self.assertEqual(len(session_hub._codex_tail_cache), cap)
+        self.assertNotIn(str(paths[0]), session_hub._codex_tail_cache)
+        self.assertIn(str(paths[-1]), session_hub._codex_tail_cache)
 
     def test_codex_tail_on_missing_file_reads_unknown_not_a_crash(self):
         session = session_hub.Session(
