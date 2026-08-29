@@ -4973,6 +4973,93 @@ class SessionHubTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_launch_group_row_live_detached_falls_through_instead_of_already_running(self):
+        """task-2142: a tmux-alive row with saved history used to short-circuit on
+        {"status": "already_running"} before ever reaching resume_group_row, so
+        _focus_or_resume_session's no-window case (detached, live) opened nothing at
+        all. tmux_session_alive=True must no longer change the outcome from the
+        tmux_session_alive=False case already covered above."""
+        metadata = {
+            "sessions": {},
+            "settings": {},
+            "groups": {
+                "/tmp/vamp": {
+                    "cwd": "/tmp/vamp",
+                    "tmux": True,
+                    "rows": [{
+                        "name": "VAMP-worker4",
+                        "provider": "Codex",
+                        "override_key": "group:/tmp/vamp#VAMP-worker4",
+                        "session_key": "Codex:old-worker",
+                    }],
+                }
+            },
+        }
+        history = session_hub.Session(
+            "Codex", "old-worker", "worker", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/worker.jsonl"),
+        )
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            with (
+                patch("session_hub.tmux_session_alive", return_value=True),
+                patch("session_hub.claude_sessions", return_value=[]),
+                patch("session_hub.codex_sessions", return_value=[history]),
+                patch("session_hub.antigravity_sessions", return_value=[]),
+                patch.object(
+                    window,
+                    "resume_group_row",
+                    return_value={"status": "resumed", "name": "VAMP-worker4"},
+                ) as resume,
+                patch.object(window, "launch") as launch,
+            ):
+                result = window.launch_group_row("/tmp/vamp", "VAMP-worker4")
+            self.assertEqual(result["status"], "resumed")
+            self.assertNotEqual(result["status"], "already_running")
+            resume.assert_called_once_with("/tmp/vamp", "VAMP-worker4")
+            launch.assert_not_called()
+        finally:
+            window.close()
+
+    def test_launch_group_row_live_detached_no_history_still_launches(self):
+        """Same live-detached case but with NO saved history: must still fall through
+        to self.launch() (whose tmux script safely attaches to the existing session)
+        rather than reporting already_running."""
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "tmux": True,
+                        "rows": [{
+                            "name": "vamp-s1",
+                            "override_key": "group:/tmp/vamp#vamp-s1",
+                            "transcripts": True,
+                        }],
+                    }
+                },
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.tmux_session_alive", return_value=True),
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.codex_sessions", return_value=[]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    result = window.launch_group_row("/tmp/vamp", "vamp-s1")
+                self.assertEqual(result, {"status": "launched", "name": "vamp-s1"})
+                self.assertNotEqual(result["status"], "already_running")
+                launch.assert_called_once()
+            finally:
+                window.close()
+
     def test_resume_group_row_uses_tmux_when_group_flagged(self):
         with tempfile.TemporaryDirectory() as temp:
             metadata = {

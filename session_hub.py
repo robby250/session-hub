@@ -8145,8 +8145,14 @@ class SessionHub(QMainWindow):
             return {"status": "error", "message": f"No row named {name!r} in this group"}
         provider = row.get("provider", "Claude")
         use_tmux = self.effective_tmux(group.get("tmux"))
-        if use_tmux and tmux_session_alive(row["name"]):
-            return {"status": "already_running", "name": name}
+        # No tmux-alive short-circuit here (task-2142): a live-but-detached row (no window open)
+        # reaches this function through _focus_or_resume_session precisely because window_titled()
+        # found nothing, and an early "already_running" return used to hand back a status dict
+        # with no terminal ever opened - a silent no-op. Falling through to the history
+        # check/resume_group_row or the fresh self.launch() below is safe regardless of whether
+        # the tmux session is already alive: both route through tmux_group_launch_command, whose
+        # `has-session -t "=name" || new-session ...; attach -t "=name"` script attaches to an
+        # existing session instead of erroring, never spawning a duplicate.
 
         # A pending marker only describes the process that was just launched.
         # If its tmux row is gone, it is stale and must not mask the row's
