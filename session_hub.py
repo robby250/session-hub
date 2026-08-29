@@ -240,6 +240,46 @@ def codex_combo_value(combo: QComboBox) -> str | None:
     return combo.currentText().strip() or None
 
 
+def invalid_codex_model_effort_reason(model: str | None, effort: str | None) -> str | None:
+    """None if (model, effort) is launchable; otherwise a user-facing reason
+    it is not.
+
+    Row447 third rework: the model/effort combos are editable (see
+    populate_codex_model_combo's own docstring - a slug this machine's cache
+    doesn't know yet must still be typeable), so a mismatched pair used to
+    reach `codex` inside an async tmux child with no visible symptom - it
+    just fails to produce a usable session, indistinguishable from "nothing
+    happened" the same way the dotted-name bug was.
+
+    Deliberately does NOT reject a model absent from codex_models() outright
+    - the cache can be stale/incomplete by design, and rejecting an unknown
+    slug would break launching a real, brand-new Codex release this
+    machine's cache hasn't fetched yet. It DOES reject an effort level that
+    is objectively wrong for a model this machine's cache DOES recognize -
+    that combination will not run under any interpretation of the cache,
+    known-bad rather than merely unverifiable.
+    """
+    if not model or not effort:
+        return None
+    known = next(
+        (entry for entry in codex_models() if entry.get("slug") == model), None
+    )
+    if known is None:
+        return None
+    supported = {
+        level.get("effort")
+        for level in known.get("supported_reasoning_levels", [])
+        if level.get("effort")
+    }
+    if effort in supported:
+        return None
+    names = ", ".join(sorted(supported)) or "none"
+    return (
+        f"Codex model {model!r} does not support reasoning effort {effort!r} "
+        f"(supported: {names})."
+    )
+
+
 # Shared session-table column set: SessionHub's main listview and
 # ManageGroupDialog both render from this (see SessionHub.populate_session_table)
 # so their common columns are defined once, in one order.
@@ -518,16 +558,61 @@ def env_int(value, fallback: int) -> int:
         return int(fallback)
 
 
+_TMUX_NAME_UNSAFE = re.compile(r"[.:]")
+
+
+def sanitize_tmux_session_name(name: str) -> str:
+    """Replace characters tmux treats as target-spec separators ('.' between
+    window/pane, ':' between session/window) with '_'.
+
+    Passed a name containing either, `tmux new-session -s` silently CREATES
+    the session under the substituted name instead of erroring - so a caller
+    that goes on to use the original, unsanitized name for `has-session`/
+    `attach` (as tmux_group_launch_command's script does for every launch,
+    not just the one that created the session) targets a name that was never
+    actually created. `attach` then fails with "can't find session", the
+    surrounding `exec` fails, and the launched agent ends up running headless
+    in a tmux session no window ever attaches to - reproduced live with a
+    Codex model slug like "gpt-5.6-luna": every dotted model name silently
+    became a no-visible-effect "New" click. Applying the same substitution
+    tmux performs BEFORE we ever call it keeps the name we use, the name tmux
+    actually assigns, and the name stored as this session's address (Codex
+    has no --name; the tmux session name IS it) identical.
+    """
+    return _TMUX_NAME_UNSAFE.sub("_", name)
+
+
+def tmux_exact_target(name: str) -> str:
+    """A tmux `-t` target spec that matches `name` EXACTLY, never as a prefix.
+
+    Real isolated-tmux control (row447 second rework): with only session
+    `foo2` live, `tmux has-session -t foo` exits 0 - tmux's default target
+    resolution accepts an unambiguous PREFIX match, so a stale/wrong name
+    can still see, stop, inspect, rename or attach to a live session it
+    only starts with. The `=` prefix on a target's session-name component
+    (tmux's own exact-match syntax) disables that: `-t =foo` does NOT match
+    `foo2`. Every `-t` argument built from a canonicalized name must go
+    through this, or canonicalizing the name alone still leaves target
+    resolution fuzzy.
+    """
+    return f"={name}"
+
+
 def suggest_session_name(
     directory: Path | None, model_alias: str | None, existing_names: set[str]
 ) -> str:
     """`<dirname>-<model>` for a model's first row in a group, `-2`/`-3`/...
     for further rows of the same model - a starting point only, since the
     name field stays freely editable in the dialogs that call this.
+
+    Pre-sanitized for tmux (see sanitize_tmux_session_name) so a dotted model
+    slug (routine for Codex, e.g. "gpt-5.6-luna") never even appears as a
+    suggestion that would later mismatch the real tmux session name.
     """
     base = (directory.name if directory else "") or "session"
     if model_alias:
         base = f"{base}-{model_alias}"
+    base = sanitize_tmux_session_name(base)
     if base not in existing_names:
         return base
     suffix = 2
@@ -919,6 +1004,14 @@ class SessionLaunchOptionsDialog(QDialog):
 
     def reasoning_effort(self) -> str | None:
         return codex_combo_value(self.codex_effort_combo) if self.codex_effort_combo else None
+
+    def accept(self) -> None:
+        if self.codex_model_combo is not None:
+            reason = invalid_codex_model_effort_reason(self.model(), self.reasoning_effort())
+            if reason:
+                QMessageBox.warning(self, "Unsupported model/effort", reason)
+                return
+        super().accept()
 
 
 @dataclass
@@ -1823,8 +1916,15 @@ def rename_group_row_in(metadata: dict, cwd: str, old: str, new: str) -> dict:
     its live session goes by session_key first (find_group_member_session), so
     an already-launched row survives the rename; a fresh launch passes the new
     --name.
+
+    `new` is canonicalized (sanitize_tmux_session_name) before any check or
+    write - row447 rework: a dedup/collision check run against the raw text
+    would miss two different raw names that canonicalize to the same tmux
+    identity, and the stored row["name"] must equal what tmux actually calls
+    the session or every downstream reader (group_row_status, launch/stop/
+    resume, pending Codex links) drifts from it again.
     """
-    new = " ".join(str(new).strip().split())
+    new = sanitize_tmux_session_name(" ".join(str(new).strip().split()))
     if not new:
         return {"status": "error", "message": "Row name must not be empty"}
     group = metadata.get("groups", {}).get(cwd)
@@ -1926,19 +2026,73 @@ def sync_group_row_names(metadata: dict) -> bool:
 def rename_tmux_session(old: str, new: str) -> bool:
     """`tmux rename-session old new` if a session called `old` exists; the
     terminal title follows on its own (set-titles-string "#S"). False when
-    tmux is absent or no such session -- nothing to rename is not an error."""
+    tmux is absent or no such session -- nothing to rename is not an error.
+
+    Both names are canonicalized through sanitize_tmux_session_name first -
+    a caller that still holds a pre-fix unsafe stored name (row447 rework:
+    legacy metadata, or a value that skipped an upstream choke point) would
+    otherwise target `old`/`new` literals tmux itself never used, the same
+    has-session/attach target-spec mismatch tmux_group_launch_command's own
+    fix addresses for launch."""
+    old = sanitize_tmux_session_name(old)
+    new = sanitize_tmux_session_name(new)
     tmux = shutil.which("tmux")
     if not tmux or old == new:
         return False
     try:
-        has = subprocess.run([tmux, "has-session", "-t", old], capture_output=True, timeout=5)
+        has = subprocess.run(
+            [tmux, "has-session", "-t", tmux_exact_target(old)], capture_output=True, timeout=5
+        )
         if has.returncode != 0:
             return False
-        done = subprocess.run([tmux, "rename-session", "-t", old, new],
+        done = subprocess.run([tmux, "rename-session", "-t", tmux_exact_target(old), new],
                               capture_output=True, timeout=5)
         return done.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def reconcile_tmux_rename(
+    old_name: str, new_name: str, live_names: frozenset[str] | None = None
+) -> dict:
+    """Rename the live tmux session `old_name` to `new_name` and report what
+    happened, instead of leaving the caller with rename_tmux_session's bare
+    True/False - a metadata rename that already committed while the tmux
+    rename silently failed is exactly the split identity row447 rework
+    reported live (Codex renamed to "Music Download", tmux stayed "projects").
+
+    Both names are canonicalized (rename_tmux_session does this too, but the
+    collision check below needs the canonical form up front). Refuses with
+    an `error` message - and touches nothing - when `new_name` already names
+    a DIFFERENT live tmux session: tmux's own `rename-session` would fail
+    for the same reason, but this gives a caller a message to show instead
+    of a bare False indistinguishable from "nothing needed renaming".
+
+    A caller should run this BEFORE writing its own metadata, so an `error`
+    result leaves the two identities exactly as consistent as they were
+    before the rename was attempted (atomic, not "renamed the label, tmux
+    disagrees").
+    """
+    old_name = sanitize_tmux_session_name(old_name)
+    new_name = sanitize_tmux_session_name(new_name)
+    if old_name == new_name:
+        return {"tmux_renamed": False, "error": None}
+    names = tmux_live_session_names() if live_names is None else live_names
+    if new_name in names:
+        return {
+            "tmux_renamed": False,
+            "error": f"A tmux session named {new_name!r} already exists.",
+        }
+    if old_name not in names:
+        # Nothing live under the old name (not yet launched, or already
+        # stopped) - no tmux rename needed, and none attempted.
+        return {"tmux_renamed": False, "error": None}
+    if rename_tmux_session(old_name, new_name):
+        return {"tmux_renamed": True, "error": None}
+    return {
+        "tmux_renamed": False,
+        "error": f"Renaming the live tmux session {old_name!r} to {new_name!r} failed.",
+    }
 
 
 def find_group_member_session(
@@ -2393,6 +2547,7 @@ def tmux_group_launch_command(name: str, cwd: str, claude_args: list[str]) -> li
     wired up for tmux-launched sessions (deliberately out of scope for this
     pass - see SessionHub.launch_group_row_via_tmux).
     """
+    name = sanitize_tmux_session_name(name)
     terminal = shutil.which("gnome-terminal")
     if not terminal:
         raise RuntimeError("Launching into tmux currently requires gnome-terminal.")
@@ -2427,14 +2582,20 @@ def tmux_group_launch_command(name: str, cwd: str, claude_args: list[str]) -> li
     # by ctrl-click-launching two group rows together (VAMPULSE-orchestrator + a worker), where the
     # window ended up titled for one row while actually attached to the other's tmux session. The
     # non-tmux path (terminal_command) already forces this for the same reason.
+    # `-t "=$2"`, not `-t "$2"`: tmux's default target resolution accepts an
+    # unambiguous PREFIX match (real isolated-tmux control, row447 second
+    # rework: with only "foo2" live, `has-session -t foo` exits 0) - the `=`
+    # prefix forces an exact match, so this script's has-session/attach never
+    # silently binds to a DIFFERENT, merely-prefixed session. See
+    # tmux_exact_target.
     return [
         "bash",
         "-c",
-        '"$1" has-session -t "$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
+        '"$1" has-session -t "=$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
         ' "$1" set-option -g set-titles on >/dev/null;'
         ' "$1" set-option -g set-titles-string "#S" >/dev/null;'
         ' "$1" set-option -g focus-events on >/dev/null;'
-        ' exec "$5" --window -- "$1" attach -t "$2"',
+        ' exec "$5" --window -- "$1" attach -t "=$2"',
         "session-hub",
         tmux,
         name,
@@ -2568,7 +2729,14 @@ def tmux_session_alive(name: str, live_names: frozenset[str] | None = None) -> b
     one whenever checking more than one name per refresh so this does a plain
     membership test instead of its own subprocess. Omitted only by isolated
     callers that just want one name's answer.
+
+    `name` is canonicalized here (see rename_tmux_session) so a caller that
+    still holds a stored-but-unsafe name (row447 rework: e.g. group_row_status
+    passing a legacy row["name"] straight through) is checked against the
+    same substituted form `live_names`/the real tmux daemon actually use,
+    instead of a literal that was never the session's real name.
     """
+    name = sanitize_tmux_session_name(name)
     if live_names is not None:
         return name in live_names
     tmux = shutil.which("tmux")
@@ -2576,7 +2744,7 @@ def tmux_session_alive(name: str, live_names: frozenset[str] | None = None) -> b
         return False
     try:
         result = subprocess.run(
-            [tmux, "has-session", "-t", name],
+            [tmux, "has-session", "-t", tmux_exact_target(name)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=2,
@@ -2605,13 +2773,17 @@ def codex_tmux_native_key(
     The rollout file descriptor is authoritative for both a fresh `codex`
     process (whose argv has no session id) and `codex resume`. Descendant
     traversal also covers tmux panes that launch through a shell wrapper.
+
+    `name` is canonicalized (see rename_tmux_session) so an unsafe stored
+    name still resolves to the real tmux session's panes.
     """
+    name = sanitize_tmux_session_name(name)
     tmux = shutil.which("tmux")
     if not tmux:
         return None
     try:
         panes = subprocess.run(
-            [tmux, "list-panes", "-t", name, "-F", "#{pane_pid}"],
+            [tmux, "list-panes", "-t", tmux_exact_target(name), "-F", "#{pane_pid}"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -2661,12 +2833,18 @@ def codex_tmux_native_key(
 
 
 def stop_tmux_session(name: str) -> None:
-    """Kill the tmux session named `name`, if any. A no-op if already gone."""
+    """Kill the tmux session named `name`, if any. A no-op if already gone.
+
+    `name` is canonicalized (see rename_tmux_session) so an unsafe stored
+    name still targets the real tmux session instead of being parsed as a
+    session:window.pane target-spec and hitting the wrong thing or nothing.
+    """
+    name = sanitize_tmux_session_name(name)
     tmux = shutil.which("tmux")
     if not tmux:
         return
     subprocess.run(
-        [tmux, "kill-session", "-t", name],
+        [tmux, "kill-session", "-t", tmux_exact_target(name)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -3673,6 +3851,147 @@ def executable(name: str) -> str:
     return str(local)
 
 
+# The canonical VAMPULSE-game checkout. `~/.codex/config.toml`'s
+# `[mcp_servers.vampulse]` block is a flat, unconditional GLOBAL entry with
+# no per-project scoping of its own, so every Codex session loads it
+# regardless of cwd - confirmed live: a session launched into plain
+# ~/projects logged `MCP client for 'vampulse' failed to start`. Session Hub
+# is the only thing that knows which cwd a launch is headed for, so scoping
+# has to happen here, as a launch-time argv override, never by editing that
+# global file (which would also affect every non-Session-Hub codex
+# invocation and the user's other configured MCPs).
+VAMPULSE_PROJECT_ROOT = Path("/home/user/projects/vampulse/VAMPULSE-game")
+
+
+def _resolve_real_path(path: Path) -> Path | None:
+    try:
+        return path.resolve()
+    except OSError:
+        return None
+
+
+def vampulse_governed_worktrees(root: Path = VAMPULSE_PROJECT_ROOT) -> list[Path]:
+    """Every real `git worktree` of the canonical VAMPULSE-game checkout,
+    resolved. Queried live (bounded, single subprocess, only while building a
+    Codex launch command) rather than hardcoded - the worktree set changes as
+    lanes are opened/closed and a stale hardcoded list would silently exclude
+    a currently-governed worktree or include a torn-down one.
+    """
+    resolved_root = _resolve_real_path(root)
+    if resolved_root is None or not resolved_root.is_dir():
+        return []
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=resolved_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        # ValueError/TypeError: a caller that broadly mocks subprocess.Popen
+        # to keep an unrelated test hermetic (this file does that in several
+        # places) breaks subprocess.run's own internals the same way a real
+        # git failure would look from here - either way, an unusable worktree
+        # lookup must fail CLOSED (no worktrees recognized as governed), not
+        # crash the launch it's a side-check for.
+        return []
+    worktrees = []
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            resolved = _resolve_real_path(Path(line[len("worktree "):]))
+            if resolved is not None:
+                worktrees.append(resolved)
+    return worktrees
+
+
+def vampulse_mcp_applies(cwd: str | Path) -> bool:
+    """True only when `cwd` is the canonical VAMPULSE-game checkout, inside
+    it, or inside one of its real git worktrees.
+
+    Both sides are resolved to their real filesystem path first (symlinks
+    followed, `..` collapsed) and compared with Path.is_relative_to rather
+    than a string prefix - a plain `str(cwd).startswith(str(root))` would
+    wrongly admit a textual-prefix impostor like
+    "/home/.../VAMPULSE-game-old" (which starts with the root's own string
+    but is a different directory), and would wrongly admit or reject a
+    symlink depending on which side it sits on. Fails closed (False) if the
+    canonical root doesn't exist or `cwd` can't be resolved - an
+    unrecognized or broken path never gets the MCP.
+    """
+    resolved_cwd = _resolve_real_path(Path(cwd))
+    if resolved_cwd is None:
+        return False
+    # VAMPULSE_PROJECT_ROOT passed explicitly, not left to
+    # vampulse_governed_worktrees's own default parameter: a default
+    # argument value binds to the ORIGINAL module-level object at function
+    # definition time, so a test (or any future caller) patching
+    # session_hub.VAMPULSE_PROJECT_ROOT would silently be ignored here
+    # otherwise - the function would keep resolving worktrees of the real
+    # canonical root no matter what was patched.
+    roots = [
+        root
+        for root in (
+            [_resolve_real_path(VAMPULSE_PROJECT_ROOT)]
+            + vampulse_governed_worktrees(VAMPULSE_PROJECT_ROOT)
+        )
+        if root is not None
+    ]
+    return any(resolved_cwd == root or resolved_cwd.is_relative_to(root) for root in roots)
+
+
+def codex_launch_args(
+    cwd: str,
+    *,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    danger_mode: bool = False,
+    session_id: str | None = None,
+    source_cwd: str | None = None,
+    initial_prompt: str | None = None,
+) -> list[str]:
+    """The Codex CLI argv shared by every launch path (direct terminal,
+    tmux, resume) - one place that decides model/effort/MCP-scope flags so
+    they can't drift between the direct-terminal and tmux code paths the way
+    two independently-maintained copies of this list already had (dual-write
+    class; see docs/netcode_dual_write_audit.md's game-code equivalent).
+
+    MCP scope is decided from `execution_cwd` (source_cwd-or-cwd for a
+    resume, cwd for a new session) - NOT the bare `cwd` parameter (row447
+    fourth rework). `codex resume -C <dir>` actually runs in `source_cwd or
+    cwd`, so scoping off `cwd` alone diverges from the real process
+    directory in both directions: a resume whose DISPLAY cwd is inside
+    VAMPULSE but whose real source_cwd is not would leak the MCP into a
+    directory it must never reach; a resume whose display cwd is outside
+    VAMPULSE but whose real source_cwd is inside it would wrongly disable
+    the MCP for a legitimately-scoped session.
+    """
+    args = [executable("codex")]
+    if danger_mode:
+        args += ["--dangerously-bypass-approvals-and-sandbox"]
+    if model:
+        args += ["-m", model]
+    if reasoning_effort:
+        args += ["-c", f"model_reasoning_effort={reasoning_effort}"]
+    execution_cwd = (source_cwd or cwd) if session_id else cwd
+    if not vampulse_mcp_applies(execution_cwd):
+        args += ["-c", "mcp_servers.vampulse.enabled=false"]
+    if session_id:
+        # source_cwd, not cwd: `codex resume -C <dir>` silently FORKS into a
+        # brand-new near-empty thread instead of erroring when <dir> differs
+        # from the session's own root - observed directly (a cwd-drifted
+        # group row, e.g. one that cd'd into a worktree, forked twice and
+        # died with no visible output under tmux). Resuming in the session's
+        # actual directory avoids triggering that fork at all.
+        args += ["resume", "-C", execution_cwd, session_id]
+    else:
+        args += ["-C", execution_cwd]
+    if initial_prompt:
+        args += [initial_prompt]
+    return args
+
+
 def is_compatibility_link(path: Path, target: Path) -> bool:
     try:
         return path.is_symlink() and path.resolve() == target.resolve()
@@ -4152,6 +4471,10 @@ class NewSessionDialog(QDialog):
         elif self.codex_model_combo is not None:
             self.model = codex_combo_value(self.codex_model_combo)
             self.reasoning_effort = codex_combo_value(self.codex_effort_combo)
+            reason = invalid_codex_model_effort_reason(self.model, self.reasoning_effort)
+            if reason:
+                QMessageBox.warning(self, "Unsupported model/effort", reason)
+                return
         self.use_tmux = self.tmux_checkbox.isChecked()
         super().accept()
 
@@ -4287,6 +4610,10 @@ class AgentModelEffortDialog(QDialog):
         elif self.codex_model_combo is not None:
             self.model = codex_combo_value(self.codex_model_combo)
             self.reasoning_effort = codex_combo_value(self.codex_effort_combo)
+            reason = invalid_codex_model_effort_reason(self.model, self.reasoning_effort)
+            if reason:
+                QMessageBox.warning(self, "Unsupported model/effort", reason)
+                return
         super().accept()
 
 
@@ -4495,9 +4822,14 @@ class LaunchNewGroupSessionsDialog(QDialog):
             effort_widget = self.table.cellWidget(row, 2)
             account_widget = self.table.cellWidget(row, 3)
             name_edit = self.table.cellWidget(row, 4)
-            name = name_edit.text().strip() if name_edit else ""
-            if not name:
+            raw_name = name_edit.text().strip() if name_edit else ""
+            if not raw_name:
                 continue
+            # Canonicalized here, before accept()'s own duplicate-name check
+            # below - two rows typed as "a.b" and "a:b" must collide there
+            # (row447 rework), not silently mint two rows sharing one real
+            # tmux identity.
+            name = sanitize_tmux_session_name(raw_name)
             provider = provider_combo.currentData() if provider_combo else "Claude"
             if provider == "Codex":
                 model = codex_combo_value(model_widget) if model_widget else None
@@ -4543,6 +4875,13 @@ class LaunchNewGroupSessionsDialog(QDialog):
                 )
                 return
             seen.add(row["name"])
+            if row["provider"] == "Codex":
+                reason = invalid_codex_model_effort_reason(
+                    row["model"], row["reasoning_effort"]
+                )
+                if reason:
+                    QMessageBox.warning(self, "Unsupported model/effort", reason)
+                    return
 
         self.group_rows = rows
         self.use_tmux = self.tmux_checkbox.isChecked()
@@ -5677,6 +6016,15 @@ class SessionHub(QMainWindow):
 
         self.new_provider = QComboBox()
         self.new_provider.addItems(PROVIDERS)
+        # PROVIDERS lists Codex first (update_new_provider_list's own
+        # fallback comment already says so), but addItems() alone leaves
+        # index 0 - Codex - selected, and that selection is "current" by the
+        # time update_new_provider_list() runs right after build_ui(), so its
+        # Claude fallback (only reached when nothing matches) never actually
+        # fires on a fresh launch. Set the real default here instead.
+        claude_index = self.new_provider.findText("Claude")
+        if claude_index >= 0:
+            self.new_provider.setCurrentIndex(claude_index)
         self.new_provider.setToolTip("Agent used for the new session")
         toolbar.addWidget(self.new_provider)
 
@@ -6885,7 +7233,36 @@ class SessionHub(QMainWindow):
             self, "Rename session", "Display name:", text=session.title
         )
         if accepted and name.strip():
-            self.save_override(session, "name", name.strip())
+            result = self.rename_session_name(session, name.strip())
+            if result["status"] == "error":
+                QMessageBox.warning(self, "Rename session", result["message"])
+
+    def rename_session_name(self, session: Session, new_name: str) -> dict:
+        """Rename one (non-group) session's display name AND its live tmux
+        session together, atomically.
+
+        Before this, "Rename session" (a plain save_override("name", ...))
+        never touched tmux at all - the exact live repro row447 rework
+        reported: a Codex conversation renamed to "Music Download" while its
+        tmux session (and therefore every peer/phone address for it) stayed
+        "projects", silently split. Canonicalized the same way a group row
+        name is (sanitize_tmux_session_name) and reconciled/refused the same
+        way rename_group_row is - see reconcile_tmux_rename.
+        """
+        sanitized = sanitize_tmux_session_name(" ".join(str(new_name).strip().split()))
+        if not sanitized:
+            return {"status": "error", "message": "Name must not be empty"}
+        overrides = (self.metadata.get("sessions") or {}).get(session.key, {})
+        tmux_enabled, old_name, _status = standalone_tmux_status(
+            session, overrides, self.settings()
+        )
+        reconciled = {"tmux_renamed": False, "error": None}
+        if tmux_enabled and old_name and old_name != sanitized:
+            reconciled = reconcile_tmux_rename(old_name, sanitized)
+            if reconciled["error"]:
+                return {"status": "error", "message": reconciled["error"]}
+        self.save_override(session, "name", sanitized)
+        return {"status": "renamed", "name": sanitized, "tmux_renamed": reconciled["tmux_renamed"]}
 
     def change_directory(self) -> None:
         session = self.selected()
@@ -6932,24 +7309,15 @@ class SessionHub(QMainWindow):
             command += ["-e"]
 
         if provider == "Codex":
-            command += [executable("codex")]
-            if self.settings().get("codex_danger_mode", False):
-                command += ["--dangerously-bypass-approvals-and-sandbox"]
-            if model:
-                command += ["-m", model]
-            if reasoning_effort:
-                command += ["-c", f"model_reasoning_effort={reasoning_effort}"]
-            if session_id:
-                # launch_cwd (the session's own source_cwd when known), not
-                # cwd: `codex resume -C <dir>` silently FORKS into a new
-                # near-empty thread rather than erroring when <dir> differs
-                # from the session's actual root - see the matching comment
-                # in launch()'s tmux branch, which hits the identical issue.
-                command += ["resume", "-C", launch_cwd, session_id]
-            else:
-                command += ["-C", cwd]
-            if initial_prompt:
-                command += [initial_prompt]
+            command += codex_launch_args(
+                cwd,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                danger_mode=self.settings().get("codex_danger_mode", False),
+                session_id=session_id,
+                source_cwd=source_cwd,
+                initial_prompt=initial_prompt,
+            )
         elif provider == "Claude":
             claude_args = [executable("claude")]
             if self.settings().get("claude_danger_mode", False):
@@ -7043,11 +7411,6 @@ class SessionHub(QMainWindow):
                     "live status until you clear or replace that `notify` line yourself.",
                 )
         try:
-            flags = (
-                self.launch_flags(session_key, flag_overrides)
-                if provider == "Claude"
-                else []
-            )
             if use_tmux and provider in ("Claude", "Codex"):
                 # tmux_name, not flag_overrides["--name"]: resuming a group
                 # row (session_id set) never passes --name at all - Claude
@@ -7057,34 +7420,36 @@ class SessionHub(QMainWindow):
                 name = tmux_name or (flag_overrides or {}).get("--name")
                 if not name:
                     raise RuntimeError("Launching into tmux requires a session name.")
+                # Canonicalized BEFORE launch_flags below builds claude_args -
+                # Claude's own --name flag must equal the exact name
+                # tmux_group_launch_command creates the tmux session under
+                # (it canonicalizes independently), or the two identities
+                # split the way row447 rework's live repro found: Claude
+                # reports one name, the tmux/peer address is a different one.
+                name = sanitize_tmux_session_name(name)
+                if flag_overrides and flag_overrides.get("--name"):
+                    flag_overrides = {**flag_overrides, "--name": name}
+            flags = (
+                self.launch_flags(session_key, flag_overrides)
+                if provider == "Claude"
+                else []
+            )
+            if use_tmux and provider in ("Claude", "Codex"):
                 if provider == "Codex":
                     # Codex has no --name; the tmux session name IS its address
                     # (VAMPULSE peers reach it with `session_ctl.py send <name>`).
                     # Before 2026-08-23 this branch was Claude-only, so a Codex
                     # row with "Launch in tmux" checked silently fell through to a
                     # plain gnome-terminal and tmux could not see it.
-                    claude_args = [executable("codex")]
-                    if self.settings().get("codex_danger_mode", False):
-                        claude_args += ["--dangerously-bypass-approvals-and-sandbox"]
-                    if model:
-                        claude_args += ["-m", model]
-                    if reasoning_effort:
-                        claude_args += ["-c", f"model_reasoning_effort={reasoning_effort}"]
-                    if session_id:
-                        # source_cwd, not cwd: `codex resume -C <dir>` silently
-                        # FORKS into a brand-new near-empty thread instead of
-                        # erroring when <dir> differs from the session's own
-                        # root (observed directly - a cwd-drifted group row,
-                        # e.g. one that cd'd into a worktree, forked twice and
-                        # died with no visible output under tmux). Resuming in
-                        # the session's actual directory avoids triggering
-                        # that fork at all - same reasoning terminal_command's
-                        # Claude branch already applies via its own launch_cwd.
-                        claude_args += ["resume", "-C", source_cwd or cwd, session_id]
-                    else:
-                        claude_args += ["-C", cwd]
-                    if initial_prompt:
-                        claude_args += [initial_prompt]
+                    claude_args = codex_launch_args(
+                        cwd,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
+                        danger_mode=self.settings().get("codex_danger_mode", False),
+                        session_id=session_id,
+                        source_cwd=source_cwd,
+                        initial_prompt=initial_prompt,
+                    )
                 else:
                     claude_args = [executable("claude")]
                     if self.settings().get("claude_danger_mode", False):
@@ -7763,12 +8128,18 @@ class SessionHub(QMainWindow):
         )
         existing_names = {row["name"] for row in group["rows"]}
         for row in rows:
-            if row["name"] in existing_names:
+            # Canonicalize before the dedup check, not just inside
+            # register_group_row below - two different raw names ("a.b",
+            # "a:b") that sanitize to the same tmux identity must collide
+            # here, or both mint a row and the second silently overwrites
+            # the first's override_key bucket (row447 rework).
+            name = sanitize_tmux_session_name(" ".join(str(row["name"]).strip().split()))
+            if name in existing_names:
                 continue
             provider = row.get("provider", "Claude")
             registered = self.register_group_row(
                 cwd,
-                row["name"],
+                name,
                 provider,
                 row.get("model"),
                 row.get("reasoning_effort"),
@@ -7795,7 +8166,12 @@ class SessionHub(QMainWindow):
         override, the same way a real session's own `session.key` does - it
         never changes for the life of the row, whether or not it's currently
         matched to a live session (see find_group_member_session, ManageGroupDialog).
+
+        `name` is canonicalized here too (idempotent alongside a caller that
+        already did it) - this is the row's one durable minting site, and its
+        own docstring said so before any caller actually enforced it.
         """
+        name = sanitize_tmux_session_name(" ".join(str(name).strip().split()))
         override_key = f"group:{cwd}#{name}"
         if model_alias or reasoning_effort or account_config_dir:
             entry = self.metadata.setdefault("sessions", {}).setdefault(override_key, {})
@@ -7893,11 +8269,23 @@ class SessionHub(QMainWindow):
     def rename_group_row(self, cwd: str, old: str, new: str) -> dict:
         """Rename a group row everywhere it is named: metadata (row + override
         bucket) and the live tmux session, so the terminal title follows.
-        See rename_group_row_in for why there is one name and not two."""
+        See rename_group_row_in for why there is one name and not two.
+
+        The tmux side is reconciled BEFORE the metadata write commits (see
+        reconcile_tmux_rename) - a target that collides with a different
+        live tmux session is refused visibly here instead of leaving the row
+        renamed in metadata while tmux never agreed (row447 rework).
+        """
+        sanitized = sanitize_tmux_session_name(" ".join(str(new).strip().split()))
+        reconciled = {"tmux_renamed": False, "error": None}
+        if sanitized and sanitized != old:
+            reconciled = reconcile_tmux_rename(old, sanitized)
+            if reconciled["error"]:
+                return {"status": "error", "message": reconciled["error"]}
         result = rename_group_row_in(self.metadata, cwd, old, new)
         if result["status"] == "renamed":
             write_metadata(self.metadata)
-            result["tmux_renamed"] = rename_tmux_session(old, result["name"])
+            result["tmux_renamed"] = reconciled["tmux_renamed"]
             self.refresh()
         return result
 
