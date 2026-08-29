@@ -5033,6 +5033,35 @@ class SessionActivityTests(unittest.TestCase):
         self.assertEqual(json_label, "Needs input")
         self.assertEqual(gui_label, "Needs input")
 
+    def test_tmux_live_session_names_survives_oserror_and_timeout(self):
+        """The subprocess spawn itself can fail at the OS level (tmux binary
+        removed/unexecutable between shutil.which() and the spawn, permission,
+        resource limits) - not just time out. Both must fail closed to an
+        empty snapshot, the same reading as 'no tmux server running', never
+        an uncaught exception that would crash the whole census (row426
+        audit rework 2)."""
+        with patch.object(session_hub.shutil, "which", return_value="/usr/bin/tmux"):
+            with patch.object(
+                session_hub.subprocess, "run", side_effect=OSError("tmux vanished")
+            ):
+                self.assertEqual(session_hub.tmux_live_session_names(), frozenset())
+            with patch.object(
+                session_hub.subprocess, "run",
+                side_effect=subprocess.TimeoutExpired(cmd="tmux", timeout=2),
+            ):
+                self.assertEqual(session_hub.tmux_live_session_names(), frozenset())
+            # Negative control: a real success path still returns the parsed names, so the
+            # frozenset() above is provably the exception branches firing, not a bug that
+            # always returns empty regardless of what happens.
+            with patch.object(
+                session_hub.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, "VAMP-worker1\nVAMP-worker2\n", ""),
+            ):
+                self.assertEqual(
+                    session_hub.tmux_live_session_names(),
+                    frozenset({"VAMP-worker1", "VAMP-worker2"}),
+                )
+
     def test_refresh_running_tab_makes_one_tmux_subprocess_call_for_n_rows(self):
         """group_row_status and session_activity used to each call
         tmux_session_alive independently - 2 subprocess spawns per row, times

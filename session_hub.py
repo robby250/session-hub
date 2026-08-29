@@ -2434,7 +2434,11 @@ def tmux_live_session_names() -> frozenset[str]:
             text=True,
             timeout=2,
         )
-    except subprocess.TimeoutExpired:
+    except (OSError, subprocess.TimeoutExpired):
+        # OSError covers the tmux binary vanishing/becoming unexecutable between the
+        # shutil.which() resolution above and this spawn, and any other launch-time OS
+        # failure (e.g. permission, resource limits) - same fail-closed reading as the
+        # "no tmux server running" branch below, not a crash of the whole census.
         return frozenset()
     if result.returncode != 0:
         # Also the correct (and common) reading for "no tmux server running

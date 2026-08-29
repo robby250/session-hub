@@ -62,8 +62,14 @@ Add provider-paired fixtures and mutation-resistant assertions for:
 - malformed/partial last transcript line => bounded fallback, no crash;
 - GUI model, TUI model and sessions JSON return identical status labels for the same fixture.
 
-Run the full Session Hub test suite. Then inspect the two currently running real rows read-only and
-record the observed Claude/Codex verdicts without stopping, relaunching or steering either session.
+Run the targeted sequence, not the full suite: `test_continue_with_other_agent_sets_correct_target_provider`
+followed in the same process by all of `SessionActivityTests` and both TUI pane test classes
+(`MainPaneColumnsTests`, `RunningPaneColumnsTests`) — 22 tests, this row's own authority for what
+"green" means here (row426 rework: the full suite left escaped focus-daemon threads throwing
+exceptions on stderr in later tests; the targeted sequence is what proves that class of bug fixed,
+and running the full suite on top adds nothing this plan currently checks). Then inspect the two
+currently running real rows read-only and record the observed Claude/Codex verdicts without
+stopping, relaunching or steering either session.
 
 ## Performance
 
@@ -73,3 +79,27 @@ cell and no unbounded JSONL read.
 
 ## Status
 
+Implemented and landed on branch `status-audit-20260829`, not yet merged to `main`:
+
+- `65d8cd6` — the one provider-neutral status/activity verdict for Claude+Codex (the contract's
+  items 1-7 above): `session_activity()`, threaded `live_names` snapshot, transcript-tail-bounded
+  Codex `Working` derivation, exact provider+id identity join.
+- `1a5713b` — rework: fixed a hang, deduped tmux subprocess calls to one snapshot per refresh
+  (`tmux_live_session_names()`), corrected a stale claim in this plan, TUI parity, tail-read
+  escalation for oversized trailing records.
+- `132520e` — rework r1: isolated two real focus-daemon threads that escaped
+  `test_continue_with_other_agent_sets_correct_target_provider` and threw uncaught exceptions on
+  stderr in later tests (patched the `focus_window_by_title` seam, joins+asserts every spawned
+  thread dead); bounded `_codex_tail_cache` to a 256-entry LRU (was an unbounded dict keyed by
+  every historical rollout path, since `codex_sessions()` has no `LIMIT`).
+- (this commit) rework r2: `tmux_live_session_names()` now catches `OSError` alongside
+  `TimeoutExpired` around the `tmux list-sessions` spawn (the binary vanishing/becoming
+  unexecutable between `shutil.which()` and the spawn, or any other OS-level launch failure, used
+  to crash the whole census instead of failing closed to an empty snapshot — same reading as "no
+  tmux server running"), with a focused fixture; filled this Status section; replaced the stale
+  "run the full suite" proof-method line above with the targeted 22-test authority.
+
+22/22 targeted sequence green (21 + the new OSError/TimeoutExpired fixture), zero escaped-thread
+exceptions on stderr. `git diff --check` clean. Merge to `main` is an orchestrator step, not done
+by this branch itself (VAMPULSE's row428 already consumes the unified verdict via this branch's
+worktree copy pending that merge — see `docs/task_notes.md#task-2114` in the VAMPULSE repo).
