@@ -2022,6 +2022,69 @@ def find_group_member_session(
     return None
 
 
+def resolve_link_active(link: dict, by_key: dict[str, "Session"]) -> "Session | None":
+    """The link's current target: link["active"] if that member still
+    exists, else the newest surviving member by updated_ms (native_key
+    breaks a tie deterministically). Repairs a link whose recorded active
+    member was deleted/trashed instead of leaving the whole link unmatched -
+    the reversed(members) insertion-order fallback this replaced picked
+    whichever member was linked first, not most recently active."""
+    active = by_key.get(link.get("active"))
+    if active:
+        return active
+    candidates = [by_key[key] for key in link.get("members", []) if key in by_key]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda session: (session.updated_ms, session.native_key))
+
+
+def linked_aware_sessions(sessions: list["Session"], links: dict) -> list["Session"]:
+    """`sessions` (a raw, un-collapsed per-provider list) with every
+    non-active link member HIDDEN and `.linked_keys` populated on the
+    survivor - mirrors discover_sessions's own link-collapse (hidden/
+    visible_linked) exactly, and for the same reason: a stale member left
+    in the pool matches on its own literal native_key before
+    find_group_member_session's `next()` ever reaches the active session's
+    linked_keys branch, since an exact self-match doesn't care that a newer
+    continuation exists. Only the active member gets linked_keys, never
+    every member: setting it on all of them let find_group_member_session's
+    next() match whichever one happened to sort first in `sessions`, so a
+    cross-provider link matched the stale non-active session instead of the
+    one the link actually points at."""
+    by_key = {session.native_key: session for session in sessions}
+    hidden: set[str] = set()
+    active_sessions: list[Session] = []
+    for link in links.values():
+        members = tuple(link.get("members", []))
+        hidden.update(members)
+        active = resolve_link_active(link, by_key)
+        if active:
+            active.linked_keys = members
+            active_sessions.append(active)
+    return [
+        session for session in sessions if session.native_key not in hidden
+    ] + active_sessions
+
+
+def group_row_candidates(metadata: dict, settings: dict) -> list[Session]:
+    """Every enabled-provider live session, link-aware - the pool a saved
+    group row's identity must be resolved against. Never call
+    claude_sessions()/codex_sessions() directly for a group-row match: a
+    same-provider-only, unlinked candidate list finds the row's stored
+    (possibly stale) native key literally instead of the link's current
+    target, which is exactly the "resume opens an older linked rollout"
+    bug - and a row relinked to a different provider than it was saved
+    under needs that provider's sessions in the pool at all to match."""
+    live: list[Session] = []
+    if settings.get("enable_claude", True):
+        live += claude_sessions()
+    if settings.get("enable_codex", True):
+        live += codex_sessions()
+    if settings.get("enable_antigravity", True):
+        live += antigravity_sessions()
+    return linked_aware_sessions(live, metadata.get("links", {}))
+
+
 def resolve_pending_codex_group_rows(metadata: dict, sessions: list[Session]) -> bool:
     """Bind newly launched Codex group rows to their exact tmux transcript.
 
@@ -2077,9 +2140,7 @@ def discover_sessions(metadata: dict) -> list[Session]:
     visible_linked = []
     for logical_key, link in metadata.setdefault("links", {}).items():
         members = tuple(link.get("members", []))
-        active = by_key.get(link.get("active"))
-        if not active:
-            active = next((by_key.get(key) for key in reversed(members) if by_key.get(key)), None)
+        active = resolve_link_active(link, by_key)
         hidden.update(members)
         if not active:
             continue
@@ -4636,44 +4697,14 @@ class ManageGroupDialog(QDialog):
         group = self.group()
         if not group:
             return []
-        settings = self.hub.settings()
-        live: list[Session] = []
-        if settings.get("enable_claude", True):
-            live += claude_sessions()
-        if settings.get("enable_codex", True):
-            live += codex_sessions()
-        if settings.get("enable_antigravity", True):
-            live += antigravity_sessions()
         overrides = self.hub.metadata.get("sessions", {})
-        links = self.hub.metadata.get("links", {})
-        # claude_sessions()/codex_sessions() are raw - unlike discover_sessions(),
-        # they never apply metadata["links"], so linked_keys is always empty
-        # unless filled in by hand. This has to happen *before* matching, not
-        # just backfilled onto whatever matched: find_group_member_session's
-        # cross-link branch (session_key in session.linked_keys) is how a row
-        # whose provider was overtaken by a linked continuation in another
-        # provider (e.g. a Claude row relinked to a Codex session) matches at
-        # all - populating it only after a same-provider native-key match
-        # already succeeded means a cross-provider link never matches here in
-        # the first place, leaving the row's Agent/Last updated blank and its
-        # context menu stuck on the "not launched" set.
-        for session in live:
-            # Only the link's designated *active* member gets linked_keys,
-            # mirroring discover_sessions - setting it on every member let
-            # find_group_member_session's next() match whichever member
-            # happens to sort first in `live` (Claude before Codex), so a
-            # cross-provider link matched the stale non-active session
-            # instead of the one the link actually points at.
-            link = next(
-                (
-                    entry
-                    for entry in links.values()
-                    if entry.get("active") == session.native_key
-                ),
-                None,
-            )
-            if link:
-                session.linked_keys = tuple(link.get("members", []))
+        # group_row_candidates() is the shared resolver discover_sessions,
+        # launch_group_row and resume_group_row also call - it applies
+        # metadata["links"] to the raw per-provider lists (they never do
+        # this on their own), which is how a row whose provider was
+        # overtaken by a linked continuation in another provider still
+        # matches here.
+        live = group_row_candidates(self.hub.metadata, self.hub.settings())
         pairs = []
         claimed: set[str] = set()
         for row in group.get("rows", []):
@@ -7481,11 +7512,12 @@ class SessionHub(QMainWindow):
         # A saved row is a persistent conversation. Reopening it after a
         # reboot must resume its history; launch_new_rows_into_group is the
         # separate path that intentionally creates a fresh transcript.
-        candidates = {
-            "Claude": claude_sessions,
-            "Codex": codex_sessions,
-            "Antigravity": antigravity_sessions,
-        }.get(provider, lambda: [])()
+        # group_row_candidates(), not a same-provider-only claude_sessions()/
+        # codex_sessions() call: a row relinked to a different provider than
+        # it was saved under has no history under its OWN provider at all,
+        # which used to fall through to "no history" and start a duplicate
+        # fresh conversation instead of resuming the real one.
+        candidates = group_row_candidates(self.metadata, self.settings())
         history = find_group_member_session(row, cwd, candidates)
         if history is not None:
             return self.resume_group_row(cwd, name)
@@ -7550,11 +7582,21 @@ class SessionHub(QMainWindow):
         row = next((r for r in group.get("rows", []) if r["name"] == name), None)
         if not row:
             return {"status": "error", "message": f"No row named {name!r} in this group"}
-        provider = row.get("provider", "Claude")
-        candidates = claude_sessions() if provider == "Claude" else codex_sessions()
+        # group_row_candidates(), not a same-provider-only claude_sessions()/
+        # codex_sessions() call: an unlinked, single-provider pool matches
+        # the row's stored (possibly stale) native key literally instead of
+        # a link's current target, which is the "resume opens an older
+        # linked rollout" bug this row exists to fix.
+        candidates = group_row_candidates(self.metadata, self.settings())
         live = find_group_member_session(row, cwd, candidates)
         if not live:
             return {"status": "error", "message": f"{name!r} has no history to resume"}
+        # live.provider, not row.get("provider"): a cross-provider link
+        # (continue_with_other_agent_for) makes the row's saved provider
+        # stale the moment it's continued elsewhere - launching under the
+        # row's old provider would run the wrong CLI against live's
+        # session_id entirely.
+        provider = live.provider
         # No session_is_tracked_alive gate: see the matching comment in
         # launch_group_row.
         self.launch(

@@ -2180,6 +2180,59 @@ class SessionHubTests(unittest.TestCase):
             result = session_hub._scan_claude_file(transcript)
             self.assertEqual(result.get("agent_name"), "vamp-s1")
 
+    def test_resolve_link_active_returns_active_member_when_it_still_exists(self):
+        by_key = {
+            "Codex:old": session_hub.Session(
+                "Codex", "old", "t", "/tmp", "/tmp", 100, Path("/tmp/o.jsonl")
+            ),
+            "Codex:new": session_hub.Session(
+                "Codex", "new", "t", "/tmp", "/tmp", 200, Path("/tmp/n.jsonl")
+            ),
+        }
+        link = {"members": ["Codex:old", "Codex:new"], "active": "Codex:new"}
+        result = session_hub.resolve_link_active(link, by_key)
+        self.assertEqual(result.native_key, "Codex:new")
+
+    def test_resolve_link_active_repairs_deleted_active_to_newest_member(self):
+        by_key = {
+            "Codex:old": session_hub.Session(
+                "Codex", "old", "t", "/tmp", "/tmp", 100, Path("/tmp/o.jsonl")
+            ),
+            "Codex:newest": session_hub.Session(
+                "Codex", "newest", "t", "/tmp", "/tmp", 900, Path("/tmp/x.jsonl")
+            ),
+        }
+        # "active" names a member missing from by_key (deleted/trashed) -
+        # first in members order too, so a reversed-insertion-order guess
+        # would have wrongly returned "old".
+        link = {
+            "members": ["Codex:deleted", "Codex:old", "Codex:newest"],
+            "active": "Codex:deleted",
+        }
+        result = session_hub.resolve_link_active(link, by_key)
+        self.assertEqual(result.native_key, "Codex:newest")
+
+    def test_resolve_link_active_tie_break_on_equal_updated_ms_is_deterministic(self):
+        by_key = {
+            "Codex:aaa": session_hub.Session(
+                "Codex", "aaa", "t", "/tmp", "/tmp", 100, Path("/tmp/a.jsonl")
+            ),
+            "Codex:zzz": session_hub.Session(
+                "Codex", "zzz", "t", "/tmp", "/tmp", 100, Path("/tmp/z.jsonl")
+            ),
+        }
+        link = {"members": ["Codex:aaa", "Codex:zzz"], "active": "Codex:gone"}
+        result = session_hub.resolve_link_active(link, by_key)
+        result_reordered = session_hub.resolve_link_active(
+            {"members": ["Codex:zzz", "Codex:aaa"], "active": "Codex:gone"}, by_key
+        )
+        self.assertEqual(result.native_key, result_reordered.native_key)
+        self.assertEqual(result.native_key, "Codex:zzz")
+
+    def test_resolve_link_active_returns_none_when_every_member_is_gone(self):
+        link = {"members": ["Codex:gone1", "Codex:gone2"], "active": "Codex:gone1"}
+        self.assertIsNone(session_hub.resolve_link_active(link, {}))
+
     def test_find_group_member_session_matches_by_agent_name_and_cwd(self):
         sessions = [
             session_hub.Session(
@@ -3578,6 +3631,8 @@ class SessionHubTests(unittest.TestCase):
                 with (
                     patch.object(session_hub.SessionHub, "launch") as launch,
                     patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.codex_sessions", return_value=[]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
                     patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
                 ):
                     result = window.launch_group_row("/tmp/vamp", "vamp-s1")
@@ -3621,6 +3676,8 @@ class SessionHubTests(unittest.TestCase):
                 with (
                     patch.object(session_hub.SessionHub, "launch") as launch,
                     patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.codex_sessions", return_value=[]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
                     patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
                 ):
                     window.launch_group_row("/tmp/vamp", "vamp-s1")
@@ -3677,7 +3734,9 @@ class SessionHubTests(unittest.TestCase):
         try:
             with (
                 patch("session_hub.tmux_session_alive", return_value=False),
+                patch("session_hub.claude_sessions", return_value=[]),
                 patch("session_hub.codex_sessions", return_value=[history]),
+                patch("session_hub.antigravity_sessions", return_value=[]),
                 patch.object(
                     window,
                     "resume_group_row",
@@ -3717,6 +3776,8 @@ class SessionHubTests(unittest.TestCase):
                 with (
                     patch.object(session_hub.SessionHub, "launch") as launch,
                     patch("session_hub.claude_sessions", return_value=[live]),
+                    patch("session_hub.codex_sessions", return_value=[]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
                     patch("session_hub.session_is_tracked_alive", return_value=False),
                     patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
                 ):
@@ -3764,7 +3825,9 @@ class SessionHubTests(unittest.TestCase):
             try:
                 with (
                     patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.claude_sessions", return_value=[]),
                     patch("session_hub.codex_sessions", return_value=[live]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
                     patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
                 ):
                     window.resume_group_row("/tmp/vamp", "vamp-codex")
@@ -3793,9 +3856,248 @@ class SessionHubTests(unittest.TestCase):
                 with (
                     patch.object(session_hub.SessionHub, "launch") as launch,
                     patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.codex_sessions", return_value=[]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
                     patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
                 ):
                     result = window.resume_group_row("/tmp/vamp", "vamp-s1")
+                launch.assert_not_called()
+                self.assertEqual(result["status"], "error")
+            finally:
+                window.close()
+
+    def test_resume_group_row_selects_active_codex_member_over_older_linked_rollout(self):
+        # task-2126: relaunching used to find the row's stale saved
+        # session_key literally (an unlinked candidates() call never applied
+        # metadata["links"]) instead of the link's current active member -
+        # reopening an older linked rollout instead of the latest
+        # conversation. The row's own session_key still names the OLD
+        # member; only metadata["links"]["active"] has been advanced.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "links": {
+                    "manual:worker": {
+                        "members": ["Codex:old-rollout", "Codex:new-rollout"],
+                        "active": "Codex:new-rollout",
+                    }
+                },
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [{
+                            "name": "VAMP-worker4",
+                            "provider": "Codex",
+                            "override_key": "group:/tmp/vamp#VAMP-worker4",
+                            "session_key": "Codex:old-rollout",
+                        }],
+                    }
+                },
+            }
+            old = session_hub.Session(
+                "Codex", "old-rollout", "VAMP-worker4", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/old.jsonl"),
+            )
+            new = session_hub.Session(
+                "Codex", "new-rollout", "VAMP-worker4", "/tmp/vamp", "/tmp/vamp", 500,
+                Path("/tmp/new.jsonl"),
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.codex_sessions", return_value=[old, new]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    result = window.resume_group_row("/tmp/vamp", "VAMP-worker4")
+                self.assertEqual(result, {"status": "resumed", "name": "VAMP-worker4"})
+                # Records the exact native (provider, session_id) launch
+                # actually received, not just the row title/status.
+                self.assertEqual(launch.call_args.args[0], "Codex")
+                self.assertEqual(launch.call_args.args[1], "new-rollout")
+            finally:
+                window.close()
+
+    def test_resume_group_row_selects_active_claude_member_over_older_linked_rollout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "links": {
+                    "manual:s1": {
+                        "members": ["Claude:old-clear", "Claude:post-clear"],
+                        "active": "Claude:post-clear",
+                    }
+                },
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [{
+                            "name": "vamp-s1",
+                            "override_key": "group:/tmp/vamp#vamp-s1",
+                            "session_key": "Claude:old-clear",
+                        }],
+                    }
+                },
+            }
+            old = session_hub.Session(
+                "Claude", "old-clear", "vamp-s1", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/old.jsonl"), agent_name="vamp-s1",
+            )
+            new = session_hub.Session(
+                "Claude", "post-clear", "vamp-s1", "/tmp/vamp", "/tmp/vamp", 500,
+                Path("/tmp/new.jsonl"), agent_name="vamp-s1",
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.claude_sessions", return_value=[old, new]),
+                    patch("session_hub.codex_sessions", return_value=[]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.resume_group_row("/tmp/vamp", "vamp-s1")
+                self.assertEqual(launch.call_args.args[0], "Claude")
+                self.assertEqual(launch.call_args.args[1], "post-clear")
+            finally:
+                window.close()
+
+    def test_resume_group_row_repairs_missing_active_to_newest_valid_member(self):
+        # link["active"] names a member that no longer exists (deleted/
+        # trashed session) - must repair to the newest surviving member by
+        # updated_ms rather than leaving the row unmatched.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "links": {
+                    "manual:worker": {
+                        "members": ["Codex:old-rollout", "Codex:deleted", "Codex:newest"],
+                        "active": "Codex:deleted",
+                    }
+                },
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [{
+                            "name": "VAMP-worker4",
+                            "provider": "Codex",
+                            "override_key": "group:/tmp/vamp#VAMP-worker4",
+                            "session_key": "Codex:old-rollout",
+                        }],
+                    }
+                },
+            }
+            old = session_hub.Session(
+                "Codex", "old-rollout", "VAMP-worker4", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/old.jsonl"),
+            )
+            newest = session_hub.Session(
+                "Codex", "newest", "VAMP-worker4", "/tmp/vamp", "/tmp/vamp", 900,
+                Path("/tmp/newest.jsonl"),
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.codex_sessions", return_value=[old, newest]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.resume_group_row("/tmp/vamp", "VAMP-worker4")
+                self.assertEqual(launch.call_args.args[1], "newest")
+            finally:
+                window.close()
+
+    def test_resume_group_row_rejects_stale_name_duplicate_from_other_provider(self):
+        # A same-titled session from a provider the row/link never named
+        # must not be picked just because the candidate pool now spans every
+        # enabled provider - only an exact native-key or linked_keys match
+        # may select a session, never its display title.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [{
+                            "name": "vamp-s1",
+                            "provider": "Claude",
+                            "override_key": "group:/tmp/vamp#vamp-s1",
+                            "session_key": "Claude:abc123",
+                        }],
+                    }
+                },
+            }
+            real = session_hub.Session(
+                "Claude", "abc123", "vamp-s1", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/real.jsonl"), agent_name="vamp-s1",
+            )
+            decoy = session_hub.Session(
+                "Codex", "unrelated-decoy", "vamp-s1", "/tmp/vamp", "/tmp/vamp", 999,
+                Path("/tmp/decoy.jsonl"),
+            )
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.claude_sessions", return_value=[real]),
+                    patch("session_hub.codex_sessions", return_value=[decoy]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    window.resume_group_row("/tmp/vamp", "vamp-s1")
+                self.assertEqual(launch.call_args.args[0], "Claude")
+                self.assertEqual(launch.call_args.args[1], "abc123")
+            finally:
+                window.close()
+
+    def test_resume_group_row_fails_closed_when_linked_members_all_missing(self):
+        # Every member of the row's link is gone (deleted/trashed) - must
+        # error and never launch, not fall back to a guess.
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "links": {
+                    "manual:worker": {
+                        "members": ["Codex:gone1", "Codex:gone2"],
+                        "active": "Codex:gone1",
+                    }
+                },
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [{
+                            "name": "VAMP-worker4",
+                            "provider": "Codex",
+                            "override_key": "group:/tmp/vamp#VAMP-worker4",
+                            "session_key": "Codex:gone1",
+                        }],
+                    }
+                },
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.codex_sessions", return_value=[]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    result = window.resume_group_row("/tmp/vamp", "VAMP-worker4")
                 launch.assert_not_called()
                 self.assertEqual(result["status"], "error")
             finally:
