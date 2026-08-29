@@ -2037,6 +2037,114 @@ class SessionHubTests(unittest.TestCase):
         self.assertEqual(dialog.group_rows, [])
         dialog.close()
 
+    def test_invalid_codex_model_effort_reason_rejects_a_mismatched_known_model(self):
+        with patch("session_hub.codex_models", return_value=self._codex_models_fixture()):
+            # gpt-5.5 supports only "medium" in the fixture.
+            self.assertIsNotNone(
+                session_hub.invalid_codex_model_effort_reason("gpt-5.5", "high")
+            )
+            self.assertIsNone(
+                session_hub.invalid_codex_model_effort_reason("gpt-5.5", "medium")
+            )
+            # No model, no effort, or Default (None) never reject.
+            self.assertIsNone(session_hub.invalid_codex_model_effort_reason(None, "high"))
+            self.assertIsNone(session_hub.invalid_codex_model_effort_reason("gpt-5.5", None))
+            # A model absent from the roster is deliberately NOT rejected -
+            # the cache can be stale/incomplete by design (populate_codex_model_combo's
+            # own docstring); only a KNOWN model with a mismatched effort is.
+            self.assertIsNone(
+                session_hub.invalid_codex_model_effort_reason("gpt-9-not-cached-yet", "ultra")
+            )
+
+    def test_agent_model_effort_dialog_rejects_a_mismatched_codex_model_effort(self):
+        """Widget-level negative control (row447 third rework): a Codex
+        model/effort combination the local roster proves invalid must be
+        rejected visibly, with the dialog never reaching the Accepted state a
+        caller (continue_with_other_agent_for) gates its launch() call on -
+        so a caller correctly never spawns anything for this input.
+        """
+        with patch("session_hub.codex_models", return_value=self._codex_models_fixture()):
+            dialog = session_hub.AgentModelEffortDialog("Codex", None)
+            self.addCleanup(dialog.close)
+            dialog.codex_model_combo.setCurrentIndex(
+                dialog.codex_model_combo.findData("gpt-5.5")
+            )
+            # Free-typed, unsupported effort - exactly what an editable
+            # combo box allows (populate_codex_effort_combo's own docstring).
+            dialog.codex_effort_combo.setCurrentText("high")
+            with patch("session_hub.QMessageBox.warning") as warning:
+                dialog.accept()
+            warning.assert_called_once()
+            self.assertNotEqual(dialog.result(), session_hub.QDialog.DialogCode.Accepted)
+
+            # Positive control: a supported pair for the same dialog proceeds.
+            dialog.codex_effort_combo.setCurrentText("medium")
+            with patch("session_hub.QMessageBox.warning") as warning:
+                dialog.accept()
+            warning.assert_not_called()
+            self.assertEqual(dialog.result(), session_hub.QDialog.DialogCode.Accepted)
+
+    def test_session_launch_options_dialog_rejects_a_mismatched_codex_model_effort(self):
+        with patch("session_hub.codex_models", return_value=self._codex_models_fixture()):
+            dialog = session_hub.SessionLaunchOptionsDialog(
+                "worker", {}, {}, {}, {}, provider="Codex",
+                model="gpt-5.5", reasoning_effort="medium",
+            )
+            self.addCleanup(dialog.close)
+            dialog.codex_effort_combo.setCurrentText("high")
+            with patch("session_hub.QMessageBox.warning") as warning:
+                dialog.accept()
+            warning.assert_called_once()
+            self.assertNotEqual(dialog.result(), session_hub.QDialog.DialogCode.Accepted)
+
+    def test_launch_new_group_sessions_dialog_rejects_a_row_with_mismatched_codex_model_effort(self):
+        with patch("session_hub.codex_models", return_value=self._codex_models_fixture()):
+            dialog = session_hub.LaunchNewGroupSessionsDialog("/tmp/vamp", set(), False)
+            self.addCleanup(dialog.close)
+            provider_combo = dialog.table.cellWidget(0, 0)
+            provider_combo.setCurrentIndex(provider_combo.findData("Codex"))
+            model_combo = dialog.table.cellWidget(0, 1)
+            model_combo.setCurrentIndex(model_combo.findData("gpt-5.5"))
+            effort_combo = dialog.table.cellWidget(0, 2)
+            effort_combo.setCurrentText("high")  # gpt-5.5 supports only "medium"
+            name_edit = dialog.table.cellWidget(0, 4)
+            name_edit.setText("vampulse-codex")
+            name_edit.auto_suggested = False
+            with patch("session_hub.QMessageBox.warning") as warning:
+                dialog.accept()
+            warning.assert_called_once()
+            self.assertEqual(dialog.group_rows, [])
+
+    def test_codex_launch_args_scopes_mcp_by_the_actual_resume_execution_directory(self):
+        """codex resume actually runs `-C source_cwd-or-cwd`, not `-C cwd` -
+        row447 fourth rework. MCP scoping must key off the SAME directory the
+        process really executes in, or a resume's display cwd and its real
+        source_cwd disagreeing about VAMPULSE membership silently leaks the
+        MCP into a directory it must never reach, or wrongly disables it for
+        a legitimately-scoped session.
+        """
+        canonical_root, _worktree, base = self._make_vampulse_fixture()
+        outside = base / "elsewhere"
+        outside.mkdir()
+
+        # display cwd INSIDE VAMPULSE, real source_cwd OUTSIDE - must scope
+        # off source_cwd (outside) and disable the MCP.
+        args = session_hub.codex_launch_args(
+            str(canonical_root), session_id="sess-1", source_cwd=str(outside),
+        )
+        self.assertIn("mcp_servers.vampulse.enabled=false", args)
+        self.assertIn(str(outside), args)
+        self.assertNotIn(str(canonical_root), args)
+
+        # display cwd OUTSIDE VAMPULSE, real source_cwd INSIDE - must scope
+        # off source_cwd (inside) and leave the MCP enabled.
+        args = session_hub.codex_launch_args(
+            str(outside), session_id="sess-2", source_cwd=str(canonical_root),
+        )
+        self.assertNotIn("mcp_servers.vampulse.enabled=false", args)
+        self.assertIn(str(canonical_root), args)
+        self.assertNotIn(str(outside), args)
+
     def test_launch_canonicalizes_tmux_name_and_claude_name_flag_together(self):
         """Full row447-rework chain: a row minted from an unsafe raw name is
         launched, and the tmux session launch() creates, the --name flag

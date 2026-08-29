@@ -240,6 +240,46 @@ def codex_combo_value(combo: QComboBox) -> str | None:
     return combo.currentText().strip() or None
 
 
+def invalid_codex_model_effort_reason(model: str | None, effort: str | None) -> str | None:
+    """None if (model, effort) is launchable; otherwise a user-facing reason
+    it is not.
+
+    Row447 third rework: the model/effort combos are editable (see
+    populate_codex_model_combo's own docstring - a slug this machine's cache
+    doesn't know yet must still be typeable), so a mismatched pair used to
+    reach `codex` inside an async tmux child with no visible symptom - it
+    just fails to produce a usable session, indistinguishable from "nothing
+    happened" the same way the dotted-name bug was.
+
+    Deliberately does NOT reject a model absent from codex_models() outright
+    - the cache can be stale/incomplete by design, and rejecting an unknown
+    slug would break launching a real, brand-new Codex release this
+    machine's cache hasn't fetched yet. It DOES reject an effort level that
+    is objectively wrong for a model this machine's cache DOES recognize -
+    that combination will not run under any interpretation of the cache,
+    known-bad rather than merely unverifiable.
+    """
+    if not model or not effort:
+        return None
+    known = next(
+        (entry for entry in codex_models() if entry.get("slug") == model), None
+    )
+    if known is None:
+        return None
+    supported = {
+        level.get("effort")
+        for level in known.get("supported_reasoning_levels", [])
+        if level.get("effort")
+    }
+    if effort in supported:
+        return None
+    names = ", ".join(sorted(supported)) or "none"
+    return (
+        f"Codex model {model!r} does not support reasoning effort {effort!r} "
+        f"(supported: {names})."
+    )
+
+
 # Shared session-table column set: SessionHub's main listview and
 # ManageGroupDialog both render from this (see SessionHub.populate_session_table)
 # so their common columns are defined once, in one order.
@@ -964,6 +1004,14 @@ class SessionLaunchOptionsDialog(QDialog):
 
     def reasoning_effort(self) -> str | None:
         return codex_combo_value(self.codex_effort_combo) if self.codex_effort_combo else None
+
+    def accept(self) -> None:
+        if self.codex_model_combo is not None:
+            reason = invalid_codex_model_effort_reason(self.model(), self.reasoning_effort())
+            if reason:
+                QMessageBox.warning(self, "Unsupported model/effort", reason)
+                return
+        super().accept()
 
 
 @dataclass
@@ -3908,6 +3956,16 @@ def codex_launch_args(
     they can't drift between the direct-terminal and tmux code paths the way
     two independently-maintained copies of this list already had (dual-write
     class; see docs/netcode_dual_write_audit.md's game-code equivalent).
+
+    MCP scope is decided from `execution_cwd` (source_cwd-or-cwd for a
+    resume, cwd for a new session) - NOT the bare `cwd` parameter (row447
+    fourth rework). `codex resume -C <dir>` actually runs in `source_cwd or
+    cwd`, so scoping off `cwd` alone diverges from the real process
+    directory in both directions: a resume whose DISPLAY cwd is inside
+    VAMPULSE but whose real source_cwd is not would leak the MCP into a
+    directory it must never reach; a resume whose display cwd is outside
+    VAMPULSE but whose real source_cwd is inside it would wrongly disable
+    the MCP for a legitimately-scoped session.
     """
     args = [executable("codex")]
     if danger_mode:
@@ -3916,7 +3974,8 @@ def codex_launch_args(
         args += ["-m", model]
     if reasoning_effort:
         args += ["-c", f"model_reasoning_effort={reasoning_effort}"]
-    if not vampulse_mcp_applies(cwd):
+    execution_cwd = (source_cwd or cwd) if session_id else cwd
+    if not vampulse_mcp_applies(execution_cwd):
         args += ["-c", "mcp_servers.vampulse.enabled=false"]
     if session_id:
         # source_cwd, not cwd: `codex resume -C <dir>` silently FORKS into a
@@ -3925,9 +3984,9 @@ def codex_launch_args(
         # group row, e.g. one that cd'd into a worktree, forked twice and
         # died with no visible output under tmux). Resuming in the session's
         # actual directory avoids triggering that fork at all.
-        args += ["resume", "-C", source_cwd or cwd, session_id]
+        args += ["resume", "-C", execution_cwd, session_id]
     else:
-        args += ["-C", cwd]
+        args += ["-C", execution_cwd]
     if initial_prompt:
         args += [initial_prompt]
     return args
@@ -4412,6 +4471,10 @@ class NewSessionDialog(QDialog):
         elif self.codex_model_combo is not None:
             self.model = codex_combo_value(self.codex_model_combo)
             self.reasoning_effort = codex_combo_value(self.codex_effort_combo)
+            reason = invalid_codex_model_effort_reason(self.model, self.reasoning_effort)
+            if reason:
+                QMessageBox.warning(self, "Unsupported model/effort", reason)
+                return
         self.use_tmux = self.tmux_checkbox.isChecked()
         super().accept()
 
@@ -4547,6 +4610,10 @@ class AgentModelEffortDialog(QDialog):
         elif self.codex_model_combo is not None:
             self.model = codex_combo_value(self.codex_model_combo)
             self.reasoning_effort = codex_combo_value(self.codex_effort_combo)
+            reason = invalid_codex_model_effort_reason(self.model, self.reasoning_effort)
+            if reason:
+                QMessageBox.warning(self, "Unsupported model/effort", reason)
+                return
         super().accept()
 
 
@@ -4808,6 +4875,13 @@ class LaunchNewGroupSessionsDialog(QDialog):
                 )
                 return
             seen.add(row["name"])
+            if row["provider"] == "Codex":
+                reason = invalid_codex_model_effort_reason(
+                    row["model"], row["reasoning_effort"]
+                )
+                if reason:
+                    QMessageBox.warning(self, "Unsupported model/effort", reason)
+                    return
 
         self.group_rows = rows
         self.use_tmux = self.tmux_checkbox.isChecked()
