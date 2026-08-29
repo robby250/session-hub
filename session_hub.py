@@ -1137,7 +1137,16 @@ class UsageActivity:
 
 
 def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | None:
-    """Compare actual usage against an even pace across the window's duration."""
+    """Compare actual usage against an even pace across the window's duration. The reported
+    deviation is relative to EXPECTED usage, not the full quota (task-2142 row453): 10% used at
+    5% expected is "100% over pace" -- an absolute-percentage-point delta ("5% over pace") buries
+    how much worse than expected that actually is once usage is still low. Desktop and the phone
+    TUI both render this exact string (never recompute the arithmetic) -- desktop calls it directly
+    and the TUI reads the same value back from `--sessions-json`'s "pace" field.
+
+    When expected usage is near zero, a relative percentage is undefined (unbounded, or a
+    divide-by-zero at exactly zero) rather than merely large, so a neutral bounded label is shown
+    instead of a number."""
     if not window.window_minutes or not window.reset_epoch:
         return None
     window_seconds = window.window_minutes * 60
@@ -1150,8 +1159,11 @@ def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | N
     delta = window.used_percent - expected_percent
     if abs(delta) < 0.5:
         return f"{expected_percent:.1f}% expected · on pace"
+    if expected_percent < 0.05:
+        return f"{expected_percent:.1f}% expected · just started"
+    relative_percent = abs(delta) / expected_percent * 100
     direction = "over" if delta > 0 else "under"
-    return f"{expected_percent:.1f}% expected · {abs(delta):.1f}% {direction} pace"
+    return f"{expected_percent:.1f}% expected · {relative_percent:.1f}% {direction} pace"
 
 
 def format_reset_timestamp(timestamp: int | None) -> str:

@@ -36,6 +36,7 @@ from PyQt6.QtCore import QPoint
 from PyQt6.QtWidgets import QApplication
 
 import session_hub
+import session_hub_tui
 
 # Captured before any per-test patch.start() can shadow them (setUp() below
 # patches session_hub.METADATA_PATH/PID_DIR for defense-in-depth on every
@@ -657,6 +658,8 @@ class SessionHubTests(unittest.TestCase):
             window.close()
 
     def test_usage_pace_flags_usage_ahead_of_even_allocation(self):
+        # 30% used at 28.6% expected: relative deviation is abs(30-28.5714)/28.5714*100 = 5.0%,
+        # not the old absolute-percentage-point delta (1.4).
         now = datetime(2026, 6, 19, 12, 0)
         reset = now + timedelta(days=5)
         window = session_hub.UsageWindow(
@@ -664,7 +667,7 @@ class SessionHubTests(unittest.TestCase):
         )
         self.assertEqual(
             session_hub.usage_pace_text(window, now=now),
-            "28.6% expected · 1.4% over pace",
+            "28.6% expected · 5.0% over pace",
         )
 
     def test_usage_pace_flags_usage_under_pace_and_missing_data(self):
@@ -675,10 +678,70 @@ class SessionHubTests(unittest.TestCase):
         )
         self.assertEqual(
             session_hub.usage_pace_text(under, now=now),
-            "28.6% expected · 18.6% under pace",
+            "28.6% expected · 65.0% under pace",
         )
         missing = session_hub.UsageWindow("Weekly", 10, "Resets later")
         self.assertIsNone(session_hub.usage_pace_text(missing, now=now))
+
+    def test_usage_pace_relative_to_expected_table(self):
+        """task-2142 row453: the reported deviation is relative to EXPECTED usage
+        (abs(used-expected)/expected*100), not an absolute percentage-point delta -- 10% used at
+        5% expected is "100% over pace", and 2.5% used at 5% expected is "50% under pace" (the
+        brief's own worked examples). expected=0 (window just opened) must show a neutral bounded
+        label, never divide by zero or print a percentage at all."""
+        now = datetime(2026, 6, 19, 12, 0)
+        reset = now + timedelta(days=5)  # 5 of 7 days remain => 2/7 = 28.5714...% expected
+
+        def window(used_percent: int) -> session_hub.UsageWindow:
+            return session_hub.UsageWindow(
+                "Weekly", used_percent, "Resets later",
+                window_minutes=10080, reset_epoch=reset.timestamp(),
+            )
+
+        # equal pace: used == expected (rounded to the nearest int the dataclass accepts)
+        equal = session_hub.usage_pace_text(window(29), now=now)  # 29 vs 28.5714 -> delta<0.5
+        self.assertIn("on pace", equal)
+
+        # 2x expected: used = 2 * expected_percent -> 100% over
+        double = session_hub.UsageWindow(
+            "Weekly", 57, "Resets later", window_minutes=10080, reset_epoch=reset.timestamp()
+        )
+        text = session_hub.usage_pace_text(double, now=now)
+        self.assertIn("over pace", text)
+        relative = float(text.split("·")[1].strip().split("%")[0])
+        self.assertAlmostEqual(relative, 99.5, delta=2.0)  # ~2x expected -> ~100% over
+
+        # half expected: used = 0.5 * expected_percent -> 50% under
+        half = session_hub.UsageWindow(
+            "Weekly", 14, "Resets later", window_minutes=10080, reset_epoch=reset.timestamp()
+        )
+        text = session_hub.usage_pace_text(half, now=now)
+        self.assertIn("under pace", text)
+        relative = float(text.split("·")[1].strip().split("%")[0])
+        self.assertAlmostEqual(relative, 51.0, delta=2.0)  # ~half expected -> ~50% under
+
+        # expected == 0: window just opened (now == reset - window_minutes exactly), any nonzero
+        # used_percent would be an undefined relative percentage -- must not divide by zero
+        start = reset - timedelta(days=7)
+        just_started = session_hub.UsageWindow(
+            "Weekly", 3, "Resets later", window_minutes=10080, reset_epoch=reset.timestamp()
+        )
+        text = session_hub.usage_pace_text(just_started, now=start)
+        self.assertNotIn("over pace", text)
+        self.assertNotIn("under pace", text)
+        self.assertIn("just started", text)
+
+    def test_usage_pace_tui_reads_the_same_formatted_string(self):
+        """task-2142 row453: the phone TUI must consume the shared formatter's OUTPUT, never
+        reimplement the pace arithmetic itself -- source-level proof that
+        `session_hub_tui.py` contains neither `expected_percent` nor `elapsed_fraction` (the two
+        names the one real computation in `usage_pace_text` uses), only a passthrough read of the
+        JSON `pace` field it already displays."""
+        import pathlib
+        tui_source = pathlib.Path(session_hub_tui.__file__).read_text()
+        self.assertNotIn("expected_percent", tui_source)
+        self.assertNotIn("elapsed_fraction", tui_source)
+        self.assertIn('window.get("pace")', tui_source)
 
     def test_claude_reset_rolls_into_next_year(self):
         self.assertEqual(
