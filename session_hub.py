@@ -4122,6 +4122,7 @@ class LaunchNewGroupSessionsDialog(QDialog):
         parent=None,
         claude_accounts: dict[str, str] | None = None,
         accounts_enabled: bool = False,
+        will_launch: bool = True,
     ) -> None:
         super().__init__(parent)
         self.cwd = cwd
@@ -4130,7 +4131,8 @@ class LaunchNewGroupSessionsDialog(QDialog):
         self.use_tmux: bool = tmux
         self.claude_accounts = claude_accounts or DEFAULT_CLAUDE_ACCOUNTS
         self.accounts_enabled = accounts_enabled
-        self.setWindowTitle("Launch new sessions")
+        self.will_launch = will_launch
+        self.setWindowTitle("Launch new sessions" if will_launch else "Add new sessions")
         self.setMinimumWidth(560)
         layout = QVBoxLayout(self)
 
@@ -4138,6 +4140,11 @@ class LaunchNewGroupSessionsDialog(QDialog):
         directory_label.setWordWrap(True)
         layout.addWidget(directory_label)
 
+        # will_launch=False ("Add new…"): the tmux choice has no effect here
+        # (register_group_row/add_new_rows_into_group never launches
+        # anything), so showing it would promise a behavior this dialog
+        # doesn't perform - it applies the next time the saved row is
+        # actually launched, via the group's own "Launch in tmux" checkbox.
         self.tmux_checkbox = QCheckBox("Launch detached inside tmux")
         self.tmux_checkbox.setChecked(tmux)
         self.tmux_checkbox.setToolTip(
@@ -4147,9 +4154,10 @@ class LaunchNewGroupSessionsDialog(QDialog):
             "be installed. /clear-detection isn't available yet for "
             "tmux-launched sessions."
         )
+        self.tmux_checkbox.setVisible(will_launch)
         layout.addWidget(self.tmux_checkbox)
 
-        layout.addWidget(QLabel("Sessions to launch:"))
+        layout.addWidget(QLabel("Sessions to launch:" if will_launch else "Sessions to add:"))
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["Provider", "Model", "Effort", "Account", "Name"])
         self.table.horizontalHeader().setSectionResizeMode(
@@ -4186,7 +4194,9 @@ class LaunchNewGroupSessionsDialog(QDialog):
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Launch")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Launch" if will_launch else "Add"
+        )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -4647,12 +4657,18 @@ class ManageGroupDialog(QDialog):
             shortcut = QShortcut(QKeySequence(key), self.table)
             shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
             shortcut.activated.connect(self.launch_selected_rows)
+        self.table.itemSelectionChanged.connect(self._update_launch_selected_enabled)
         layout.addWidget(self.table)
 
         controls = QHBoxLayout()
-        launch_all = QPushButton("Launch all")
-        launch_all.clicked.connect(self.launch_all)
-        controls.addWidget(launch_all)
+        self.launch_selected_button = QPushButton("Launch selected")
+        self.launch_selected_button.setToolTip(
+            "Launch or resume every currently-selected row - nothing "
+            "happens with no selection."
+        )
+        self.launch_selected_button.setEnabled(False)
+        self.launch_selected_button.clicked.connect(self.launch_selected_rows)
+        controls.addWidget(self.launch_selected_button)
         add_session_button = QPushButton("Add session…")
         add_session_button.setToolTip(
             "File an already-running session into this group - no new "
@@ -4660,13 +4676,13 @@ class ManageGroupDialog(QDialog):
         )
         add_session_button.clicked.connect(self.add_existing_session)
         controls.addWidget(add_session_button)
-        launch_new_button = QPushButton("Launch new…")
-        launch_new_button.setToolTip(
+        add_new_button = QPushButton("Add new…")
+        add_new_button.setToolTip(
             "Define one or more brand-new named sessions (Claude or Codex) "
-            "and launch them into this group."
+            "and save them into this group - nothing gets launched."
         )
-        launch_new_button.clicked.connect(self.launch_new_rows)
-        controls.addWidget(launch_new_button)
+        add_new_button.clicked.connect(self.add_new_rows)
+        controls.addWidget(add_new_button)
         group_options_button = QPushButton("Group launch options…")
         group_options_button.setToolTip(
             "Env vars and CLI flags applied to every row in this group. "
@@ -4917,23 +4933,22 @@ class ManageGroupDialog(QDialog):
         self.hub.refresh()
         self.reload(select_override_keys={row["override_key"]})
 
-    def launch_all(self) -> None:
-        group = self.group()
-        if not group:
-            return
-        for row, match in self.matched_sessions():
-            if match and session_is_tracked_alive(match):
-                continue
-            self.launch_row(row["name"])
+    def _update_launch_selected_enabled(self) -> None:
+        self.launch_selected_button.setEnabled(
+            bool(self.table.selectionModel().selectedRows())
+        )
 
     def launch_selected_rows(self) -> None:
-        """Enter/Return on the table: launch or resume every selected row.
+        """"Launch selected" button / Enter/Return on the table: launch or
+        resume every selected row, in table order.
 
         Mirrors launch_or_resume_row's per-row launch-vs-resume choice, but
         for the whole (Ctrl/Shift-click) selection at once instead of just
-        the row under the cursor.
+        the row under the cursor. Table order (not selection/click order)
+        keeps multi-row launches deterministic and matches what the user
+        sees top to bottom.
         """
-        table_rows = {index.row() for index in self.table.selectionModel().selectedRows()}
+        table_rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()})
         if not table_rows:
             return
         override_keys = set()
@@ -4974,7 +4989,7 @@ class ManageGroupDialog(QDialog):
         self.hub.file_session_into_group(dialog.session, self.cwd)
         self.reload()
 
-    def launch_new_rows(self) -> None:
+    def add_new_rows(self) -> None:
         group = self.group()
         existing_names = {row["name"] for row in group.get("rows", [])} if group else set()
         dialog = LaunchNewGroupSessionsDialog(
@@ -4984,10 +4999,11 @@ class ManageGroupDialog(QDialog):
             self,
             claude_accounts=self.hub.settings().get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS,
             accounts_enabled=bool(self.hub.settings().get("claude_accounts_enabled")),
+            will_launch=False,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.group_rows:
             return
-        self.hub.launch_new_rows_into_group(self.cwd, dialog.group_rows, dialog.use_tmux)
+        self.hub.add_new_rows_into_group(self.cwd, dialog.group_rows)
         self.reload()
 
     def reorder_row(self, source_row: int, target_row: int) -> None:
@@ -5615,6 +5631,8 @@ class SessionHub(QMainWindow):
         self.running_table.verticalHeader().setVisible(False)
         self.running_table.horizontalHeader().setStretchLastSection(True)
         self.running_table.cellDoubleClicked.connect(self.reveal_running_row)
+        self.running_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.running_table.customContextMenuRequested.connect(self.running_context_menu)
         running_layout.addWidget(self.running_table, 1)
         running_actions = QHBoxLayout()
         running_actions.addStretch(1)
@@ -6408,6 +6426,24 @@ class SessionHub(QMainWindow):
             return
         cwd, name, session_id = item.data(Qt.ItemDataRole.UserRole)
         self._focus_or_resume_session(cwd, name, session_id)
+
+    def running_context_menu(self, point) -> None:
+        """Right-click a Running row: the same exact-identity focus/stop
+        authority as double-click and the Stop button, just reachable
+        without a prior left-click select."""
+        item = self.running_table.itemAt(point)
+        if item is None:
+            return
+        row = item.row()
+        self.running_table.setCurrentCell(row, 0)
+        menu = QMenu(self)
+        bring_up_action = QAction("Bring up window", self)
+        bring_up_action.triggered.connect(lambda: self.reveal_running_row(row))
+        menu.addAction(bring_up_action)
+        stop_action = QAction("Stop session", self)
+        stop_action.triggered.connect(self.stop_selected_running)
+        menu.addAction(stop_action)
+        menu.exec(self.running_table.viewport().mapToGlobal(point))
 
     def apply_filter(self) -> None:
         query = self.search.text().strip().lower()
@@ -7516,19 +7552,21 @@ class SessionHub(QMainWindow):
     def launch_selected_provider(self) -> None:
         self.launch_new(self.new_provider.currentText())
 
-    def launch_new_rows_into_group(
-        self, cwd: str, rows: list[dict], use_tmux: bool
-    ) -> None:
-        """Register and launch each row (`{"name", "provider", "model", "reasoning_effort"}`)
-        into the group at `cwd`.
+    def add_new_rows_into_group(self, cwd: str, rows: list[dict]) -> None:
+        """Register each row (`{"name", "provider", "model", "reasoning_effort"}`)
+        into the group at `cwd`, without launching anything - no provider
+        CLI, terminal, tmux session, resume, or focus action.
 
         Skips any name already present in the group - the same merge
         behavior the removed top-level "New session group…" button had
         when pointed at an existing directory. Called from
-        ManageGroupDialog's "Launch new…" button (LaunchNewGroupSessionsDialog);
-        the group itself must already exist - creating one happens either
-        via "Add session to group… → New group…" (no launch) or implicitly
-        the first time a session is filed into a not-yet-existing cwd.
+        ManageGroupDialog's "Add new…" button (LaunchNewGroupSessionsDialog,
+        will_launch=False); the group itself must already exist - creating
+        one happens either via "Add session to group… → New group…" or
+        implicitly the first time a session is filed into a not-yet-existing
+        cwd. The row is launched later, the same way any other saved-but-
+        not-yet-running row is: per-row Launch, "Launch selected", or the
+        row's own double-click/Enter.
         """
         group = self.metadata.setdefault("groups", {}).setdefault(
             cwd, {"cwd": cwd, "rows": []}
@@ -7545,19 +7583,6 @@ class SessionHub(QMainWindow):
                 row.get("model"),
                 row.get("reasoning_effort"),
                 row.get("account_config_dir"),
-            )
-            if provider == "Codex":
-                registered["codex_pending_since"] = int(time.time() * 1000)
-            self.launch(
-                provider,
-                None,
-                cwd,
-                model=row.get("model") if provider == "Codex" else None,
-                reasoning_effort=row.get("reasoning_effort") if provider == "Codex" else None,
-                session_key=registered["override_key"],
-                flag_overrides={"--name": registered["name"]},
-                focus=False,
-                use_tmux=use_tmux,
             )
             group["rows"].append(registered)
             existing_names.add(registered["name"])
@@ -7625,9 +7650,10 @@ class SessionHub(QMainWindow):
             write_metadata(self.metadata)
 
         # A saved row is a persistent conversation. Reopening it after a
-        # reboot must resume its history; launch_new_rows_into_group is the
-        # separate path that intentionally creates a fresh transcript.
-        # group_row_candidates(), not a same-provider-only claude_sessions()/
+        # reboot must resume its history; a row that has never run (added
+        # via "Add new…", never yet launched) has none, and history is
+        # exactly what decides that below - not a separate immediate-launch
+        # code path. group_row_candidates(), not a same-provider-only claude_sessions()/
         # codex_sessions() call: a row relinked to a different provider than
         # it was saved under has no history under its OWN provider at all,
         # which used to fall through to "no history" and start a duplicate
