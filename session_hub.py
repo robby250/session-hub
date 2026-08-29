@@ -23,10 +23,17 @@ import time
 import tomllib
 import uuid
 from dataclasses import dataclass, replace
+from terminal_profile import (  # noqa: E402  (see terminal_profile.py -- shared with vte_embed_helper.py)
+    gnome_terminal_profile_style,
+    resolve_gnome_terminal_font,
+    resolve_gnome_terminal_profile_uuid,
+)
 from datetime import date, datetime
 from pathlib import Path
 
-from PyQt6.QtCore import QByteArray, QObject, QRunnable, QThreadPool, QTimer, QUrl, Qt, pyqtSignal
+from PyQt6.QtCore import (
+    QByteArray, QObject, QRunnable, QSocketNotifier, QThreadPool, QTimer, QUrl, Qt, pyqtSignal,
+)
 from PyQt6.QtGui import (
     QAction,
     QColor,
@@ -1168,59 +1175,206 @@ def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | N
     return f"{expected_percent:.1f}% expected · {relative_percent:.1f}% {direction} pace"
 
 
-def _embed_precheck(platform_name: str, xterm_path: str | None, winid: int | None) -> str | None:
+_GIREPOSITORY_SEARCH_DIRS = (
+    "/usr/lib/girepository-1.0",
+    "/usr/lib/x86_64-linux-gnu/girepository-1.0",
+    "/usr/lib/aarch64-linux-gnu/girepository-1.0",
+    "/usr/local/lib/girepository-1.0",
+)
+
+
+def _typelib_present(filename: str) -> bool:
+    """Filesystem-only check for a GObject-Introspection typelib (task-2142 row453 REWORK --
+    orchestrator audit, 2026-08-30: `_embed_helper_ready` previously did `import gi; ... from
+    gi.repository import Gtk, Vte` IN THIS QT PROCESS to check readiness -- loading GTK's native
+    libraries into the same process as PyQt6 is exactly the cross-toolkit risk that audit flagged.
+    A bare file-existence probe answers the same question without ever loading either toolkit
+    here; the helper subprocess is the only place Gtk/Vte are actually imported."""
+    search_dirs = [p for p in os.environ.get("GI_TYPELIB_PATH", "").split(":") if p]
+    search_dirs += list(_GIREPOSITORY_SEARCH_DIRS)
+    return any((Path(d) / filename).is_file() for d in search_dirs)
+
+
+def _embed_helper_ready(which=shutil.which) -> bool:
+    """True if the embedded-terminal helper's dependencies -- a python3 interpreter, plus the
+    Gtk3/Vte typelibs the HELPER SUBPROCESS needs -- look present (task-2142 row453 REWORK)."""
+    if not which("python3"):
+        return False
+    return _typelib_present("Gtk-3.0.typelib") and _typelib_present("Vte-2.91.typelib")
+
+
+def _embed_precheck(platform_name: str, helper_ready: bool, winid: int | None) -> str | None:
     """Pure: the reason an embedded terminal cannot be attached right now, or None if every
     precondition holds (task-2142 row453). Kept separate from EmbeddedTerminalController so every
     branch is a plain string-in/string-out unit test with no Qt widget, X server or subprocess."""
     if platform_name != "xcb":
         return f"embedded terminal requires X11 (platform is {platform_name!r})"
-    if not xterm_path:
-        return "xterm is not installed"
+    if not helper_ready:
+        return "the embedded terminal helper is unavailable (python3-gi / gir1.2-vte-2.91 missing?)"
     if not winid or winid <= 0:
         return "no valid native window id for the terminal container"
     return None
 
 
-class EmbeddedTerminalController:
-    """Owns AT MOST ONE embedded xterm client (`xterm -into <winid> -e tmux attach-session -t
-    <name>`) attached to one container widget's native window (task-2142 row453). Switching
-    sessions gracefully ends only the OLD xterm client -- `detach()` never sends anything to tmux,
-    so the session a client was attached to keeps running headless exactly as before, the same
-    contract as a user manually detaching a real tmux client.
+class _EmbedWindowResizer:
+    """Injectable wrapper around python-xlib for keeping the VTE helper's Gtk.Plug window
+    pixel-exact with its Qt container on every resize (task-2142 row453 REWORK). Gtk.Plug embeds
+    itself into the socket window Session Hub hands it, but does not track that socket's size on
+    its own -- X11 embedding makes the EMBEDDER (Session Hub, the socket side) responsible for
+    resizing the child window, same as a window manager resizing any ordinary top-level window;
+    that resize is what makes GTK/Vte recompute the pty's rows/cols and send SIGWINCH.
 
-    `popen`/`which`/`platform_name` are injectable so a hermetic test can drive every precheck,
-    switch, failure and one-child-replacement path without a real X server, xterm binary or tmux
-    session -- it only needs a fake with `.winId()`."""
+    python-xlib is imported lazily so constructing this class -- and therefore
+    EmbeddedTerminalController -- never requires Xlib to be installed for a hermetic, non-X
+    test."""
+
+    def __init__(self, display_factory=None):
+        self._display_factory = display_factory or self._real_display
+        self._display = None
+
+    @staticmethod
+    def _real_display():
+        from Xlib import display
+
+        return display.Display()
+
+    def _disp(self):
+        if self._display is None:
+            self._display = self._display_factory()
+        return self._display
+
+    def resize(self, child_winid: int, width: int, height: int) -> bool:
+        try:
+            disp = self._disp()
+            child = disp.create_resource_object("window", child_winid)
+            child.configure(width=max(1, width), height=max(1, height))
+            disp.sync()
+        except Exception:
+            return False
+        return True
+
+
+def _default_read_xid_line(process: subprocess.Popen, timeout: float) -> str | None:
+    """Blocking-with-timeout read of the helper's one `XID=<id>` stdout line (task-2142 row453
+    REWORK). Plain `readline()` has no timeout, so a helper that never realizes its window would
+    otherwise hang Session Hub's GUI thread forever."""
+    if process.stdout is None:
+        return None
+    ready, _, _ = select.select([process.stdout], [], [], timeout)
+    if not ready:
+        return None
+    return process.stdout.readline()
+
+
+class EmbeddedTerminalController:
+    """Owns AT MOST ONE embedded terminal client: a small first-party GTK3/Vte helper process
+    (`vte_embed_helper.py`), embedded via `Gtk.Plug` into one container widget's native X window,
+    running `tmux attach-session -t <name>` inside a real `Vte.Terminal` (task-2142 row453
+    REWORK -- replaces the earlier bare-xterm embed, which could not match gnome-terminal's font/
+    theme/DPI because it never consulted GNOME Terminal's actual profile). Switching sessions
+    gracefully ends only the OLD client -- `detach()` never sends anything to tmux, so the
+    session a client was attached to keeps running headless exactly as before, the same contract
+    as a user manually detaching a real tmux client.
+
+    `popen`/`which`/`platform_name`/`embedder`/`read_xid_line`/`helper_ready`/`profile_uuid` are
+    all injectable so a hermetic test can drive every precheck, switch, failure and
+    one-child-replacement path without a real X server, GTK, tmux session or gsettings -- it only
+    needs a fake container with `.winId()`/`.size()`."""
 
     def __init__(self, container, popen=subprocess.Popen, which=shutil.which,
-                 platform_name=lambda: QApplication.platformName()):
+                 platform_name=lambda: QApplication.platformName(),
+                 embedder=None, read_xid_line=_default_read_xid_line,
+                 helper_ready=None, profile_uuid=None, helper_script=None):
         self._container = container
         self._popen = popen
         self._which = which
         self._platform_name = platform_name
+        self._embedder = embedder or _EmbedWindowResizer()
+        self._read_xid_line = read_xid_line
+        self._helper_ready = helper_ready or _embed_helper_ready
+        self._profile_uuid = profile_uuid or resolve_gnome_terminal_profile_uuid
+        self._helper_script = helper_script or str(
+            Path(__file__).resolve().parent / "vte_embed_helper.py"
+        )
         self.process: subprocess.Popen | None = None
         self.current_name: str | None = None
+        self._child_winid: int | None = None
+        self._pending_name: str | None = None
 
-    def attach(self, name: str) -> tuple[bool, str]:
-        """Precheck BEFORE touching any existing client: a systemic failure (no X11, no xterm)
-        must never tear down an already-working embedded session just because the user clicked a
+    def begin_attach(self, name: str) -> tuple[bool, str]:
+        """Phase 1 of attaching: precheck + launch the helper ONLY -- does not block waiting for
+        its XID line (task-2142 row453 REWORK -- orchestrator audit, 2026-08-30: a blocking read
+        here froze the GUI thread for up to 3s). The caller (the Qt GUI thread) waits for
+        readability asynchronously -- e.g. via QSocketNotifier plus a bounded singleShot timeout
+        -- then calls `finish_attach` with whatever line (or None) it got. `attach()` below is a
+        synchronous convenience wrapper over both for callers that don't need that split.
+
+        Precheck BEFORE touching any existing client: a systemic failure (no X11, no helper) must
+        never tear down an already-working embedded session just because the user clicked a
         different row -- it fails the same way every time regardless, so check first."""
         try:
             winid = int(self._container.winId())
         except (TypeError, ValueError):
             winid = None
-        reason = _embed_precheck(self._platform_name(), self._which("xterm"), winid)
+        reason = _embed_precheck(self._platform_name(), self._helper_ready(), winid)
         if reason:
             return False, reason
         self.detach()
-        argv = ["xterm", "-into", str(winid), "-e", "tmux", "attach-session", "-t", name]
+        argv = [self._which("python3"), self._helper_script,
+                "--socket-id", str(winid), "--tmux-session", name]
+        profile_uuid = self._profile_uuid()
+        if profile_uuid:
+            argv += ["--profile-uuid", profile_uuid]
         try:
-            self.process = self._popen(argv)
+            self.process = self._popen(argv, stdout=subprocess.PIPE, text=True, bufsize=1)
         except OSError as e:
             self.process = None
-            return False, f"failed to launch xterm: {e}"
+            return False, f"failed to launch the embedded terminal helper: {e}"
+        self._pending_name = name
+        return True, "launching"
+
+    def finish_attach(self, line: str | None) -> tuple[bool, str]:
+        """Phase 2: complete (or fail) the attach `begin_attach` started, given ONE stdout line
+        the caller already read (or None on timeout/EOF) (task-2142 row453 REWORK)."""
+        name = self._pending_name
+        self._pending_name = None
+        child_winid = None
+        if line and line.strip().startswith("XID="):
+            try:
+                child_winid = int(line.strip().split("=", 1)[1])
+            except ValueError:
+                child_winid = None
+        if child_winid is None:
+            self.detach()
+            return False, "the embedded terminal helper did not report a window id"
+        size = self._container.size()
+        if not self._embedder.resize(child_winid, size.width(), size.height()):
+            self.detach()
+            return False, "failed to size the embedded terminal's window"
         self.current_name = name
+        self._child_winid = child_winid
         return True, "attached"
+
+    def attach(self, name: str) -> tuple[bool, str]:
+        """Synchronous convenience wrapper over begin_attach+finish_attach (task-2142 row453
+        REWORK) -- for hermetic tests and any non-GUI caller. The real widget wiring in
+        SessionHub._switch_embedded_terminal uses begin_attach/finish_attach directly via a
+        QSocketNotifier so it never blocks the GUI thread; this wrapper is the one place still
+        allowed to block, via the injected `read_xid_line`."""
+        ok, reason = self.begin_attach(name)
+        if not ok:
+            return False, reason
+        line = self._read_xid_line(self.process, 3.0)
+        return self.finish_attach(line)
+
+    def resize_to_container(self) -> None:
+        """Re-fill the container on every resize (window resize, splitter drag) -- must be
+        called by the owning widget's resizeEvent/splitterMoved; Gtk.Plug does not track the
+        socket side's size changes on its own (task-2142 row453 REWORK)."""
+        if self._child_winid is None or self.process is None or self.process.poll() is not None:
+            return
+        size = self._container.size()
+        self._embedder.resize(self._child_winid, size.width(), size.height())
 
     def detach(self) -> None:
         if self.process is not None:
@@ -1233,18 +1387,38 @@ class EmbeddedTerminalController:
                     self.process.wait(timeout=2)
         self.process = None
         self.current_name = None
+        self._child_winid = None
 
     def poll_alive(self) -> bool:
         """True if a client is currently attached and still running. Clears state -- without
-        touching tmux -- the moment the child has exited on its own, so the caller's next poll
-        tick shows the failure and can fall back to external attachment."""
+        touching tmux -- the moment the child has exited on its own (the helper quits itself on
+        Vte's `child-exited` signal, so this needs no dedicated poll timer -- see
+        `_check_embedded_terminal_liveness`, folded into the existing 2s status tick), so the
+        caller's next check shows the failure and can fall back to external attachment."""
         if self.process is None:
             return False
         if self.process.poll() is not None:
             self.process = None
             self.current_name = None
+            self._child_winid = None
             return False
         return True
+
+
+class _EmbeddedTerminalContainer(QWidget):
+    """QWidget subclass so the container's own resizes reach the embedded terminal (task-2142
+    row453 REWORK). A plain QWidget's `resizeEvent` cannot be hooked from outside without
+    subclassing -- Qt dispatches virtual methods through the class's vtable, not an instance
+    attribute, so assigning `.resizeEvent = ...` on an existing QWidget instance is silently
+    never called."""
+
+    def __init__(self, on_resize):
+        super().__init__()
+        self._on_resize = on_resize
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._on_resize()
 
 
 def format_reset_timestamp(timestamp: int | None) -> str:
@@ -6393,6 +6567,7 @@ class SessionHub(QMainWindow):
     def _on_running_status_tick(self) -> None:
         if self._running_tab_visible():
             self.refresh_running_tab()
+            self._check_embedded_terminal_liveness()
 
     def _on_main_tab_changed(self, _index: int) -> None:
         # Refresh immediately on becoming visible instead of leaving the table up to
@@ -6619,21 +6794,24 @@ class SessionHub(QMainWindow):
         self.running_terminal_failure = QLabel()
         self.running_terminal_failure.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.running_terminal_failure.setWordWrap(True)
-        self.running_terminal_container = QWidget()
+        self.running_terminal_container = _EmbeddedTerminalContainer(
+            self._on_terminal_container_resize
+        )
         running_terminal_stack.addWidget(self.running_terminal_placeholder)
         running_terminal_stack.addWidget(self.running_terminal_failure)
         running_terminal_stack.addWidget(self.running_terminal_container)
         self._running_terminal_stack = running_terminal_stack
         self._embedded_terminal = EmbeddedTerminalController(self.running_terminal_container)
-        self._embedded_terminal_poll = QTimer(self)
-        self._embedded_terminal_poll.setInterval(1000)
-        self._embedded_terminal_poll.timeout.connect(self._poll_embedded_terminal)
+        self._embedded_terminal_meta: dict[str, tuple[str, str | None]] = {}
 
         running_splitter = QSplitter(Qt.Orientation.Horizontal)
         running_splitter.addWidget(running_list_page)
         running_splitter.addWidget(running_terminal_page)
         running_splitter.setStretchFactor(0, 0)
         running_splitter.setStretchFactor(1, 1)
+        running_splitter.splitterMoved.connect(
+            lambda *_a: self._on_terminal_container_resize()
+        )
         running_layout.addWidget(running_splitter, 1)
 
         external_shortcut = QShortcut(QKeySequence("Ctrl+Shift+O"), running_page)
@@ -7469,12 +7647,52 @@ class SessionHub(QMainWindow):
         if (self._embedded_terminal.current_name == name
                 and self._embedded_terminal.poll_alive()):
             return  # already attached to this exact session -- no needless restart
-        ok, detail = self._embedded_terminal.attach(name)
-        if ok:
-            self._embedded_terminal_poll.start()
-            self._running_terminal_stack.setCurrentWidget(self.running_terminal_container)
+        ok, detail = self._embedded_terminal.begin_attach(name)
+        if not ok:
+            self._show_embed_failure(cwd, name, session_id, detail)
             return
-        self._embedded_terminal_poll.stop()
+        self._await_embed_xid(cwd, name, session_id)
+
+    def _await_embed_xid(self, cwd: str, name: str, session_id: str | None) -> None:
+        """Waits for the helper's one `XID=` stdout line EVENT-DRIVEN via QSocketNotifier, with a
+        bounded 3s singleShot (never periodic/recurring) timeout fallback -- never a blocking read
+        on the GUI thread (task-2142 row453 REWORK -- orchestrator audit, 2026-08-30)."""
+        process = self._embedded_terminal.process
+        notifier = QSocketNotifier(process.stdout.fileno(), QSocketNotifier.Type.Read, self)
+        timeout_timer = QTimer(self)
+        timeout_timer.setSingleShot(True)
+        state = {"done": False}
+
+        def finish(line: str | None) -> None:
+            if state["done"]:
+                return
+            state["done"] = True
+            notifier.setEnabled(False)
+            notifier.deleteLater()
+            timeout_timer.stop()
+            timeout_timer.deleteLater()
+            self._finish_embed_attach(cwd, name, session_id, line)
+
+        notifier.activated.connect(lambda _fd: finish(process.stdout.readline()))
+        timeout_timer.timeout.connect(lambda: finish(None))
+        timeout_timer.start(3000)
+        # Keep references alive -- an unreferenced QSocketNotifier/QTimer can be garbage
+        # collected out from under Qt before it ever fires.
+        self._embed_await_notifier = notifier
+        self._embed_await_timer = timeout_timer
+
+    def _finish_embed_attach(self, cwd: str, name: str, session_id: str | None,
+                              line: str | None) -> None:
+        ok, detail = self._embedded_terminal.finish_attach(line)
+        if ok:
+            # finish_attach() already resized the child to the container's exact current size --
+            # no need for a second _on_terminal_container_resize() call here.
+            self._embedded_terminal_meta[name] = (cwd, session_id)
+            self._running_terminal_stack.setCurrentWidget(self.running_terminal_container)
+        else:
+            self._show_embed_failure(cwd, name, session_id, detail)
+
+    def _show_embed_failure(self, cwd: str, name: str, session_id: str | None, detail: str) -> None:
         self.running_terminal_failure.setText(
             f"Could not embed a terminal for {name!r}: {detail}\n"
             "Falling back to an external terminal window."
@@ -7482,18 +7700,29 @@ class SessionHub(QMainWindow):
         self._running_terminal_stack.setCurrentWidget(self.running_terminal_failure)
         self._focus_or_resume_session(cwd, name, session_id)
 
-    def _poll_embedded_terminal(self) -> None:
-        """The embedded xterm child can exit on its own (tmux session ended, xterm crashed) --
-        caught here rather than only at the next explicit switch, so the panel never silently
-        keeps showing a dead terminal as if it were still attached."""
+    def _on_terminal_container_resize(self) -> None:
+        """Re-fill the panel on container resize AND splitter drag (task-2142 row453 REWORK) --
+        wired from `_EmbeddedTerminalContainer.resizeEvent` and `running_splitter.splitterMoved`.
+        A plain attribute lookup rather than a direct bound-method reference at construction time,
+        so this can be wired before `self._embedded_terminal` exists yet."""
+        if hasattr(self, "_embedded_terminal"):
+            self._embedded_terminal.resize_to_container()
+
+    def _check_embedded_terminal_liveness(self) -> None:
+        """The embedded terminal's helper process can exit on its own (tmux session ended, the
+        helper crashed) -- caught here, folded into the EXISTING 2s `_status_timer` tick rather
+        than a dedicated poll timer (task-2142 row453 REWORK; a prior version added its own 1s
+        timer, which the brief's no-new-periodic-poll rule forbids), so the panel never silently
+        keeps showing a dead terminal, and falls back to an external terminal window exactly like
+        a failed attach does."""
         name = self._embedded_terminal.current_name
-        if self._embedded_terminal.poll_alive():
+        if name is None or self._embedded_terminal.poll_alive():
             return
-        self._embedded_terminal_poll.stop()
-        if name is None:
-            return
+        cwd, session_id = self._embedded_terminal_meta.get(name, (None, None))
         self.running_terminal_failure.setText(f"The embedded terminal for {name!r} exited.")
         self._running_terminal_stack.setCurrentWidget(self.running_terminal_failure)
+        if cwd is not None:
+            self._focus_or_resume_session(cwd, name, session_id)
 
     def running_context_menu(self, point) -> None:
         """Right-click a Running row: the same exact-identity focus/stop

@@ -3,6 +3,7 @@ import contextlib
 import io
 import os
 import json
+import select
 import subprocess
 import shutil
 import sys
@@ -33,6 +34,7 @@ os.environ["XDG_DATA_HOME"] = _TEST_XDG_DATA_HOME
 atexit.register(shutil.rmtree, _TEST_XDG_DATA_HOME, ignore_errors=True)
 
 from PyQt6.QtCore import QPoint
+from PyQt6.QtGui import QResizeEvent
 from PyQt6.QtWidgets import QApplication
 
 import session_hub
@@ -8309,16 +8311,23 @@ class ExtractLastMeaningfulBlockTests(unittest.TestCase):
         self.assertEqual(block, "● Something happened")
 
 
-class _FakeXtermProcess:
-    """Stands in for a real xterm subprocess.Popen handle. `.terminate()`/`.kill()` only flip
-    local flags -- there is nothing here that could ever reach tmux, which is the point: any test
-    asserting "no tmux kill" only has to prove this fake was never asked to run a tmux command."""
+class _FakeEmbedProcess:
+    """Stands in for the real `vte_embed_helper.py` subprocess.Popen handle. `.terminate()`/
+    `.kill()` only flip local flags -- there is nothing here that could ever reach tmux, which is
+    the point: any test asserting "no tmux kill" only has to prove this fake was never asked to
+    run a tmux command. `.stdout` is backed by a REAL pipe (not a plain fake with a bogus
+    `fileno() -> -1`) -- task-2142 row453 REWORK's widget path constructs a real QSocketNotifier
+    over this fd, and Qt's event dispatcher does not tolerate an invalid one."""
 
-    def __init__(self, argv):
+    def __init__(self, argv, stdout_lines=("XID=555\n",)):
         self.argv = argv
         self._alive = True
         self.terminated = False
         self.killed = False
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(write_fd, "w") as w:
+            w.write("".join(stdout_lines))
+        self.stdout = os.fdopen(read_fd, "r")
 
     def poll(self):
         return None if self._alive else 0
@@ -8335,26 +8344,59 @@ class _FakeXtermProcess:
         return 0
 
 
+class _FakeSize:
+    def __init__(self, width, height):
+        self._width = width
+        self._height = height
+
+    def width(self):
+        return self._width
+
+    def height(self):
+        return self._height
+
+
 class _FakeWinIdContainer:
-    def __init__(self, winid):
+    def __init__(self, winid, width=640, height=480):
         self._winid = winid
+        self._size = _FakeSize(width, height)
 
     def winId(self):
         return self._winid
 
+    def size(self):
+        return self._size
+
+    def resize(self, width, height):
+        self._size = _FakeSize(width, height)
+
+
+class _FakeEmbedder:
+    """Records every `resize()` call (target child window id, width, height) instead of touching
+    a real X server -- the "assert exact geometry every time" control for
+    EmbeddedTerminalControllerTests/RunningTabEmbeddedTerminalTests (task-2142 row453 REWORK)."""
+
+    def __init__(self, fail=False):
+        self.calls = []
+        self._fail = fail
+
+    def resize(self, child_winid, width, height):
+        self.calls.append((child_winid, width, height))
+        return not self._fail
+
 
 class EmbedPrecheckTests(unittest.TestCase):
-    """task-2142 row453: _embed_precheck is pure -- table-tested with no Qt widget, X server,
-    xterm binary or tmux session involved at all."""
+    """task-2142 row453 REWORK: _embed_precheck is pure -- table-tested with no Qt widget, X
+    server, helper subprocess or tmux session involved at all."""
 
     def test_table(self):
         cases = [
-            (("xcb", "/usr/bin/xterm", 999), None),
-            (("wayland", "/usr/bin/xterm", 999), "X11"),
-            (("offscreen", "/usr/bin/xterm", 999), "X11"),
-            (("xcb", None, 999), "xterm"),
-            (("xcb", "/usr/bin/xterm", 0), "window id"),
-            (("xcb", "/usr/bin/xterm", None), "window id"),
+            (("xcb", True, 999), None),
+            (("wayland", True, 999), "X11"),
+            (("offscreen", True, 999), "X11"),
+            (("xcb", False, 999), "helper"),
+            (("xcb", True, 0), "window id"),
+            (("xcb", True, None), "window id"),
         ]
         for args, expect_substr in cases:
             reason = session_hub._embed_precheck(*args)
@@ -8365,36 +8407,173 @@ class EmbedPrecheckTests(unittest.TestCase):
                 self.assertIn(expect_substr, reason, args)
 
 
-class EmbeddedTerminalControllerTests(unittest.TestCase):
-    """task-2142 row453: hermetic fake-xterm/fake-tmux proof for exact argv/target, one-child
-    replacement, and that nothing here can ever touch tmux -- popen/which/platform_name are fully
-    injected, so none of this needs a real X server, xterm binary or tmux session."""
+class GnomeTerminalProfileResolutionTests(unittest.TestCase):
+    """task-2142 row453 REWORK: pure gsettings-parsing logic, table-tested against fake `run`
+    output -- proves the font/color resolution matches GNOME Terminal's own precedence
+    (use-system-font / use-theme-colors) rather than an xterm-default approximation."""
 
-    def _controller(self, xterm_path="/usr/bin/xterm", platform="xcb", winid=999):
-        container = _FakeWinIdContainer(winid)
+    @staticmethod
+    def _fake_run(answers):
+        def run(argv, capture_output, text, timeout):
+            key = tuple(argv)
+            stdout = answers.get(key, "")
+            return subprocess.CompletedProcess(argv, 0 if key in answers else 1, stdout, "")
+        return run
+
+    def test_resolve_profile_uuid(self):
+        run = self._fake_run({
+            ("gsettings", "get", "org.gnome.Terminal.ProfilesList", "default"):
+                "'b1dcc9dd-5262-4d8d-a863-c897e6d979b9'\n",
+        })
+        self.assertEqual(
+            session_hub.resolve_gnome_terminal_profile_uuid(run=run),
+            "b1dcc9dd-5262-4d8d-a863-c897e6d979b9",
+        )
+
+    def test_resolve_profile_uuid_missing_gsettings_returns_none(self):
+        def raising_run(*a, **k):
+            raise OSError("gsettings not found")
+        self.assertIsNone(session_hub.resolve_gnome_terminal_profile_uuid(run=raising_run))
+
+    def test_font_falls_back_to_desktop_monospace_when_profile_uses_system_font(self):
+        # The live facts reported for this box (task-2148/2142 orchestrator, 2026-08-30):
+        # use-system-font=true, org.gnome.desktop.interface monospace-font-name='Liberation Mono 10'.
+        uuid = "b1dcc9dd-5262-4d8d-a863-c897e6d979b9"
+        path = f"/org/gnome/terminal/legacy/profiles:/:{uuid}/"
+        run = self._fake_run({
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "use-system-font"):
+                "true\n",
+            ("gsettings", "get", "org.gnome.desktop.interface", "monospace-font-name"):
+                "Liberation Mono 10\n",
+        })
+        self.assertEqual(session_hub.resolve_gnome_terminal_font(uuid, run=run), "Liberation Mono 10")
+
+    def test_font_uses_profile_font_when_system_font_is_off(self):
+        uuid = "uuid-1"
+        path = f"/org/gnome/terminal/legacy/profiles:/:{uuid}/"
+        run = self._fake_run({
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "use-system-font"):
+                "false\n",
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "font"):
+                "Fira Code 12\n",
+        })
+        self.assertEqual(session_hub.resolve_gnome_terminal_font(uuid, run=run), "Fira Code 12")
+
+    def test_style_omits_colors_when_theme_colors_are_used(self):
+        # Also the live default for this box: use-theme-colors=true -- hardcoding a color pair
+        # here would fight the GTK theme gnome-terminal itself renders with.
+        uuid = "uuid-1"
+        path = f"/org/gnome/terminal/legacy/profiles:/:{uuid}/"
+        run = self._fake_run({
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "use-system-font"):
+                "true\n",
+            ("gsettings", "get", "org.gnome.desktop.interface", "monospace-font-name"):
+                "Liberation Mono 10\n",
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "use-theme-colors"):
+                "true\n",
+        })
+        style = session_hub.gnome_terminal_profile_style(uuid, run=run)
+        self.assertEqual(style, {"font": "Liberation Mono 10"})
+
+    def test_style_includes_explicit_colors_when_theme_colors_are_off(self):
+        uuid = "uuid-1"
+        path = f"/org/gnome/terminal/legacy/profiles:/:{uuid}/"
+        run = self._fake_run({
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "use-system-font"):
+                "true\n",
+            ("gsettings", "get", "org.gnome.desktop.interface", "monospace-font-name"):
+                "Liberation Mono 10\n",
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "use-theme-colors"):
+                "false\n",
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "background-color"):
+                "#1E1E1E\n",
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "foreground-color"):
+                "#DDDDDD\n",
+        })
+        style = session_hub.gnome_terminal_profile_style(uuid, run=run)
+        self.assertEqual(style["background"], "#1E1E1E")
+        self.assertEqual(style["foreground"], "#DDDDDD")
+
+    def test_shared_resolver_control_embedded_argv_uuid_matches_external_default(self):
+        """The determinism control the orchestrator asked for: whatever profile uuid the embedded
+        helper is launched with must be EXACTLY the uuid resolve_gnome_terminal_profile_uuid()
+        (the one function both paths consult) resolves -- not a hardcoded/duplicated string."""
+        run = self._fake_run({
+            ("gsettings", "get", "org.gnome.Terminal.ProfilesList", "default"):
+                "'b1dcc9dd-5262-4d8d-a863-c897e6d979b9'\n",
+        })
+        container = _FakeWinIdContainer(999)
         calls = []
 
-        def fake_popen(argv):
+        def fake_popen(argv, **kwargs):
             calls.append(argv)
-            return _FakeXtermProcess(argv)
+            return _FakeEmbedProcess(argv)
 
         ctl = session_hub.EmbeddedTerminalController(
-            container, popen=fake_popen, which=lambda name: xterm_path,
-            platform_name=lambda: platform,
+            container, popen=fake_popen, which=lambda name: "/usr/bin/python3",
+            platform_name=lambda: "xcb", embedder=_FakeEmbedder(),
+            read_xid_line=lambda proc, timeout: "XID=555\n",
+            helper_ready=lambda: True,
+            profile_uuid=lambda: session_hub.resolve_gnome_terminal_profile_uuid(run=run),
         )
-        return ctl, calls
+        ctl.attach("a")
+        self.assertIn("--profile-uuid", calls[0])
+        self.assertEqual(
+            calls[0][calls[0].index("--profile-uuid") + 1],
+            session_hub.resolve_gnome_terminal_profile_uuid(run=run),
+        )
+
+
+class EmbeddedTerminalControllerTests(unittest.TestCase):
+    """task-2142 row453 REWORK: hermetic fake-helper/fake-tmux proof for exact argv/target,
+    one-child replacement, exact-geometry resizing, and that nothing here can ever touch tmux --
+    popen/which/platform_name/embedder/read_xid_line/helper_ready/profile_uuid are fully
+    injected, so none of this needs a real X server, GTK, tmux session or gsettings."""
+
+    def _controller(self, helper_ready=True, platform="xcb", winid=999, width=640, height=480,
+                     embedder=None, xid_line="XID=555\n", profile_uuid=None):
+        container = _FakeWinIdContainer(winid, width, height)
+        calls = []
+
+        def fake_popen(argv, **kwargs):
+            calls.append(argv)
+            return _FakeEmbedProcess(argv, stdout_lines=(xid_line,) if xid_line else ())
+
+        embedder = embedder if embedder is not None else _FakeEmbedder()
+        ctl = session_hub.EmbeddedTerminalController(
+            container, popen=fake_popen, which=lambda name: f"/usr/bin/{name}",
+            platform_name=lambda: platform, embedder=embedder,
+            read_xid_line=lambda proc, timeout: proc.stdout.readline() or None,
+            helper_ready=lambda: helper_ready,
+            profile_uuid=lambda: profile_uuid,
+        )
+        return ctl, calls, embedder, container
 
     def test_attach_exact_argv_and_target(self):
-        ctl, calls = self._controller(winid=999)
+        ctl, calls, embedder, _container = self._controller(winid=999)
         ok, _detail = ctl.attach("vamp-worker2")
         self.assertTrue(ok)
-        self.assertEqual(
-            calls, [["xterm", "-into", "999", "-e", "tmux", "attach-session", "-t", "vamp-worker2"]]
-        )
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]
+        self.assertEqual(argv[0], "/usr/bin/python3")
+        self.assertTrue(argv[1].endswith("vte_embed_helper.py"))
+        self.assertEqual(argv[2:6], ["--socket-id", "999", "--tmux-session", "vamp-worker2"])
         self.assertEqual(ctl.current_name, "vamp-worker2")
+        self.assertNotIn("--profile-uuid", argv)  # profile_uuid=None here -> omitted, not blank
+
+    def test_attach_includes_profile_uuid_when_resolved(self):
+        ctl, calls, _embedder, _container = self._controller(profile_uuid="uuid-xyz")
+        ctl.attach("a")
+        self.assertIn("--profile-uuid", calls[0])
+        self.assertEqual(calls[0][calls[0].index("--profile-uuid") + 1], "uuid-xyz")
+
+    def test_attach_resizes_the_reported_child_to_the_exact_container_size(self):
+        ctl, _calls, embedder, _container = self._controller(width=800, height=600)
+        ctl.attach("a")
+        self.assertEqual(embedder.calls, [(555, 800, 600)])
 
     def test_switching_sessions_replaces_the_one_child_and_never_touches_tmux(self):
-        ctl, calls = self._controller()
+        ctl, calls, _embedder, _container = self._controller()
         ctl.attach("a")
         first_proc = ctl.process
         ctl.attach("b")
@@ -8410,7 +8589,7 @@ class EmbeddedTerminalControllerTests(unittest.TestCase):
     def test_reattaching_the_same_alive_session_is_a_no_op_at_the_controller_level(self):
         # (the widget-level no-op short-circuit lives in _switch_embedded_terminal; this proves
         # the controller itself is safe to call attach() twice in a row regardless.)
-        ctl, calls = self._controller()
+        ctl, calls, _embedder, _container = self._controller()
         ctl.attach("a")
         first_proc = ctl.process
         ctl.attach("a")
@@ -8418,28 +8597,43 @@ class EmbeddedTerminalControllerTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
     def test_not_x11_fails_closed_and_launches_nothing(self):
-        ctl, calls = self._controller(platform="offscreen")
+        ctl, calls, _embedder, _container = self._controller(platform="offscreen")
         ok, detail = ctl.attach("a")
         self.assertFalse(ok)
         self.assertIn("X11", detail)
         self.assertEqual(calls, [])
         self.assertIsNone(ctl.process)
 
-    def test_xterm_missing_fails_closed_and_launches_nothing(self):
-        ctl, calls = self._controller(xterm_path=None)
+    def test_helper_unavailable_fails_closed_and_launches_nothing(self):
+        ctl, calls, _embedder, _container = self._controller(helper_ready=False)
         ok, detail = ctl.attach("a")
         self.assertFalse(ok)
-        self.assertIn("xterm", detail)
+        self.assertIn("helper", detail)
         self.assertEqual(calls, [])
 
     def test_invalid_window_id_fails_closed_and_launches_nothing(self):
-        ctl, calls = self._controller(winid=0)
+        ctl, calls, _embedder, _container = self._controller(winid=0)
         ok, detail = ctl.attach("a")
         self.assertFalse(ok)
         self.assertEqual(calls, [])
 
-    def test_detach_terminates_the_xterm_client_only_never_tmux(self):
-        ctl, _calls = self._controller()
+    def test_no_xid_reported_fails_closed_and_terminates_the_helper(self):
+        ctl, calls, embedder, _container = self._controller(xid_line=None)
+        ok, detail = ctl.attach("a")
+        self.assertFalse(ok)
+        self.assertIn("window id", detail)
+        self.assertEqual(embedder.calls, [])  # never resized a child we never got an id for
+        self.assertIsNone(ctl.process)  # detach() already cleaned up the failed helper
+
+    def test_embedder_resize_failure_fails_closed(self):
+        ctl, _calls, _embedder, _container = self._controller(embedder=_FakeEmbedder(fail=True))
+        ok, detail = ctl.attach("a")
+        self.assertFalse(ok)
+        self.assertIn("size", detail)
+        self.assertIsNone(ctl.process)
+
+    def test_detach_terminates_the_helper_only_never_tmux(self):
+        ctl, _calls, _embedder, _container = self._controller()
         ctl.attach("a")
         proc = ctl.process
         ctl.detach()
@@ -8448,18 +8642,18 @@ class EmbeddedTerminalControllerTests(unittest.TestCase):
         self.assertIsNone(ctl.current_name)
 
     def test_detach_with_nothing_attached_is_a_safe_no_op(self):
-        ctl, _calls = self._controller()
+        ctl, _calls, _embedder, _container = self._controller()
         ctl.detach()  # must not raise
         self.assertIsNone(ctl.process)
 
     def test_poll_alive_true_while_child_is_running(self):
-        ctl, _calls = self._controller()
+        ctl, _calls, _embedder, _container = self._controller()
         ctl.attach("a")
         self.assertTrue(ctl.poll_alive())
         self.assertEqual(ctl.current_name, "a")  # unaffected by a live poll
 
     def test_poll_alive_clears_state_without_touching_tmux_when_child_exits(self):
-        ctl, _calls = self._controller()
+        ctl, _calls, _embedder, _container = self._controller()
         ctl.attach("a")
         ctl.process._alive = False  # the child exited on its own (tmux session gone, crash, ...)
         self.assertFalse(ctl.poll_alive())
@@ -8469,17 +8663,98 @@ class EmbeddedTerminalControllerTests(unittest.TestCase):
     def test_launch_oserror_fails_closed_without_raising(self):
         container = _FakeWinIdContainer(999)
 
-        def raising_popen(argv):
-            raise OSError("xterm not executable")
+        def raising_popen(argv, **kwargs):
+            raise OSError("python3 not executable")
 
         ctl = session_hub.EmbeddedTerminalController(
-            container, popen=raising_popen, which=lambda name: "/usr/bin/xterm",
-            platform_name=lambda: "xcb",
+            container, popen=raising_popen, which=lambda name: f"/usr/bin/{name}",
+            platform_name=lambda: "xcb", embedder=_FakeEmbedder(),
+            helper_ready=lambda: True, profile_uuid=lambda: None,
         )
         ok, detail = ctl.attach("a")
         self.assertFalse(ok)
-        self.assertIn("xterm", detail)
+        self.assertIn("helper", detail)
         self.assertIsNone(ctl.process)
+
+    def test_resize_to_container_is_a_no_op_before_any_attach(self):
+        ctl, _calls, embedder, _container = self._controller()
+        ctl.resize_to_container()  # must not raise
+        self.assertEqual(embedder.calls, [])
+
+    def test_resize_to_container_tracks_two_separate_resizes_exactly(self):
+        ctl, _calls, embedder, container = self._controller(width=640, height=480)
+        ctl.attach("a")
+        self.assertEqual(embedder.calls[-1], (555, 640, 480))  # initial fill, from attach()
+
+        container.resize(900, 500)
+        ctl.resize_to_container()
+        self.assertEqual(embedder.calls[-1], (555, 900, 500))  # resize #1: exact new size
+
+        container.resize(1024, 768)
+        ctl.resize_to_container()
+        self.assertEqual(embedder.calls[-1], (555, 1024, 768))  # resize #2: exact new size
+
+        container.resize(700, 768)  # simulates a splitter drag: width-only change
+        ctl.resize_to_container()
+        self.assertEqual(embedder.calls[-1], (555, 700, 768))  # splitter move: exact new size
+        self.assertEqual(len(embedder.calls), 4)  # one child, resized exactly each time
+
+    def test_resize_to_container_is_a_no_op_after_the_child_exits(self):
+        ctl, _calls, embedder, container = self._controller()
+        ctl.attach("a")
+        embedder.calls.clear()
+        ctl.process._alive = False
+        ctl.poll_alive()  # clears process/current_name, matching production's liveness check
+        container.resize(1200, 900)
+        ctl.resize_to_container()
+        self.assertEqual(embedder.calls, [])
+
+    def test_begin_attach_never_reads_stdout_itself(self):
+        """task-2142 row453 REWORK -- orchestrator audit, 2026-08-30: begin_attach must launch
+        and return WITHOUT touching stdout at all; only the caller-driven finish_attach (fed by a
+        real QSocketNotifier in production) reads the XID line, so the GUI thread is never
+        blocked waiting on it."""
+        def poisoned_read_xid_line(proc, timeout):
+            raise AssertionError("begin_attach must never read stdout itself")
+
+        container = _FakeWinIdContainer(999)
+        calls = []
+
+        def fake_popen(argv, **kwargs):
+            calls.append(argv)
+            return _FakeEmbedProcess(argv)
+
+        ctl = session_hub.EmbeddedTerminalController(
+            container, popen=fake_popen, which=lambda name: f"/usr/bin/{name}",
+            platform_name=lambda: "xcb", embedder=_FakeEmbedder(),
+            read_xid_line=poisoned_read_xid_line, helper_ready=lambda: True,
+            profile_uuid=lambda: None,
+        )
+        ok, detail = ctl.begin_attach("a")
+        self.assertTrue(ok)
+        self.assertEqual(detail, "launching")
+        self.assertEqual(len(calls), 1)
+
+    def test_begin_attach_then_finish_attach_completes_exactly_like_attach(self):
+        ctl, _calls, embedder, container = self._controller(width=800, height=600)
+        ok, detail = ctl.begin_attach("a")
+        self.assertTrue(ok)
+        self.assertEqual(detail, "launching")
+        self.assertIsNone(ctl.current_name)  # not attached yet -- awaiting the XID line
+        ok2, detail2 = ctl.finish_attach("XID=555\n")
+        self.assertTrue(ok2)
+        self.assertEqual(detail2, "attached")
+        self.assertEqual(ctl.current_name, "a")
+        self.assertEqual(embedder.calls, [(555, 800, 600)])
+
+    def test_finish_attach_timeout_line_none_fails_closed(self):
+        ctl, _calls, embedder, _container = self._controller()
+        ctl.begin_attach("a")
+        ok, detail = ctl.finish_attach(None)  # the bounded singleShot timeout case
+        self.assertFalse(ok)
+        self.assertIn("window id", detail)
+        self.assertIsNone(ctl.current_name)
+        self.assertEqual(embedder.calls, [])
 
 
 class MetadataShrinkGuardTests(unittest.TestCase):
@@ -8549,9 +8824,12 @@ class MetadataShrinkGuardTests(unittest.TestCase):
 
 
 class RunningTabEmbeddedTerminalTests(unittest.TestCase):
-    """task-2142 row453: widget-level proof that single click, Enter and double-click all converge
-    on the same exact embedded switch, and that a systemic embedding failure shows in-panel and
-    falls back to external attachment without silently doing nothing."""
+    """task-2142 row453 REWORK: widget-level proof that single click, Enter and double-click all
+    converge on the same exact embedded switch; that a systemic embedding failure OR an unexpected
+    helper exit both show in-panel and fall back to external attachment; that the panel is resized
+    to the exact container size on every container resize and splitter drag (never just at attach
+    time); and that the fix for the reviewer's REWORK finding -- no dedicated poll timer beyond
+    the existing 2s status tick -- actually holds."""
 
     @classmethod
     def setUpClass(cls):
@@ -8585,21 +8863,37 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
             self.addCleanup(c.stop)
         return window
 
+    def _wire_fake_embedding(self, window, embedder=None, xid_line="XID=555\n"):
+        # The controller instance already exists (built in SessionHub.__init__ with the real
+        # subprocess.Popen/shutil.which/etc bound as early-evaluated default arguments), so
+        # patching the subprocess/gsettings/Xlib MODULES here would never reach it -- substitute
+        # its own injected seams directly instead, exactly what production code would pass at
+        # construction time.
+        embedder = embedder if embedder is not None else _FakeEmbedder()
+        calls = []
+
+        def fake_popen(argv, **kwargs):
+            calls.append(argv)
+            return _FakeEmbedProcess(argv, stdout_lines=(xid_line,) if xid_line else ())
+
+        window._embedded_terminal._popen = fake_popen
+        window._embedded_terminal._which = lambda name: f"/usr/bin/{name}"
+        window._embedded_terminal._embedder = embedder
+        window._embedded_terminal._read_xid_line = lambda proc, timeout: proc.stdout.readline() or None
+        window._embedded_terminal._helper_ready = lambda: True
+        window._embedded_terminal._profile_uuid = lambda: None
+        # _await_embed_xid normally waits on a QSocketNotifier over the helper's REAL stdout fd,
+        # which a fake process has none of -- complete it synchronously instead, exercising the
+        # exact same _finish_embed_attach the real notifier callback calls.
+        window._await_embed_xid = lambda cwd, name, session_id: window._finish_embed_attach(
+            cwd, name, session_id, xid_line
+        )
+        return calls, embedder
+
     def test_click_enter_and_double_click_all_embed_the_exact_same_target(self):
         window = self._window_with_one_running_session()
         item = window.running_table.item(0, 0)
-        calls = []
-
-        def fake_popen(argv):
-            calls.append(argv)
-            return _FakeXtermProcess(argv)
-
-        # The controller instance already exists (built in SessionHub.__init__ with the real
-        # subprocess.Popen/shutil.which bound as early-evaluated default arguments), so patching
-        # the subprocess/shutil MODULES here would never reach it -- substitute its own injected
-        # seams directly instead, exactly what production code would pass at construction time.
-        window._embedded_terminal._popen = fake_popen
-        window._embedded_terminal._which = lambda name: "/usr/bin/xterm"
+        calls, _embedder = self._wire_fake_embedding(window)
         with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
             # single click (itemClicked)
             window._activate_running_row(item)
@@ -8626,9 +8920,95 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
         self.assertIn("X11", window.running_terminal_failure.text())
         focus_mock.assert_called_once_with("/tmp/vampembed", "vamp-embed", "id-embed1")
 
+    def test_unexpected_helper_exit_shows_in_panel_and_falls_back_externally(self):
+        """VAMP-reviewer REWORK finding (task2142-row453): child-exit detection showed the
+        failure label but never called the external fallback the way a failed attach does."""
+        window = self._window_with_one_running_session()
+        item = window.running_table.item(0, 0)
+        self._wire_fake_embedding(window)
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window._activate_running_row(item)
+        window._embedded_terminal.process._alive = False  # helper exited on its own
+        with patch.object(window, "_focus_or_resume_session") as focus_mock:
+            window._check_embedded_terminal_liveness()
+        self.assertEqual(
+            window._running_terminal_stack.currentWidget(), window.running_terminal_failure
+        )
+        self.assertIn("exited", window.running_terminal_failure.text())
+        focus_mock.assert_called_once_with("/tmp/vampembed", "vamp-embed", "id-embed1")
+
+    def test_no_dedicated_poll_timer_liveness_rides_the_existing_2s_status_tick(self):
+        """VAMP-reviewer REWORK finding: a prior version added its own 1s QTimer despite the
+        brief's explicit no-new-periodic-poll rule. Budget control: exactly the pre-existing
+        `_status_timer` (2000ms) exists; no second timer was reintroduced."""
+        window = self._window_with_one_running_session()
+        self.assertFalse(hasattr(window, "_embedded_terminal_poll"))
+        self.assertEqual(window._status_timer.interval(), 2000)
+
+    def test_switching_terminal_never_blocks_on_a_synchronous_stdout_read(self):
+        """task-2142 row453 REWORK -- orchestrator audit, 2026-08-30: the real widget path
+        (begin_attach + QSocketNotifier + finish_attach) must never call the blocking
+        `_read_xid_line` seam -- that one is only for the synchronous `attach()` test/non-GUI
+        convenience wrapper. Poison it and drive `_switch_embedded_terminal` for real (not via
+        the `_await_embed_xid` test override) to prove the production call graph never reaches
+        it."""
+        window = self._window_with_one_running_session()
+        item = window.running_table.item(0, 0)
+        calls, _embedder = self._wire_fake_embedding(window)
+
+        def poisoned(proc, timeout):
+            raise AssertionError("the widget path must never block reading stdout itself")
+        window._embedded_terminal._read_xid_line = poisoned
+        # Undo the test-only synchronous _await_embed_xid override from _wire_fake_embedding --
+        # this test wants the REAL begin_attach/_await_embed_xid split, driven by directly calling
+        # _finish_embed_attach the way the real QSocketNotifier callback would (never by touching
+        # the poisoned _read_xid_line).
+        del window._await_embed_xid
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window._activate_running_row(item)  # begin_attach only -- must not raise/block
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(window._embedded_terminal.current_name)  # not finished yet
+        window._finish_embed_attach("/tmp/vampembed", "vamp-embed", "id-embed1", "XID=555\n")
+        self.assertEqual(window._embedded_terminal.current_name, "vamp-embed")
+
+    def test_initial_attach_two_resizes_and_a_splitter_move_each_fill_the_container_exactly(self):
+        """Xvfb/widget geometry control (orchestrator ROW453 addenda): initial size, two resizes
+        and a splitter move each resize the ONE embedded child to the container's exact pixel
+        size -- never left at a stale/cropped size from a previous fill.
+
+        Drives the container's REAL `resizeEvent` override via `QApplication.sendEvent` (the
+        same delivery mechanism Qt itself uses, just invoked directly) rather than `window.show()`
+        -- a real `show()` under `QT_QPA_PLATFORM=offscreen` segfaults this process at interpreter
+        teardown for this splitter/stack widget tree (unrelated to correctness: the same exact-
+        geometry/one-child contract is also proven end-to-end against REAL X11/Gtk.Plug in
+        EmbeddedTerminalXvfbSmokeTest below, with no Qt widget tree involved at all)."""
+        window = self._window_with_one_running_session()
+        item = window.running_table.item(0, 0)
+        _calls, embedder = self._wire_fake_embedding(window)
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window._activate_running_row(item)
+        self.assertEqual(len(embedder.calls), 1)  # initial fill, one child
+        child_winid = embedder.calls[0][0]
+
+        container = window.running_terminal_container
+        for width, height in [(801, 601), (1024, 700)]:  # resize #1, resize #2
+            old_size = container.size()
+            container.resize(width, height)
+            QApplication.sendEvent(container, QResizeEvent(container.size(), old_size))
+            self.assertEqual(embedder.calls[-1], (child_winid, width, height))
+
+        # A splitter drag resizes the container the same way -- `_on_terminal_container_resize` is
+        # exactly what `running_splitter.splitterMoved` is wired to (see build_ui).
+        old_size = container.size()
+        container.resize(700, 768)
+        window._on_terminal_container_resize()
+        self.assertEqual(embedder.calls[-1], (child_winid, 700, 768))
+        self.assertEqual(len(embedder.calls), 4)  # one child, resized exactly each time
+        self.assertNotEqual(old_size, container.size())
+
     def test_close_ends_only_the_embedded_client_never_tmux(self):
         window = self._window_with_one_running_session()
-        fake = _FakeXtermProcess(["xterm"])
+        fake = _FakeEmbedProcess(["python3"])
         window._embedded_terminal.process = fake
         window._embedded_terminal.current_name = "vamp-embed"
         with patch.object(session_hub, "QApplication") as qapp_cls:
@@ -8636,6 +9016,96 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
             window.close()
         self.assertTrue(fake.terminated)
         self.assertFalse(fake.killed)
+
+
+@unittest.skipUnless(shutil.which("Xvfb"), "Xvfb not installed")
+@unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
+class EmbeddedTerminalXvfbSmokeTest(unittest.TestCase):
+    """task-2142 row453 REWORK live smoke: a REAL vte_embed_helper.py subprocess, a REAL
+    Gtk.Plug embed, and REAL X11 resize calls, all confined to a private throw-away Xvfb display
+    -- never the user's live X session. Proves the actual integration point (not just the fakes
+    above): the helper's window really does end up as the socket's one child, and really does end
+    up at the exact requested pixel size after a fresh embed and two follow-up resizes."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import gi
+            gi.require_version("Gtk", "3.0")
+            gi.require_version("Vte", "2.91")
+            from gi.repository import Gtk, Vte  # noqa: F401
+            from Xlib import display as _xlib_display  # noqa: F401
+        except (ImportError, ValueError) as e:
+            raise unittest.SkipTest(f"embed helper dependencies unavailable: {e}")
+
+        cls.display_num = 97  # arbitrary, unlikely-to-collide private display
+        cls.xvfb = subprocess.Popen(
+            ["Xvfb", f":{cls.display_num}", "-screen", "0", "800x600x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        cls.env = dict(os.environ, DISPLAY=f":{cls.display_num}")
+        from Xlib import display as xlib_display
+
+        deadline = time.monotonic() + 5.0
+        cls.disp = None
+        while time.monotonic() < deadline:
+            try:
+                cls.disp = xlib_display.Display(f":{cls.display_num}")
+                break
+            except Exception:
+                time.sleep(0.1)
+        if cls.disp is None:
+            cls.xvfb.terminate()
+            raise unittest.SkipTest("Xvfb did not become ready in time")
+
+        cls.tmux_session = "row453-xvfb-smoke"
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", cls.tmux_session, "sleep 60"],
+            check=True, env=cls.env,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        subprocess.run(["tmux", "kill-session", "-t", cls.tmux_session],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if getattr(cls, "disp", None) is not None:
+            cls.disp.close()
+        cls.xvfb.terminate()
+        cls.xvfb.wait(timeout=5)
+
+    def test_real_embed_is_one_child_at_exact_geometry_across_two_resizes(self):
+        root = self.disp.screen().root
+        socket_win = root.create_window(
+            0, 0, 640, 480, 0, self.disp.screen().root_depth,
+        )
+        socket_win.map()
+        self.disp.sync()
+
+        helper = str(Path(__file__).resolve().parent / "vte_embed_helper.py")
+        proc = subprocess.Popen(
+            [sys.executable, helper, "--socket-id", str(socket_win.id),
+             "--tmux-session", self.tmux_session],
+            stdout=subprocess.PIPE, text=True, bufsize=1, env=self.env,
+        )
+        self.addCleanup(lambda: (proc.terminate(), proc.wait(timeout=5)))
+
+        ready, _, _ = select.select([proc.stdout], [], [], 10.0)
+        self.assertTrue(ready, "helper never reported an XID within 10s")
+        line = proc.stdout.readline().strip()
+        self.assertTrue(line.startswith("XID="), line)
+        child_id = int(line.split("=", 1)[1])
+
+        children = socket_win.query_tree().children
+        self.assertEqual(len(children), 1)  # exactly one embedded child
+        self.assertEqual(children[0].id, child_id)
+
+        embedder = session_hub._EmbedWindowResizer(display_factory=lambda: self.disp)
+        for width, height in [(640, 480), (900, 500), (1024, 768)]:
+            self.assertTrue(embedder.resize(child_id, width, height))
+            self.disp.sync()
+            geom = self.disp.create_resource_object("window", child_id).get_geometry()
+            self.assertEqual((geom.width, geom.height), (width, height))
+        self.assertEqual(len(socket_win.query_tree().children), 1)  # still exactly one child
 
 
 if __name__ == "__main__":
