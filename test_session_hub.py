@@ -47,6 +47,50 @@ class SessionHubTests(unittest.TestCase):
         self.addCleanup(metadata_patcher.stop)
         self.addCleanup(pid_dir_patcher.stop)
 
+        # Same safety-net principle as above, for two more real-I/O seams a bare
+        # SessionHub()/refresh() can hit without any test-specific patch:
+        #
+        # 1. tmux_live_session_names() spawns a REAL `tmux list-sessions` subprocess
+        #    whenever populate_session_table() decides a refresh needs activity data,
+        #    which any SessionHub() construction can trigger. That is real, slow,
+        #    non-hermetic I/O, and on this environment it crashed outright
+        #    (subprocess.run -> ValueError: not enough values to unpack) in tests that
+        #    never intended to exercise tmux at all (row432 audit). Default `which`
+        #    to report "tmux" as absent (tmux_live_session_names() then short-circuits
+        #    to frozenset() with no subprocess spawn); every other binary name still
+        #    resolves through the REAL shutil.which, unchanged, and any test that
+        #    patches session_hub.shutil.which itself (most of the tmux/launch tests
+        #    do, with their own dict/side_effect) shadows this net for its own scope
+        #    exactly as it did before this net existed.
+        # 2. refresh_usage() queues its three UsageWorker QRunnables via
+        #    QTimer.singleShot(0, ...), which only fires if something pumps the Qt
+        #    event loop (a modal .exec(), QApplication.processEvents()). No test here
+        #    exercises real refresh_usage()/UsageWorker dispatch - they all inject
+        #    fixture data through usage_loaded() directly - so if a nested event loop
+        #    tick ever DOES fire that singleShot, the real readers each carry up to a
+        #    12-15s timeout and can call out over the network. Stub refresh_usage()
+        #    itself to a no-op (NOT the three read_*_usage functions - those are
+        #    directly under test elsewhere, e.g.
+        #    test_read_claude_usage_falls_back_to_activity_when_bars_missing calls
+        #    session_hub.read_claude_usage() for real with its own subprocess.run
+        #    fixture, and a blanket stub of the reader silently broke that test
+        #    during this same audit) so an accidental fire costs nothing instead of
+        #    up to ~45s, without touching the readers' own direct tests.
+        real_which = shutil.which
+
+        def _which_no_tmux(name, *args, **kwargs):
+            if name == "tmux":
+                return None
+            return real_which(name, *args, **kwargs)
+
+        which_patcher = patch.object(session_hub.shutil, "which", side_effect=_which_no_tmux)
+        which_patcher.start()
+        self.addCleanup(which_patcher.stop)
+
+        refresh_usage_patcher = patch.object(session_hub.SessionHub, "refresh_usage")
+        refresh_usage_patcher.start()
+        self.addCleanup(refresh_usage_patcher.stop)
+
     def test_discovers_both_agents(self):
         sessions = session_hub.discover_sessions({"sessions": {}})
         providers = {item.provider for item in sessions}
@@ -1458,7 +1502,16 @@ class SessionHubTests(unittest.TestCase):
         with patch("session_hub.read_metadata", return_value=metadata):
             window = session_hub.SessionHub()
         try:
-            with patch.object(session_hub.SessionHub, "spawn") as spawn:
+            # "/tmp/vamp" is a fixture-only path, not a real directory in this
+            # environment - launch()'s Path(cwd).is_dir() guard would otherwise fail
+            # and pop a REAL modal QMessageBox.warning(), which blocks forever with no
+            # user present to click it (row432 audit: this was the suite's actual
+            # hang, not tmux/usage I/O). Same precedent as the two other tests here
+            # that patch session_hub.Path.is_dir directly.
+            with (
+                patch.object(session_hub.SessionHub, "spawn") as spawn,
+                patch("session_hub.Path.is_dir", return_value=True),
+            ):
                 window.launch(
                     "Claude",
                     None,
@@ -1478,6 +1531,73 @@ class SessionHubTests(unittest.TestCase):
             self.assertNotIn("pidfile", spawn.call_args.kwargs)
         finally:
             window.close()
+
+    # --- row432 audit: negative controls for the suite-speed/hermeticity fixes ---
+
+    def test_launch_missing_cwd_shows_warning_dialog_not_a_hang(self):
+        """The Path(cwd).is_dir() guard in launch() pops a REAL QMessageBox.warning()
+        when the directory doesn't exist - unmocked, that blocks the whole suite
+        forever with no user to click it. This was the suite's actual hang (found via
+        faulthandler.dump_traceback_later stuck at session_hub.py:6652, not tmux/usage
+        I/O as first suspected) - the fixed test above patches
+        session_hub.Path.is_dir so its "/tmp/vamp" cwd is treated as real. This test
+        exercises the guard itself with QMessageBox mocked, proving it still fires
+        (spawn never called) and that mocking it is what keeps this fast rather than
+        the guard having been silently removed."""
+        metadata = {"sessions": {}, "settings": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            missing = "/tmp/session-hub-row432-does-not-exist"
+            self.assertFalse(Path(missing).is_dir())
+            with (
+                patch.object(session_hub.SessionHub, "spawn") as spawn,
+                patch("session_hub.QMessageBox.warning") as warning,
+            ):
+                window.launch("Claude", None, missing)
+            warning.assert_called_once()
+            spawn.assert_not_called()
+        finally:
+            window.close()
+
+    def test_setup_which_net_blocks_real_tmux_lookup_but_passes_through_other_names(self):
+        """Regression trap for the shutil.which safety net added in setUp (row432): if
+        it were removed or narrowed, a bare SessionHub() would resolve real tmux via
+        shutil.which and could hit the real environment's tmux binary/subprocess again
+        - the exact seam that crashed two other tests with the sandbox's own
+        subprocess.run unpack failure (ValueError: not enough values to unpack).
+        Proves the net is active AND that it still passes through a non-tmux binary
+        lookup unchanged, so it isn't blanket-stubbing every name."""
+        self.assertIsNone(session_hub.shutil.which("tmux"))
+        self.assertIsNotNone(session_hub.shutil.which("python3"))
+
+    def test_setup_refresh_usage_net_is_a_stub_but_leaves_the_readers_real(self):
+        """Regression trap for the refresh_usage() safety net added in setUp
+        (row432): if it were removed, an accidental Qt event-loop tick firing the
+        queued refresh_usage() QTimer.singleShot could spawn real UsageWorker
+        QRunnables, each with up to a 15s timeout and network access. Proves
+        refresh_usage() is stubbed (calling it does not raise or populate
+        usage_workers) while the three read_*_usage functions it would have
+        dispatched to are left genuinely real - a blanket stub of the readers
+        themselves broke test_read_claude_usage_falls_back_to_activity_when_bars_missing
+        earlier in this same audit, which is why the net sits on refresh_usage()
+        and not on the readers."""
+        metadata = {"sessions": {}, "settings": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            window.refresh_usage()
+            self.assertEqual(window.usage_workers, {})
+            self.assertIsInstance(session_hub.SessionHub.refresh_usage, MagicMock)
+        finally:
+            window.close()
+        payload = {"result": "Last 24h · 1 requests · 1 sessions"}
+        completed = session_hub.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+        with patch("session_hub.subprocess.run", return_value=completed):
+            result = session_hub.read_claude_usage()
+        self.assertEqual([(a.label, a.requests, a.sessions) for a in result], [("Last 24h", 1, 1)])
 
     def test_launch_with_tmux_requires_a_name(self):
         window = session_hub.SessionHub()
@@ -4794,6 +4914,26 @@ class SessionActivityTests(unittest.TestCase):
             patcher = patch.object(session_hub, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+
+        # Same real-I/O safety net as SessionHubTests.setUp (row432 audit) - this
+        # class also constructs a bare SessionHub() at least once.
+        real_which = shutil.which
+
+        def _which_no_tmux(name, *args, **kwargs):
+            if name == "tmux":
+                return None
+            return real_which(name, *args, **kwargs)
+
+        which_patcher = patch.object(session_hub.shutil, "which", side_effect=_which_no_tmux)
+        which_patcher.start()
+        self.addCleanup(which_patcher.stop)
+
+        # Stub refresh_usage() itself, not the three read_*_usage functions - see
+        # SessionHubTests.setUp's comment for why (a blanket reader stub broke a test
+        # that exercises read_claude_usage() directly).
+        refresh_usage_patcher = patch.object(session_hub.SessionHub, "refresh_usage")
+        refresh_usage_patcher.start()
+        self.addCleanup(refresh_usage_patcher.stop)
 
     def _rollout(self, records: list[dict]) -> Path:
         path = self.temp / f"rollout_{len(list(self.temp.glob('rollout_*.jsonl')))}.jsonl"
