@@ -5896,6 +5896,83 @@ class SessionActivityTests(unittest.TestCase):
         self.assertEqual(json_label, "Needs input")
         self.assertEqual(gui_label, "Needs input")
 
+    def test_activity_item_activation_focuses_the_exact_live_session(self):
+        # task-2135: mounts the REAL Recent-activity widget through the real
+        # refresh_running_tab()/_refresh_activity_list() pipeline (not a
+        # hand-built dict), then activates each item and asserts the exact
+        # (cwd, name, session_id) passed to the shared Running focus
+        # authority. Covers: a live exact-identity Claude event, a second
+        # Claude row sharing the SAME row name in a different cwd (duplicate
+        # names must never conflate), a repaired Codex link row (its
+        # session_key already points at the current active member, as
+        # row433's persistence guarantees), and a stale/historical entry
+        # whose session_id belongs to no currently-running row.
+        claude_a = session_hub.Session(
+            "Claude", "id-a", "t", "/tmp/vamp2135a", "/tmp/vamp2135a", 100,
+            Path("/tmp/a.jsonl"), agent_name="vamp-shared",
+        )
+        claude_b = session_hub.Session(
+            "Claude", "id-b", "t", "/tmp/vamp2135b", "/tmp/vamp2135b", 100,
+            Path("/tmp/b.jsonl"), agent_name="vamp-shared",
+        )
+        codex_new = session_hub.Session(
+            "Codex", "new-id", "t", "/tmp/vamp2135c", "/tmp/vamp2135c", 100,
+            Path("/tmp/c.jsonl"),
+        )
+        metadata = {
+            "settings": {},
+            "sessions": {},
+            "groups": {
+                "/tmp/vamp2135a": {"tmux": True, "rows": [{"name": "vamp-shared"}]},
+                "/tmp/vamp2135b": {"tmux": True, "rows": [{"name": "vamp-shared"}]},
+                "/tmp/vamp2135c": {
+                    "tmux": True,
+                    "rows": [{
+                        "name": "vamp-codex", "provider": "Codex",
+                        "session_key": "Codex:new-id",
+                    }],
+                },
+            },
+        }
+        statuses = [
+            ("id-a", {"state": "working", "ts": 1000, "detail": "a"}),
+            ("id-b", {"state": "working", "ts": 1000, "detail": "b"}),
+            ("new-id", {"state": "idle", "ts": 1000, "detail": ""}),
+            ("stale-ghost", {"state": "done", "ts": 1000, "detail": "long finished"}),
+        ]
+        with (
+            patch.object(session_hub, "read_metadata", return_value=metadata),
+            patch.object(session_hub, "claude_sessions", return_value=[claude_a, claude_b]),
+            patch.object(session_hub, "codex_sessions", return_value=[codex_new]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub, "tmux_session_alive", return_value=True),
+            patch.object(session_hub, "all_session_statuses", return_value=statuses),
+        ):
+            window = session_hub.SessionHub()
+            try:
+                window.refresh_running_tab()
+                self.assertEqual(window.activity_list.count(), 4)
+                with patch.object(window, "_focus_or_resume_session") as focus_mock:
+                    window.activate_activity_item(window.activity_list.item(0))
+                    focus_mock.assert_called_once_with(
+                        "/tmp/vamp2135a", "vamp-shared", "id-a")
+
+                    focus_mock.reset_mock()
+                    window.activate_activity_item(window.activity_list.item(1))
+                    focus_mock.assert_called_once_with(
+                        "/tmp/vamp2135b", "vamp-shared", "id-b")
+
+                    focus_mock.reset_mock()
+                    window.activate_activity_item(window.activity_list.item(2))
+                    focus_mock.assert_called_once_with(
+                        "/tmp/vamp2135c", "vamp-codex", "new-id")
+
+                    focus_mock.reset_mock()
+                    window.activate_activity_item(window.activity_list.item(3))
+                    focus_mock.assert_not_called()
+            finally:
+                window.close()
+
     def test_tmux_live_session_names_survives_oserror_and_timeout(self):
         """The subprocess spawn itself can fail at the OS level (tmux binary
         removed/unexecutable between shutil.which() and the spawn, permission,

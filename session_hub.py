@@ -5625,6 +5625,10 @@ class SessionHub(QMainWindow):
         self.activity_list = QListWidget()
         self.activity_list.setMaximumHeight(160)
         self.activity_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        # itemActivated covers both double-click (the same activation gesture Running's
+        # cellDoubleClicked uses) and Enter/Return on the current item - one signal, one
+        # handler, for both the mouse and keyboard paths (task-2135).
+        self.activity_list.itemActivated.connect(self.activate_activity_item)
         running_layout.addWidget(self.activity_list)
 
         tabs = QTabWidget()
@@ -6270,10 +6274,10 @@ class SessionHub(QMainWindow):
             )
             self.running_table.setItem(index, 3, self._status_column_item(state))
             self.running_table.setItem(index, 4, self._detail_column_item(detail))
-        names_by_id = {
-            match.session_id: row["name"] for _dn, _cwd, row, match in running if match
+        live_by_id = {
+            match.session_id: (cwd, row["name"]) for _dn, cwd, row, match in running if match
         }
-        self._refresh_activity_list(names_by_id)
+        self._refresh_activity_list(live_by_id)
 
     def _status_column_item(self, state: str) -> QTableWidgetItem:
         label, color = activity_label(state)
@@ -6290,13 +6294,21 @@ class SessionHub(QMainWindow):
             item.setToolTip(detail)
         return item
 
-    def _refresh_activity_list(self, names_by_id: dict[str, str]) -> None:
+    def _refresh_activity_list(self, live_by_id: dict[str, tuple[str, str]]) -> None:
         """Recent-activity strip: a history log of raw write_session_status
         events (each entry's own recorded state/detail/ts), deliberately NOT
         routed through session_activity's CURRENT-state verdict - see that
         function's docstring for why a log of past events must not be
         rewritten to today's live state. Shares only activity_label() so the
-        two surfaces render identically."""
+        two surfaces render identically.
+
+        `live_by_id` is exactly the (cwd, name) pair the current refresh's
+        running-row resolution assigned to a session_id (task-2135) - not a
+        display-name lookup. An entry whose session_id is not a key here is
+        stale/stopped/historical: it gets no identity data at all, so
+        activate_activity_item() below is inert for it by construction
+        rather than guessing a same-name row or a different linked member.
+        """
         self.activity_list.clear()
         for session_id, status in all_session_statuses()[:20]:
             label, color = activity_label(status.get("state"))
@@ -6304,11 +6316,29 @@ class SessionHub(QMainWindow):
                 continue
             when = datetime.fromtimestamp(status.get("ts", 0)).strftime("%H:%M:%S")
             detail = " ".join(status.get("detail", "").split())[:80]
-            name = names_by_id.get(session_id, session_id[:8])
+            live = live_by_id.get(session_id)
+            name = live[1] if live else session_id[:8]
             text = f"{when}  {name}  {label}" + (f" — {detail}" if detail else "")
             entry = QListWidgetItem(text)
             entry.setForeground(QColor(color))
+            entry.setData(
+                Qt.ItemDataRole.UserRole,
+                (live[0], live[1], session_id) if live else None,
+            )
             self.activity_list.addItem(entry)
+
+    def activate_activity_item(self, item: QListWidgetItem) -> None:
+        """Recent-activity double-click/Enter: focus the row's live session
+        through the exact same authority as Running (task-2135). A stale,
+        stopped or historical entry carries no identity data (see
+        _refresh_activity_list) and is inert here - it never starts a new
+        session, resumes a different linked member, or focuses an unrelated
+        same-name row."""
+        identity = item.data(Qt.ItemDataRole.UserRole)
+        if not identity:
+            return
+        cwd, name, session_id = identity
+        self._focus_or_resume_session(cwd, name, session_id)
 
     def stop_selected_running(self) -> None:
         row = self.running_table.currentRow()
@@ -6327,8 +6357,13 @@ class SessionHub(QMainWindow):
         stop_tmux_session(name)
         self.refresh_running_tab()
 
-    def reveal_running_row(self, row: int, _column: int = 0) -> None:
-        """Double-click a Running row: bring its terminal to the front.
+    def _focus_or_resume_session(self, cwd: str, name: str, session_id: str | None) -> None:
+        """Bring a running row's terminal to the front, or open/resume it if
+        no terminal window exists yet. The one focus authority behind both
+        the Running double-click and Recent-activity activation
+        (task-2135) - reusing it, rather than a second implementation, is
+        what keeps them from ever disagreeing about what a given identity
+        resolves to.
 
         wmctrl -a already unminimizes as well as raising, so a window that's
         merely minimized in the taskbar is covered for free. wmctrl can only
@@ -6340,10 +6375,6 @@ class SessionHub(QMainWindow):
         has-session gates their tmux attach, so this only ever opens a
         terminal onto the existing session, never a second copy of it.
         """
-        item = self.running_table.item(row, 0)
-        if not item:
-            return
-        cwd, name, session_id = item.data(Qt.ItemDataRole.UserRole)
         if session_id:
             status = read_session_status(session_id)
             if status and status.get("state") == "done":
@@ -6365,6 +6396,14 @@ class SessionHub(QMainWindow):
         # on with several other windows open. Same wmctrl activation used
         # above for an already-open window, just given time to appear first.
         threading.Thread(target=focus_window_by_title, args=(name,), daemon=True).start()
+
+    def reveal_running_row(self, row: int, _column: int = 0) -> None:
+        """Double-click a Running row: bring its terminal to the front."""
+        item = self.running_table.item(row, 0)
+        if not item:
+            return
+        cwd, name, session_id = item.data(Qt.ItemDataRole.UserRole)
+        self._focus_or_resume_session(cwd, name, session_id)
 
     def apply_filter(self) -> None:
         query = self.search.text().strip().lower()
