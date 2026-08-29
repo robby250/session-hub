@@ -7735,20 +7735,37 @@ _CLAUDE_PANE_FIXTURE = (
     "                                                                           /rc\n"
 )
 
-# Synthetic Codex-style pane -- Codex CLI was not live on this host, so this fixture
-# exercises the STRUCTURAL rules (border rule, bare prompt, "Ctrl+C" footer phrase,
-# blank chrome) rather than any Codex-specific literal beyond the documented CLI hint
-# text, matching the brief's "only known ... borders, footers and blank chrome" limit.
+# Real `tmux capture-pane -p -t %30` dump, 2026-08-29 -- a live Codex session
+# (VAMP-reviewer) mid-review, captured the same way as the Claude fixture above. Ground
+# truth for the border-rule-with-caption shape ("─ Worked for 2m 18s ─..."), the "›"
+# empty-prompt placeholder, and the "Context NN%…" footer -- none of which were
+# guessed.
 _CODEX_PANE_FIXTURE = (
-    "Applied patch to session_hub.py: added extract_last_meaningful_block.\n"
-    "\n"
-    "Running: python3 -m pytest test_session_hub.py -k pane_fixture\n"
-    "17 passed in 2.1s\n"
-    "\n"
-    "────────────────────────────────────────────────────────────────────────────────\n"
-    "> \n"
-    "────────────────────────────────────────────────────────────────────────────────\n"
-    "  Ctrl+C to interrupt · Ctrl+D to exit\n"
+    '    18 +- `.claude/hooks/selftest_hooks.py:327-336` adds the required same-entry\n'
+    '         extra-process negative\n'
+    '    19 +  control; appending a second executable command to the dispatcher strin\n'
+    '        g is rejected, closing the\n'
+    '    20 +  prior substring-containment acceptance seam.\n'
+    '\n'
+    '    31 +ACCEPT\n'
+    '\n'
+    '────────────────────────────────────────────────────────────────────────────────\n'
+    '\n'
+    '• I cannot mark row458 through the existing gate: review_ctl.py refuses because\n'
+    '  its candidate is already contained in current main (“no commits ahead of\n'
+    '  main”). Directly editing the review ref would violate my read-only reviewer\n'
+    '  role.\n'
+    '\n'
+    '  Current state remains null verdicts with\n'
+    '  invalidated_by=worker_identity_changed; the gate needs an explicit obsolete/\n'
+    '  invalid-author retirement path to suppress watchdog escalation.\n'
+    '\n'
+    '─ Worked for 2m 18s ─────────────────────────────────────────────────────────────────\n'
+    '\n'
+    '\n'
+    '› Ask Codex to do anything\n'
+    '\n'
+    '  gpt-5.6-luna high · ~/projects/vampulse/worktrees/vamp-reviewer · Context 65%…\n'
 )
 
 
@@ -7771,16 +7788,17 @@ class ExtractLastMeaningfulBlockTests(unittest.TestCase):
         self.assertNotIn("How is Claude doing", block)
         self.assertNotIn("1: Bad", block)
 
-    def test_codex_pane_returns_the_test_result_block_not_chrome(self):
+    def test_codex_pane_returns_the_last_message_block_not_chrome(self):
         block = session_hub.extract_last_meaningful_block(_CODEX_PANE_FIXTURE)
-        self.assertIn("17 passed", block)
-        self.assertIn("pytest test_session_hub.py", block)
+        self.assertIn("invalidated_by=worker_identity_changed", block)
+        self.assertIn("watchdog escalation", block)
 
     def test_codex_pane_excludes_footer_border_and_prompt(self):
         block = session_hub.extract_last_meaningful_block(_CODEX_PANE_FIXTURE)
-        self.assertNotIn("Ctrl+C", block)
+        self.assertNotIn("Ask Codex to do anything", block)
+        self.assertNotIn("Worked for 2m 18s", block)
+        self.assertNotIn("Context 65%", block)
         self.assertNotIn("─", block)
-        self.assertNotIn(">", block)
 
     def test_empty_pane_returns_empty_string(self):
         self.assertEqual(session_hub.extract_last_meaningful_block(""), "")

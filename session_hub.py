@@ -1173,26 +1173,41 @@ def strip_terminal_codes(text: str) -> str:
     return text.replace("\r", "\n")
 
 
-# task-2142: chrome patterns confirmed against a live `tmux capture-pane -p` dump of a
-# real running Claude Code session (VAMP-worker1, 2026-08-29) -- see the commit message
-# for the exact sample. Structural (border rules, blank lines, bare prompt carets,
-# spinner-status lines) rather than provider-specific text, so it also covers Codex's
-# equivalent box-drawn footer/border without needing a live Codex sample; the two
-# phrase lists below are the only provider-specific literals, both drawn from
-# documented CLI hint text, not guessed.
-_PANE_BORDER_RULE_RE = re.compile(r"^[─━═]{3,}(?:\s+\S.*)?[─━═]*$")
-_PANE_BARE_PROMPT_RE = re.compile(r"^[❯>▌]\s*$")
+# task-2142: chrome patterns confirmed against live `tmux capture-pane -p` dumps of a
+# real running Claude Code session (VAMP-worker1) AND a real running Codex session
+# (VAMP-reviewer), both 2026-08-29 -- see the commit message and the test fixtures for
+# the exact samples. Structural (rule-character-dominant lines, blank lines, bare
+# prompt carets, spinner/status-line shapes) rather than provider-specific text, so the
+# same rules cover both without needing per-provider special-casing; the phrase/
+# substring lists are the only provider-specific literals, all drawn from real captures.
+_PANE_RULE_CHARS = set("─━═╌╍╾╼┄┅┈┉")
+_PANE_BARE_PROMPT_RE = re.compile(r"^[❯>▌›]\s*$")
 # The spinner glyph cycles through several frames (✻, ∴, ✢, ✽, ·, braille dots, ...);
 # matching the shape -- a short leading glyph, a gerund ending in an ellipsis, then a
 # parenthesized "(Nm Ns · ... tokens)" stat block -- is more robust than an exhaustive
 # glyph whitelist, which a future spinner frame would silently fall through.
 _PANE_SPINNER_STATUS_RE = re.compile(r"^\S{1,2}\s+\S+…\s*\(.*\)$")
 _PANE_RATING_LINE_RE = re.compile(r"^(\d:\s+\S+\s*){2,}$")
+_PANE_CONTEXT_FOOTER_RE = re.compile(r"context\s+\d+%", re.IGNORECASE)
 _PANE_FOOTER_PHRASES = (
     "esc to interrupt", "shift+tab to cycle", "bypass permissions",
     "for shortcuts", "ctrl+c to interrupt", "ctrl+c to exit", "to interrupt",
 )
-_PANE_KNOWN_CHROME_SUBSTRINGS = ("how is claude doing this session?",)
+_PANE_KNOWN_CHROME_SUBSTRINGS = (
+    "how is claude doing this session?",
+    "ask codex to do anything",
+)
+
+
+def _is_pane_border_rule_line(stripped: str) -> bool:
+    """A rule/separator line: mostly box-drawing rule characters, with at most a
+    short embedded label (a session name, or Codex's "Worked for Ns" caption).
+    A real content line is never dominated by these characters."""
+    rule_count = sum(1 for c in stripped if c in _PANE_RULE_CHARS)
+    if rule_count < 3:
+        return False
+    label = "".join(c for c in stripped if c not in _PANE_RULE_CHARS).strip()
+    return len(label) <= 40 and rule_count >= len(stripped) * 0.5
 
 
 def _is_pane_chrome_line(line: str) -> bool:
@@ -1203,13 +1218,15 @@ def _is_pane_chrome_line(line: str) -> bool:
     # own line in a plain `-p` capture; real content is never this short on its own.
     if len(stripped) <= 3:
         return True
-    if _PANE_BORDER_RULE_RE.match(stripped):
+    if _is_pane_border_rule_line(stripped):
         return True
     if _PANE_BARE_PROMPT_RE.match(stripped):
         return True
     if _PANE_SPINNER_STATUS_RE.match(stripped):
         return True
     if _PANE_RATING_LINE_RE.match(stripped):
+        return True
+    if _PANE_CONTEXT_FOOTER_RE.search(stripped):
         return True
     lowered = stripped.lower()
     if any(p in lowered for p in _PANE_FOOTER_PHRASES):
