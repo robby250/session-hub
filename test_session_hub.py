@@ -1,9 +1,11 @@
+import atexit
 import contextlib
 import io
 import os
 import json
 import subprocess
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -14,9 +16,34 @@ from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# task-2134: a per-test METADATA_PATH/PID_DIR patch is not a sufficient
+# safety boundary - a scope escape, a direct test-method invocation that
+# skips setUp(), or a delayed Qt close firing after the patch context has
+# exited can still resolve session_hub's module-level path constants to the
+# real, unpatched value (this is exactly how the row434 test overwrote the
+# user's live metadata.json). Forcing XDG_DATA_HOME to a fresh,
+# process-owned directory before session_hub is ever imported makes every
+# path constant derived from DATA_DIR (METADATA_PATH, PID_DIR, STATUS_DIR,
+# METADATA_BACKUP_DIR, TRASH_DIR, ...) sandboxed for the lifetime of this
+# process, independent of any later patch scope. Only the directory created
+# here is ever removed - a caller-provided XDG_DATA_HOME, if any, is
+# overridden in-process but never touched on disk.
+_TEST_XDG_DATA_HOME = tempfile.mkdtemp(prefix="session-hub-test-xdg-")
+os.environ["XDG_DATA_HOME"] = _TEST_XDG_DATA_HOME
+atexit.register(shutil.rmtree, _TEST_XDG_DATA_HOME, ignore_errors=True)
+
+from PyQt6.QtCore import QPoint
 from PyQt6.QtWidgets import QApplication
 
 import session_hub
+
+# Captured before any per-test patch.start() can shadow them (setUp() below
+# patches session_hub.METADATA_PATH/PID_DIR for defense-in-depth on every
+# test), so the sandbox-membership check has the module's true unpatched
+# default to compare against rather than whichever test happens to be
+# running.
+_ORIGINAL_METADATA_PATH = session_hub.METADATA_PATH
+_ORIGINAL_PID_DIR = session_hub.PID_DIR
 
 
 class SessionHubTests(unittest.TestCase):
@@ -3113,6 +3140,38 @@ class SessionHubTests(unittest.TestCase):
             }
         )
 
+    def test_manage_group_dialog_launch_selected_rows_preserves_table_order(self):
+        # Ctrl/Shift-click selection order need not match visual table order
+        # (here: row 2 clicked first, then 0, then 1) - launches must still
+        # go out top-to-bottom, not in click order.
+        hub = MagicMock()
+        dialog = session_hub.ManageGroupDialog.__new__(session_hub.ManageGroupDialog)
+        dialog.hub = hub
+        dialog.cwd = "/tmp/vamp"
+        dialog.reload = MagicMock()
+        dialog.pair_at_table_row = MagicMock(
+            side_effect=lambda table_row: (
+                {
+                    "name": f"vamp-s{table_row}",
+                    "override_key": f"group:/tmp/vamp#vamp-s{table_row}",
+                },
+                None,
+            )
+        )
+        index2, index0, index1 = MagicMock(), MagicMock(), MagicMock()
+        index2.row.return_value = 2
+        index0.row.return_value = 0
+        index1.row.return_value = 1
+        selection_model = MagicMock()
+        selection_model.selectedRows.return_value = [index2, index0, index1]
+        dialog.table = MagicMock()
+        dialog.table.selectionModel.return_value = selection_model
+
+        dialog.launch_selected_rows()
+
+        called_rows = [call.args[0] for call in dialog.pair_at_table_row.call_args_list]
+        self.assertEqual(called_rows, [0, 1, 2])
+
     def test_manage_group_dialog_launch_selected_rows_does_nothing_when_empty(self):
         hub = MagicMock()
         dialog = session_hub.ManageGroupDialog.__new__(session_hub.ManageGroupDialog)
@@ -3129,6 +3188,39 @@ class SessionHubTests(unittest.TestCase):
         hub.resume_group_row.assert_not_called()
         hub.refresh.assert_not_called()
         dialog.reload.assert_not_called()
+
+    def test_manage_group_dialog_launch_selected_button_enabled_only_with_selection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "rows": [
+                            {"name": "vamp-s1", "override_key": "group:/tmp/vamp#vamp-s1"}
+                        ],
+                    }
+                },
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    dialog = session_hub.ManageGroupDialog(window, "/tmp/vamp")
+                try:
+                    self.assertFalse(dialog.launch_selected_button.isEnabled())
+                    dialog.table.selectRow(0)
+                    self.assertTrue(dialog.launch_selected_button.isEnabled())
+                    dialog.table.clearSelection()
+                    self.assertFalse(dialog.launch_selected_button.isEnabled())
+                finally:
+                    dialog.close()
+            finally:
+                window.close()
 
     def test_manage_group_dialog_launch_row_delegates_to_hub(self):
         hub = MagicMock()
@@ -3394,6 +3486,83 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_module_data_paths_all_share_the_forced_test_sandbox_root(self):
+        # task-2134: every module-level mutable data path must be born inside
+        # the process-wide XDG_DATA_HOME sandbox forced at import time (top of
+        # this file) - protecting METADATA_PATH alone while a sibling live
+        # path (e.g. the backup dir) stays exposed is the same class of bug.
+        sandbox = Path(_TEST_XDG_DATA_HOME)
+        for path in (
+            session_hub.DATA_DIR,
+            _ORIGINAL_METADATA_PATH,
+            _ORIGINAL_PID_DIR,
+            session_hub.STATUS_DIR,
+            session_hub.METADATA_BACKUP_DIR,
+            session_hub.TRASH_DIR,
+        ):
+            self.assertTrue(
+                path.is_relative_to(sandbox),
+                f"{path} escapes the forced test sandbox {sandbox}",
+            )
+
+    def test_metadata_writes_never_escape_the_test_process_sandbox(self):
+        # task-2134: replays the exact incident. The row434 leak was NOT a
+        # normal unittest run - setUp()'s METADATA_PATH patch was always the
+        # outer scope in that path and would have caught the write anyway.
+        # The brief names the real trigger: "a scope escape, direct
+        # test-method invocation ... can run after that mock ends" - i.e.
+        # the test method executed WITHOUT going through TestCase.run(), so
+        # setUp() (and its METADATA_PATH/PID_DIR patch) never fires and the
+        # dialog.close() write hits whatever session_hub.METADATA_PATH
+        # resolves to at import time. A caller/production XDG root ("live"
+        # data, sentinel below) is present in the child's environment; the
+        # harness script below instantiates the previously-leaking test
+        # and calls it directly, exactly reproducing that bypass. The
+        # top-of-file XDG_DATA_HOME override must force session_hub onto its
+        # own private sandbox at import time - before setUp ever would have
+        # run - so the sentinel stays byte-identical regardless.
+        sentinel_root = tempfile.mkdtemp(prefix="session-hub-test-sentinel-")
+        self.addCleanup(shutil.rmtree, sentinel_root, ignore_errors=True)
+        sentinel_metadata_dir = Path(sentinel_root) / "session-hub"
+        sentinel_metadata_dir.mkdir()
+        sentinel_metadata = sentinel_metadata_dir / "metadata.json"
+        sentinel_bytes = (
+            b'{"sessions": {"Claude:live-real": {"name": "the users real session"}}, '
+            b'"settings": {}, "sentinel": "must-stay-byte-identical"}'
+        )
+        sentinel_metadata.write_bytes(sentinel_bytes)
+
+        harness = (
+            "import os\n"
+            "os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')\n"
+            "import test_session_hub as m\n"
+            "from PyQt6.QtWidgets import QApplication\n"
+            "_app = QApplication.instance() or QApplication([])\n"
+            "tc = m.SessionHubTests(\n"
+            "    'test_matched_sessions_prefers_row_identity_over_stale_native_key_override'\n"
+            ")\n"
+            # Deliberately skip tc.setUp() - this is the direct
+            # test-method invocation the brief names as the real leak path.
+            "tc.test_matched_sessions_prefers_row_identity_over_stale_native_key_override()\n"
+        )
+
+        env = dict(os.environ)
+        env["XDG_DATA_HOME"] = sentinel_root
+        result = subprocess.run(
+            [sys.executable, "-c", harness],
+            cwd=str(Path(__file__).resolve().parent),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            sentinel_metadata.read_bytes(),
+            sentinel_bytes,
+            "the sentinel 'live' metadata.json was modified by the test subprocess",
+        )
+
     def test_matched_sessions_populates_linked_keys_from_metadata_links(self):
         # claude_sessions() is raw and never applies metadata["links"], so
         # without this, session.linked_keys is always empty for a group row
@@ -3498,6 +3667,77 @@ class SessionHubTests(unittest.TestCase):
                     dialog.close()
             finally:
                 window.close()
+
+    def test_all_sessions_table_restored_to_six_original_columns_running_unchanged(self):
+        # task-2136: task-2114 added Status/Last message to All Sessions
+        # without being asked, corrupting the saved widths/order of its
+        # original six columns. Running is a different table/widget
+        # entirely and keeps its own Status/Last message unchanged.
+        metadata = {"sessions": {}, "settings": {}, "groups": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            headers = [
+                window.table.horizontalHeaderItem(i).text()
+                for i in range(window.table.columnCount())
+            ]
+            self.assertEqual(
+                headers,
+                ["Agent", "Model", "Name", "Working directory", "Last updated", "Session ID"],
+            )
+            running_headers = [
+                window.running_table.horizontalHeaderItem(i).text()
+                for i in range(window.running_table.columnCount())
+            ]
+            self.assertEqual(
+                running_headers, ["Project", "Name", "Provider", "Status", "Last message"]
+            )
+        finally:
+            window.close()
+
+    def test_all_sessions_column_state_ignores_stale_eight_column_blob_restores_v2(self):
+        # An eight-column state blob (from the rejected task-2114 layout)
+        # restored onto today's six-column header is exactly the corruption
+        # task-2136 fixes - restoreState() with a mismatched section count
+        # scrambles widths/order. The settings key changed to
+        # main_table_columns_v2 (mirroring ManageGroupDialog's own
+        # group_table_columns_v2 precedent) so the old blob is never read;
+        # a real six-column blob under the new key still round-trips.
+        eight_col_scratch = session_hub.QTableWidget(0, 8)
+        eight_col_scratch.setHorizontalHeaderLabels([str(i) for i in range(8)])
+        stale_eight_col_state = session_hub.column_widths_state(eight_col_scratch)
+        eight_col_scratch.deleteLater()
+
+        with patch("session_hub.read_metadata", return_value={"sessions": {}, "settings": {}, "groups": {}}):
+            scratch = session_hub.SessionHub()
+        agent_index = list(session_hub.SessionHub.SESSION_TABLE_COLUMNS).index("Agent")
+        scratch.table.horizontalHeader().resizeSection(agent_index, 321)
+        valid_six_col_state = session_hub.column_widths_state(scratch.table)
+        scratch.close()
+
+        metadata = {
+            "sessions": {},
+            "settings": {
+                "main_table_columns": stale_eight_col_state,
+                "main_table_columns_v2": valid_six_col_state,
+            },
+            "groups": {},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertEqual(window.table.columnCount(), 6)
+            headers = [
+                window.table.horizontalHeaderItem(i).text()
+                for i in range(window.table.columnCount())
+            ]
+            self.assertEqual(
+                headers,
+                ["Agent", "Model", "Name", "Working directory", "Last updated", "Session ID"],
+            )
+            self.assertEqual(window.table.horizontalHeader().sectionSize(agent_index), 321)
+        finally:
+            window.close()
 
     def test_manage_group_dialog_default_column_order_puts_status_first_and_agent_last(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4337,6 +4577,30 @@ class SessionHubTests(unittest.TestCase):
         self.assertTrue(dialog.use_tmux)
         dialog.close()
 
+    def test_launch_new_group_sessions_dialog_will_launch_false_hides_launch_copy(self):
+        # task-2137: "Add new…" reuses this dialog but must not claim it
+        # launches anything - the tmux choice has no effect when nothing is
+        # launched, so it's hidden rather than shown and then ignored.
+        launch_dialog = session_hub.LaunchNewGroupSessionsDialog("/tmp/vamp", set(), False)
+        self.assertEqual(launch_dialog.windowTitle(), "Launch new sessions")
+        self.assertFalse(launch_dialog.tmux_checkbox.isHidden())
+        ok_button = launch_dialog.findChild(
+            session_hub.QDialogButtonBox
+        ).button(session_hub.QDialogButtonBox.StandardButton.Ok)
+        self.assertEqual(ok_button.text(), "Launch")
+        launch_dialog.close()
+
+        add_dialog = session_hub.LaunchNewGroupSessionsDialog(
+            "/tmp/vamp", set(), False, will_launch=False
+        )
+        self.assertEqual(add_dialog.windowTitle(), "Add new sessions")
+        self.assertTrue(add_dialog.tmux_checkbox.isHidden())
+        ok_button = add_dialog.findChild(
+            session_hub.QDialogButtonBox
+        ).button(session_hub.QDialogButtonBox.StandardButton.Ok)
+        self.assertEqual(ok_button.text(), "Add")
+        add_dialog.close()
+
     def test_manage_group_dialog_tmux_checkbox_persists_to_group(self):
         with tempfile.TemporaryDirectory() as temp:
             metadata = {
@@ -4503,7 +4767,7 @@ class SessionHubTests(unittest.TestCase):
             self.assertNotEqual(rows[0]["model"], "gpt-5.6-sol")
             dialog.close()
 
-    def test_launch_new_rows_into_group_launches_all_rows_and_saves_group(self):
+    def test_add_new_rows_into_group_saves_all_rows_without_launching(self):
         with tempfile.TemporaryDirectory() as temp:
             metadata = {"sessions": {}, "settings": {}}
             with patch("session_hub.read_metadata", return_value=metadata):
@@ -4519,10 +4783,8 @@ class SessionHubTests(unittest.TestCase):
                         "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
                     ),
                 ):
-                    window.launch_new_rows_into_group(temp, rows, False)
-                self.assertEqual(launch.call_count, 2)
-                for call in launch.call_args_list:
-                    self.assertFalse(call.kwargs["focus"])
+                    window.add_new_rows_into_group(temp, rows)
+                launch.assert_not_called()
                 saved = window.metadata["groups"][temp]
                 self.assertEqual(
                     {row["name"] for row in saved["rows"]},
@@ -4531,7 +4793,10 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_launch_new_rows_into_group_launches_codex_row_with_its_own_provider(self):
+    def test_add_new_rows_into_group_saves_codex_row_without_pending_marker(self):
+        # codex_pending_since only means anything for a process just
+        # launched - a saved-but-never-launched row must not carry one, or
+        # its first real launch reads as a stale/orphaned relaunch.
         with tempfile.TemporaryDirectory() as temp:
             metadata = {"sessions": {}, "settings": {}}
             with patch("session_hub.read_metadata", return_value=metadata):
@@ -4542,21 +4807,18 @@ class SessionHubTests(unittest.TestCase):
                     patch.object(session_hub.SessionHub, "launch") as launch,
                     patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
                 ):
-                    window.launch_new_rows_into_group(temp, rows, False)
-                launch.assert_called_once()
-                call_args = launch.call_args
-                self.assertEqual(call_args.args[0], "Codex")
-                self.assertEqual(call_args.kwargs["model"], "gpt-5")
+                    window.add_new_rows_into_group(temp, rows)
+                launch.assert_not_called()
                 saved_row = window.metadata["groups"][temp]["rows"][0]
                 self.assertEqual(saved_row["provider"], "Codex")
-                self.assertIn("codex_pending_since", saved_row)
+                self.assertNotIn("codex_pending_since", saved_row)
                 self.assertEqual(
                     window.metadata["sessions"][saved_row["override_key"]]["model"], "gpt-5"
                 )
             finally:
                 window.close()
 
-    def test_launch_new_rows_into_group_merges_without_duplicating_existing_rows(self):
+    def test_add_new_rows_into_group_merges_without_duplicating_existing_rows(self):
         with tempfile.TemporaryDirectory() as temp:
             metadata = {
                 "sessions": {},
@@ -4576,18 +4838,19 @@ class SessionHubTests(unittest.TestCase):
                     {"name": "vampulse-sonnet", "model": "sonnet"},
                 ]
                 with (
-                    patch.object(session_hub.SessionHub, "launch"),
+                    patch.object(session_hub.SessionHub, "launch") as launch,
                     patch(
                         "session_hub.METADATA_PATH", Path(temp) / "metadata.json"
                     ),
                 ):
-                    window.launch_new_rows_into_group(temp, rows, False)
+                    window.add_new_rows_into_group(temp, rows)
+                launch.assert_not_called()
                 saved = window.metadata["groups"][temp]
                 self.assertEqual(len(saved["rows"]), 2)
             finally:
                 window.close()
 
-    def test_manage_group_dialog_launch_new_rows_delegates_to_hub(self):
+    def test_manage_group_dialog_add_new_rows_delegates_to_hub_no_launch_dialog(self):
         with tempfile.TemporaryDirectory() as temp:
             metadata = {
                 "sessions": {},
@@ -4615,13 +4878,14 @@ class SessionHubTests(unittest.TestCase):
                         patch(
                             "session_hub.LaunchNewGroupSessionsDialog",
                             return_value=dialog_instance,
-                        ),
-                        patch.object(window, "launch_new_rows_into_group") as launch,
+                        ) as dialog_ctor,
+                        patch.object(window, "add_new_rows_into_group") as add_new,
                     ):
-                        dialog.launch_new_rows()
-                    launch.assert_called_once_with(
-                        "/tmp/vamp", [{"name": "vamp-new", "model": None}], True
+                        dialog.add_new_rows()
+                    add_new.assert_called_once_with(
+                        "/tmp/vamp", [{"name": "vamp-new", "model": None}]
                     )
+                    self.assertFalse(dialog_ctor.call_args.kwargs["will_launch"])
                 finally:
                     dialog.close()
             finally:
@@ -5792,6 +6056,192 @@ class SessionActivityTests(unittest.TestCase):
 
         self.assertEqual(json_label, "Needs input")
         self.assertEqual(gui_label, "Needs input")
+
+    def test_activity_item_activation_focuses_the_exact_live_session(self):
+        # task-2135: mounts the REAL Recent-activity widget through the real
+        # refresh_running_tab()/_refresh_activity_list() pipeline (not a
+        # hand-built dict), then activates each item and asserts the exact
+        # (cwd, name, session_id) passed to the shared Running focus
+        # authority. Covers: a live exact-identity Claude event, a second
+        # Claude row sharing the SAME row name in a different cwd (duplicate
+        # names must never conflate), a repaired Codex link row (its
+        # session_key already points at the current active member, as
+        # row433's persistence guarantees), and a stale/historical entry
+        # whose session_id belongs to no currently-running row.
+        claude_a = session_hub.Session(
+            "Claude", "id-a", "t", "/tmp/vamp2135a", "/tmp/vamp2135a", 100,
+            Path("/tmp/a.jsonl"), agent_name="vamp-shared",
+        )
+        claude_b = session_hub.Session(
+            "Claude", "id-b", "t", "/tmp/vamp2135b", "/tmp/vamp2135b", 100,
+            Path("/tmp/b.jsonl"), agent_name="vamp-shared",
+        )
+        codex_new = session_hub.Session(
+            "Codex", "new-id", "t", "/tmp/vamp2135c", "/tmp/vamp2135c", 100,
+            Path("/tmp/c.jsonl"),
+        )
+        metadata = {
+            "settings": {},
+            "sessions": {},
+            "groups": {
+                "/tmp/vamp2135a": {"tmux": True, "rows": [{"name": "vamp-shared"}]},
+                "/tmp/vamp2135b": {"tmux": True, "rows": [{"name": "vamp-shared"}]},
+                "/tmp/vamp2135c": {
+                    "tmux": True,
+                    "rows": [{
+                        "name": "vamp-codex", "provider": "Codex",
+                        "session_key": "Codex:new-id",
+                    }],
+                },
+            },
+        }
+        statuses = [
+            ("id-a", {"state": "working", "ts": 1000, "detail": "a"}),
+            ("id-b", {"state": "working", "ts": 1000, "detail": "b"}),
+            ("new-id", {"state": "idle", "ts": 1000, "detail": ""}),
+            ("stale-ghost", {"state": "done", "ts": 1000, "detail": "long finished"}),
+        ]
+        with (
+            patch.object(session_hub, "read_metadata", return_value=metadata),
+            patch.object(session_hub, "claude_sessions", return_value=[claude_a, claude_b]),
+            patch.object(session_hub, "codex_sessions", return_value=[codex_new]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub, "tmux_session_alive", return_value=True),
+            patch.object(session_hub, "all_session_statuses", return_value=statuses),
+        ):
+            window = session_hub.SessionHub()
+            try:
+                window.refresh_running_tab()
+                self.assertEqual(window.activity_list.count(), 4)
+                with patch.object(window, "_focus_or_resume_session") as focus_mock:
+                    window.activate_activity_item(window.activity_list.item(0))
+                    focus_mock.assert_called_once_with(
+                        "/tmp/vamp2135a", "vamp-shared", "id-a")
+
+                    focus_mock.reset_mock()
+                    window.activate_activity_item(window.activity_list.item(1))
+                    focus_mock.assert_called_once_with(
+                        "/tmp/vamp2135b", "vamp-shared", "id-b")
+
+                    focus_mock.reset_mock()
+                    window.activate_activity_item(window.activity_list.item(2))
+                    focus_mock.assert_called_once_with(
+                        "/tmp/vamp2135c", "vamp-codex", "new-id")
+
+                    focus_mock.reset_mock()
+                    window.activate_activity_item(window.activity_list.item(3))
+                    focus_mock.assert_not_called()
+            finally:
+                window.close()
+
+    def test_running_context_menu_bring_up_window_resolves_exact_duplicate_name_row(self):
+        # task-2137: right-click a Running row with a name shared by another
+        # row in a different cwd - "Bring up window" must resolve the exact
+        # row clicked, the same identity Running's own double-click uses,
+        # never a different same-name sibling.
+        claude_a = session_hub.Session(
+            "Claude", "id-a", "t", "/tmp/vamp2137a", "/tmp/vamp2137a", 100,
+            Path("/tmp/2137a.jsonl"), agent_name="vamp-shared",
+        )
+        claude_b = session_hub.Session(
+            "Claude", "id-b", "t", "/tmp/vamp2137b", "/tmp/vamp2137b", 100,
+            Path("/tmp/2137b.jsonl"), agent_name="vamp-shared",
+        )
+        metadata = {
+            "settings": {}, "sessions": {},
+            "groups": {
+                "/tmp/vamp2137a": {"tmux": True, "rows": [{"name": "vamp-shared"}]},
+                "/tmp/vamp2137b": {"tmux": True, "rows": [{"name": "vamp-shared"}]},
+            },
+        }
+        with (
+            patch.object(session_hub, "read_metadata", return_value=metadata),
+            patch.object(session_hub, "claude_sessions", return_value=[claude_a, claude_b]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub, "tmux_session_alive", return_value=True),
+        ):
+            window = session_hub.SessionHub()
+            try:
+                window.refresh_running_tab()
+                self.assertEqual(window.running_table.rowCount(), 2)
+                for row, (cwd, session_id) in enumerate(
+                    [("/tmp/vamp2137a", "id-a"), ("/tmp/vamp2137b", "id-b")]
+                ):
+                    point = window.running_table.visualItemRect(
+                        window.running_table.item(row, 0)
+                    ).center()
+                    with patch.object(session_hub, "QMenu") as menu_cls:
+                        menu_instance = MagicMock()
+                        menu_cls.return_value = menu_instance
+                        window.running_context_menu(point)
+                    added = [call.args[0] for call in menu_instance.addAction.call_args_list]
+                    self.assertEqual(
+                        [action.text() for action in added],
+                        ["Bring up window", "Stop session"],
+                    )
+                    with patch.object(window, "_focus_or_resume_session") as focus_mock:
+                        added[0].trigger()
+                        focus_mock.assert_called_once_with(cwd, "vamp-shared", session_id)
+            finally:
+                window.close()
+
+    def test_running_context_menu_stop_session_confirms_and_stops_exact_row(self):
+        claude_a = session_hub.Session(
+            "Claude", "id-a", "t", "/tmp/vamp2137stop", "/tmp/vamp2137stop", 100,
+            Path("/tmp/2137stop.jsonl"),
+        )
+        metadata = {
+            "settings": {}, "sessions": {},
+            "groups": {"/tmp/vamp2137stop": {"tmux": True, "rows": [{"name": "vamp-stop-me"}]}},
+        }
+        with (
+            patch.object(session_hub, "read_metadata", return_value=metadata),
+            patch.object(session_hub, "claude_sessions", return_value=[claude_a]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub, "tmux_session_alive", return_value=True),
+        ):
+            window = session_hub.SessionHub()
+            try:
+                window.refresh_running_tab()
+                point = window.running_table.visualItemRect(
+                    window.running_table.item(0, 0)
+                ).center()
+                with patch.object(session_hub, "QMenu") as menu_cls:
+                    menu_instance = MagicMock()
+                    menu_cls.return_value = menu_instance
+                    window.running_context_menu(point)
+                added = [call.args[0] for call in menu_instance.addAction.call_args_list]
+                with (
+                    patch.object(
+                        session_hub.QMessageBox, "question",
+                        return_value=session_hub.QMessageBox.StandardButton.Yes,
+                    ) as confirm,
+                    patch.object(session_hub, "stop_tmux_session") as stop_mock,
+                    patch.object(session_hub.SessionHub, "refresh_running_tab") as refresh_mock,
+                ):
+                    added[1].trigger()
+                confirm.assert_called_once()
+                stop_mock.assert_called_once_with("vamp-stop-me")
+                refresh_mock.assert_called_once()
+            finally:
+                window.close()
+
+    def test_running_context_menu_empty_area_offers_no_menu(self):
+        # Negative control for the two tests above: right-clicking where no
+        # row exists must not construct a menu or touch focus/stop at all.
+        metadata = {"settings": {}, "sessions": {}, "groups": {}}
+        with patch.object(session_hub, "read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            window.refresh_running_tab()
+            self.assertEqual(window.running_table.rowCount(), 0)
+            with patch.object(session_hub, "QMenu") as menu_cls:
+                window.running_context_menu(QPoint(5, 5))
+            menu_cls.assert_not_called()
+        finally:
+            window.close()
 
     def test_tmux_live_session_names_survives_oserror_and_timeout(self):
         """The subprocess spawn itself can fail at the OS level (tmux binary

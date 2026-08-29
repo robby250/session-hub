@@ -221,15 +221,12 @@ class MainPane(Vertical):
             self.filtered = list(sessions)
         table = self.query_one("#main", DataTable)
         table.clear(columns=True)
-        table.add_columns("Provider", "Name", "Status", "Last message", "Working directory", "Session ID")
+        table.add_columns("Provider", "Name", "Working directory", "Session ID")
         table.cursor_type = "row"
         for session in self.filtered:
-            detail = " ".join(str(session.get("activity_detail", "")).split())
             table.add_row(
                 "Group" if session["is_group"] else session["provider"],
                 session["title"],
-                session.get("activity_label", ""),
-                detail if len(detail) <= 60 else detail[:59] + "…",
                 session["cwd"],
                 session["session_id"],
             )

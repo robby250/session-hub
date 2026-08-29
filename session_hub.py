@@ -244,8 +244,7 @@ def codex_combo_value(combo: QComboBox) -> str | None:
 # ManageGroupDialog both render from this (see SessionHub.populate_session_table)
 # so their common columns are defined once, in one order.
 SESSION_TABLE_COLUMNS = (
-    "Agent", "Model", "Name", "Status", "Last message", "Working directory",
-    "Last updated", "Session ID",
+    "Agent", "Model", "Name", "Working directory", "Last updated", "Session ID",
 )
 # Catalog of well-known agent environment variables. Each spec drives the
 # value editor (a slider, spin box, dropdown, or text field, per "kind") and
@@ -4123,6 +4122,7 @@ class LaunchNewGroupSessionsDialog(QDialog):
         parent=None,
         claude_accounts: dict[str, str] | None = None,
         accounts_enabled: bool = False,
+        will_launch: bool = True,
     ) -> None:
         super().__init__(parent)
         self.cwd = cwd
@@ -4131,7 +4131,8 @@ class LaunchNewGroupSessionsDialog(QDialog):
         self.use_tmux: bool = tmux
         self.claude_accounts = claude_accounts or DEFAULT_CLAUDE_ACCOUNTS
         self.accounts_enabled = accounts_enabled
-        self.setWindowTitle("Launch new sessions")
+        self.will_launch = will_launch
+        self.setWindowTitle("Launch new sessions" if will_launch else "Add new sessions")
         self.setMinimumWidth(560)
         layout = QVBoxLayout(self)
 
@@ -4139,6 +4140,11 @@ class LaunchNewGroupSessionsDialog(QDialog):
         directory_label.setWordWrap(True)
         layout.addWidget(directory_label)
 
+        # will_launch=False ("Add new…"): the tmux choice has no effect here
+        # (register_group_row/add_new_rows_into_group never launches
+        # anything), so showing it would promise a behavior this dialog
+        # doesn't perform - it applies the next time the saved row is
+        # actually launched, via the group's own "Launch in tmux" checkbox.
         self.tmux_checkbox = QCheckBox("Launch detached inside tmux")
         self.tmux_checkbox.setChecked(tmux)
         self.tmux_checkbox.setToolTip(
@@ -4148,9 +4154,10 @@ class LaunchNewGroupSessionsDialog(QDialog):
             "be installed. /clear-detection isn't available yet for "
             "tmux-launched sessions."
         )
+        self.tmux_checkbox.setVisible(will_launch)
         layout.addWidget(self.tmux_checkbox)
 
-        layout.addWidget(QLabel("Sessions to launch:"))
+        layout.addWidget(QLabel("Sessions to launch:" if will_launch else "Sessions to add:"))
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["Provider", "Model", "Effort", "Account", "Name"])
         self.table.horizontalHeader().setSectionResizeMode(
@@ -4187,7 +4194,9 @@ class LaunchNewGroupSessionsDialog(QDialog):
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Launch")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Launch" if will_launch else "Add"
+        )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -4563,10 +4572,8 @@ class ManageGroupDialog(QDialog):
         column
         for column in SESSION_TABLE_COLUMNS
         # This dialog keeps its own launch-liveness STATUS_COLUMN
-        # (Running/Stopped, via group_row_status) - the main listview's
-        # Status/Last message columns are a different fact (activity, not
-        # liveness - see session_activity) and would collide with it here.
-        if column not in ("Working directory", "Session ID", "Status", "Last message")
+        # (Running/Stopped, via group_row_status), separate from Session ID.
+        if column not in ("Working directory", "Session ID")
     )
     TRANSCRIPTS_COLUMN = len(SHARED_COLUMNS)
     STATUS_COLUMN = len(SHARED_COLUMNS) + 1
@@ -4650,12 +4657,18 @@ class ManageGroupDialog(QDialog):
             shortcut = QShortcut(QKeySequence(key), self.table)
             shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
             shortcut.activated.connect(self.launch_selected_rows)
+        self.table.itemSelectionChanged.connect(self._update_launch_selected_enabled)
         layout.addWidget(self.table)
 
         controls = QHBoxLayout()
-        launch_all = QPushButton("Launch all")
-        launch_all.clicked.connect(self.launch_all)
-        controls.addWidget(launch_all)
+        self.launch_selected_button = QPushButton("Launch selected")
+        self.launch_selected_button.setToolTip(
+            "Launch or resume every currently-selected row - nothing "
+            "happens with no selection."
+        )
+        self.launch_selected_button.setEnabled(False)
+        self.launch_selected_button.clicked.connect(self.launch_selected_rows)
+        controls.addWidget(self.launch_selected_button)
         add_session_button = QPushButton("Add session…")
         add_session_button.setToolTip(
             "File an already-running session into this group - no new "
@@ -4663,13 +4676,13 @@ class ManageGroupDialog(QDialog):
         )
         add_session_button.clicked.connect(self.add_existing_session)
         controls.addWidget(add_session_button)
-        launch_new_button = QPushButton("Launch new…")
-        launch_new_button.setToolTip(
+        add_new_button = QPushButton("Add new…")
+        add_new_button.setToolTip(
             "Define one or more brand-new named sessions (Claude or Codex) "
-            "and launch them into this group."
+            "and save them into this group - nothing gets launched."
         )
-        launch_new_button.clicked.connect(self.launch_new_rows)
-        controls.addWidget(launch_new_button)
+        add_new_button.clicked.connect(self.add_new_rows)
+        controls.addWidget(add_new_button)
         group_options_button = QPushButton("Group launch options…")
         group_options_button.setToolTip(
             "Env vars and CLI flags applied to every row in this group. "
@@ -4920,23 +4933,22 @@ class ManageGroupDialog(QDialog):
         self.hub.refresh()
         self.reload(select_override_keys={row["override_key"]})
 
-    def launch_all(self) -> None:
-        group = self.group()
-        if not group:
-            return
-        for row, match in self.matched_sessions():
-            if match and session_is_tracked_alive(match):
-                continue
-            self.launch_row(row["name"])
+    def _update_launch_selected_enabled(self) -> None:
+        self.launch_selected_button.setEnabled(
+            bool(self.table.selectionModel().selectedRows())
+        )
 
     def launch_selected_rows(self) -> None:
-        """Enter/Return on the table: launch or resume every selected row.
+        """"Launch selected" button / Enter/Return on the table: launch or
+        resume every selected row, in table order.
 
         Mirrors launch_or_resume_row's per-row launch-vs-resume choice, but
         for the whole (Ctrl/Shift-click) selection at once instead of just
-        the row under the cursor.
+        the row under the cursor. Table order (not selection/click order)
+        keeps multi-row launches deterministic and matches what the user
+        sees top to bottom.
         """
-        table_rows = {index.row() for index in self.table.selectionModel().selectedRows()}
+        table_rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()})
         if not table_rows:
             return
         override_keys = set()
@@ -4977,7 +4989,7 @@ class ManageGroupDialog(QDialog):
         self.hub.file_session_into_group(dialog.session, self.cwd)
         self.reload()
 
-    def launch_new_rows(self) -> None:
+    def add_new_rows(self) -> None:
         group = self.group()
         existing_names = {row["name"] for row in group.get("rows", [])} if group else set()
         dialog = LaunchNewGroupSessionsDialog(
@@ -4987,10 +4999,11 @@ class ManageGroupDialog(QDialog):
             self,
             claude_accounts=self.hub.settings().get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS,
             accounts_enabled=bool(self.hub.settings().get("claude_accounts_enabled")),
+            will_launch=False,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.group_rows:
             return
-        self.hub.launch_new_rows_into_group(self.cwd, dialog.group_rows, dialog.use_tmux)
+        self.hub.add_new_rows_into_group(self.cwd, dialog.group_rows)
         self.reload()
 
     def reorder_row(self, source_row: int, target_row: int) -> None:
@@ -5559,12 +5572,19 @@ class SessionHub(QMainWindow):
             self.table,
             SessionHub.SESSION_TABLE_COLUMNS,
             {
-                "Agent": 90, "Model": 90, "Name": 220, "Status": 90,
-                "Last message": 260, "Working directory": 320, "Last updated": 140,
+                "Agent": 90, "Model": 90, "Name": 220, "Working directory": 320,
+                "Last updated": 140,
             },
             stretch_column="Session ID",
         )
-        restore_column_widths(self.table, self.settings().get("main_table_columns"))
+        # _v2: task-2136 reverted All Sessions from the rejected eight-column
+        # (Status/Last message added) layout back to six - an old eight-column
+        # blob restored onto a six-column header scrambles widths/order (the
+        # bug this reverts), so the settings key changes too, exactly like
+        # ManageGroupDialog's own group_table_columns_v2 bump for the same
+        # reason. A pre-existing six-column blob under the old key is simply
+        # not re-read; only a fresh v2 blob round-trips.
+        restore_column_widths(self.table, self.settings().get("main_table_columns_v2"))
         self.table.doubleClicked.connect(self.resume_selected)
         for key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             shortcut = QShortcut(QKeySequence(key), self.table)
@@ -5611,6 +5631,8 @@ class SessionHub(QMainWindow):
         self.running_table.verticalHeader().setVisible(False)
         self.running_table.horizontalHeader().setStretchLastSection(True)
         self.running_table.cellDoubleClicked.connect(self.reveal_running_row)
+        self.running_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.running_table.customContextMenuRequested.connect(self.running_context_menu)
         running_layout.addWidget(self.running_table, 1)
         running_actions = QHBoxLayout()
         running_actions.addStretch(1)
@@ -5625,6 +5647,10 @@ class SessionHub(QMainWindow):
         self.activity_list = QListWidget()
         self.activity_list.setMaximumHeight(160)
         self.activity_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        # itemActivated covers both double-click (the same activation gesture Running's
+        # cellDoubleClicked uses) and Enter/Return on the current item - one signal, one
+        # handler, for both the mouse and keyboard paths (task-2135).
+        self.activity_list.itemActivated.connect(self.activate_activity_item)
         running_layout.addWidget(self.activity_list)
 
         tabs = QTabWidget()
@@ -5660,7 +5686,7 @@ class SessionHub(QMainWindow):
             latest["settings"]["window_geometry"] = bytes(
                 self.saveGeometry().toBase64()
             ).decode("ascii")
-            latest["settings"]["main_table_columns"] = column_widths_state(self.table)
+            latest["settings"]["main_table_columns_v2"] = column_widths_state(self.table)
             self.metadata = latest
             write_metadata(latest)
         super().closeEvent(event)
@@ -6270,10 +6296,10 @@ class SessionHub(QMainWindow):
             )
             self.running_table.setItem(index, 3, self._status_column_item(state))
             self.running_table.setItem(index, 4, self._detail_column_item(detail))
-        names_by_id = {
-            match.session_id: row["name"] for _dn, _cwd, row, match in running if match
+        live_by_id = {
+            match.session_id: (cwd, row["name"]) for _dn, cwd, row, match in running if match
         }
-        self._refresh_activity_list(names_by_id)
+        self._refresh_activity_list(live_by_id)
 
     def _status_column_item(self, state: str) -> QTableWidgetItem:
         label, color = activity_label(state)
@@ -6290,13 +6316,21 @@ class SessionHub(QMainWindow):
             item.setToolTip(detail)
         return item
 
-    def _refresh_activity_list(self, names_by_id: dict[str, str]) -> None:
+    def _refresh_activity_list(self, live_by_id: dict[str, tuple[str, str]]) -> None:
         """Recent-activity strip: a history log of raw write_session_status
         events (each entry's own recorded state/detail/ts), deliberately NOT
         routed through session_activity's CURRENT-state verdict - see that
         function's docstring for why a log of past events must not be
         rewritten to today's live state. Shares only activity_label() so the
-        two surfaces render identically."""
+        two surfaces render identically.
+
+        `live_by_id` is exactly the (cwd, name) pair the current refresh's
+        running-row resolution assigned to a session_id (task-2135) - not a
+        display-name lookup. An entry whose session_id is not a key here is
+        stale/stopped/historical: it gets no identity data at all, so
+        activate_activity_item() below is inert for it by construction
+        rather than guessing a same-name row or a different linked member.
+        """
         self.activity_list.clear()
         for session_id, status in all_session_statuses()[:20]:
             label, color = activity_label(status.get("state"))
@@ -6304,11 +6338,29 @@ class SessionHub(QMainWindow):
                 continue
             when = datetime.fromtimestamp(status.get("ts", 0)).strftime("%H:%M:%S")
             detail = " ".join(status.get("detail", "").split())[:80]
-            name = names_by_id.get(session_id, session_id[:8])
+            live = live_by_id.get(session_id)
+            name = live[1] if live else session_id[:8]
             text = f"{when}  {name}  {label}" + (f" — {detail}" if detail else "")
             entry = QListWidgetItem(text)
             entry.setForeground(QColor(color))
+            entry.setData(
+                Qt.ItemDataRole.UserRole,
+                (live[0], live[1], session_id) if live else None,
+            )
             self.activity_list.addItem(entry)
+
+    def activate_activity_item(self, item: QListWidgetItem) -> None:
+        """Recent-activity double-click/Enter: focus the row's live session
+        through the exact same authority as Running (task-2135). A stale,
+        stopped or historical entry carries no identity data (see
+        _refresh_activity_list) and is inert here - it never starts a new
+        session, resumes a different linked member, or focuses an unrelated
+        same-name row."""
+        identity = item.data(Qt.ItemDataRole.UserRole)
+        if not identity:
+            return
+        cwd, name, session_id = identity
+        self._focus_or_resume_session(cwd, name, session_id)
 
     def stop_selected_running(self) -> None:
         row = self.running_table.currentRow()
@@ -6327,8 +6379,13 @@ class SessionHub(QMainWindow):
         stop_tmux_session(name)
         self.refresh_running_tab()
 
-    def reveal_running_row(self, row: int, _column: int = 0) -> None:
-        """Double-click a Running row: bring its terminal to the front.
+    def _focus_or_resume_session(self, cwd: str, name: str, session_id: str | None) -> None:
+        """Bring a running row's terminal to the front, or open/resume it if
+        no terminal window exists yet. The one focus authority behind both
+        the Running double-click and Recent-activity activation
+        (task-2135) - reusing it, rather than a second implementation, is
+        what keeps them from ever disagreeing about what a given identity
+        resolves to.
 
         wmctrl -a already unminimizes as well as raising, so a window that's
         merely minimized in the taskbar is covered for free. wmctrl can only
@@ -6340,10 +6397,6 @@ class SessionHub(QMainWindow):
         has-session gates their tmux attach, so this only ever opens a
         terminal onto the existing session, never a second copy of it.
         """
-        item = self.running_table.item(row, 0)
-        if not item:
-            return
-        cwd, name, session_id = item.data(Qt.ItemDataRole.UserRole)
         if session_id:
             status = read_session_status(session_id)
             if status and status.get("state") == "done":
@@ -6365,6 +6418,32 @@ class SessionHub(QMainWindow):
         # on with several other windows open. Same wmctrl activation used
         # above for an already-open window, just given time to appear first.
         threading.Thread(target=focus_window_by_title, args=(name,), daemon=True).start()
+
+    def reveal_running_row(self, row: int, _column: int = 0) -> None:
+        """Double-click a Running row: bring its terminal to the front."""
+        item = self.running_table.item(row, 0)
+        if not item:
+            return
+        cwd, name, session_id = item.data(Qt.ItemDataRole.UserRole)
+        self._focus_or_resume_session(cwd, name, session_id)
+
+    def running_context_menu(self, point) -> None:
+        """Right-click a Running row: the same exact-identity focus/stop
+        authority as double-click and the Stop button, just reachable
+        without a prior left-click select."""
+        item = self.running_table.itemAt(point)
+        if item is None:
+            return
+        row = item.row()
+        self.running_table.setCurrentCell(row, 0)
+        menu = QMenu(self)
+        bring_up_action = QAction("Bring up window", self)
+        bring_up_action.triggered.connect(lambda: self.reveal_running_row(row))
+        menu.addAction(bring_up_action)
+        stop_action = QAction("Stop session", self)
+        stop_action.triggered.connect(self.stop_selected_running)
+        menu.addAction(stop_action)
+        menu.exec(self.running_table.viewport().mapToGlobal(point))
 
     def apply_filter(self) -> None:
         query = self.search.text().strip().lower()
@@ -7473,19 +7552,21 @@ class SessionHub(QMainWindow):
     def launch_selected_provider(self) -> None:
         self.launch_new(self.new_provider.currentText())
 
-    def launch_new_rows_into_group(
-        self, cwd: str, rows: list[dict], use_tmux: bool
-    ) -> None:
-        """Register and launch each row (`{"name", "provider", "model", "reasoning_effort"}`)
-        into the group at `cwd`.
+    def add_new_rows_into_group(self, cwd: str, rows: list[dict]) -> None:
+        """Register each row (`{"name", "provider", "model", "reasoning_effort"}`)
+        into the group at `cwd`, without launching anything - no provider
+        CLI, terminal, tmux session, resume, or focus action.
 
         Skips any name already present in the group - the same merge
         behavior the removed top-level "New session group…" button had
         when pointed at an existing directory. Called from
-        ManageGroupDialog's "Launch new…" button (LaunchNewGroupSessionsDialog);
-        the group itself must already exist - creating one happens either
-        via "Add session to group… → New group…" (no launch) or implicitly
-        the first time a session is filed into a not-yet-existing cwd.
+        ManageGroupDialog's "Add new…" button (LaunchNewGroupSessionsDialog,
+        will_launch=False); the group itself must already exist - creating
+        one happens either via "Add session to group… → New group…" or
+        implicitly the first time a session is filed into a not-yet-existing
+        cwd. The row is launched later, the same way any other saved-but-
+        not-yet-running row is: per-row Launch, "Launch selected", or the
+        row's own double-click/Enter.
         """
         group = self.metadata.setdefault("groups", {}).setdefault(
             cwd, {"cwd": cwd, "rows": []}
@@ -7502,19 +7583,6 @@ class SessionHub(QMainWindow):
                 row.get("model"),
                 row.get("reasoning_effort"),
                 row.get("account_config_dir"),
-            )
-            if provider == "Codex":
-                registered["codex_pending_since"] = int(time.time() * 1000)
-            self.launch(
-                provider,
-                None,
-                cwd,
-                model=row.get("model") if provider == "Codex" else None,
-                reasoning_effort=row.get("reasoning_effort") if provider == "Codex" else None,
-                session_key=registered["override_key"],
-                flag_overrides={"--name": registered["name"]},
-                focus=False,
-                use_tmux=use_tmux,
             )
             group["rows"].append(registered)
             existing_names.add(registered["name"])
@@ -7582,9 +7650,10 @@ class SessionHub(QMainWindow):
             write_metadata(self.metadata)
 
         # A saved row is a persistent conversation. Reopening it after a
-        # reboot must resume its history; launch_new_rows_into_group is the
-        # separate path that intentionally creates a fresh transcript.
-        # group_row_candidates(), not a same-provider-only claude_sessions()/
+        # reboot must resume its history; a row that has never run (added
+        # via "Add new…", never yet launched) has none, and history is
+        # exactly what decides that below - not a separate immediate-launch
+        # code path. group_row_candidates(), not a same-provider-only claude_sessions()/
         # codex_sessions() call: a row relinked to a different provider than
         # it was saved under has no history under its OWN provider at all,
         # which used to fall through to "no history" and start a duplicate
