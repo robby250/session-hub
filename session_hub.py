@@ -2790,14 +2790,26 @@ _codex_tail_cache: "collections.OrderedDict[str, tuple[int, int, tuple[str, floa
 
 def _codex_tail_turn_state(path: Path) -> tuple[str, float] | None:
     """The most recent task_started/task_complete/turn_aborted event_msg
-    record found in a bounded tail of a Codex rollout file, as
-    (kind, epoch_seconds), or None if no tail window up to
-    _CODEX_TAIL_MAX_BYTES contains one. "task_started" with nothing newer
-    after it is durable evidence of an in-progress turn; "task_complete"/
-    "turn_aborted" is durable evidence the last turn already ended - see
+    record for a Codex rollout file, as (kind, epoch_seconds), or None if
+    none has ever been found. "task_started" with nothing newer after it is
+    durable evidence of an in-progress turn; "task_complete"/"turn_aborted"
+    is durable evidence the last turn already ended - see
     hook_event_to_status_codex's own docstring for why Codex's `notify` alone
     can't tell the difference. Cached per path by (mtime, size), bounded LRU -
     see _codex_tail_cache.
+
+    A file that GREW since the last lookup is scanned incrementally
+    (_codex_tail_turn_state_delta), not re-derived from a fresh bounded tail
+    of the new, larger end of file - the reported false-Done bug was exactly
+    that: a still-open turn's task_started, found while the file was small,
+    receded past _CODEX_TAIL_MAX_BYTES once later tool output in that SAME
+    turn kept appending, and a fresh escalating scan from the new EOF could
+    no longer see it, silently falling back to the previous turn's stale
+    "done" status. Scanning only what was appended since the last confirmed
+    read means a marker once found is never lost to later unrelated growth,
+    while a genuinely newer marker in the new bytes still wins. A shrunk or
+    unrecognized path (rotation, or never looked up before) gets the full
+    cold scan.
     """
     try:
         stat = path.stat()
@@ -2808,7 +2820,10 @@ def _codex_tail_turn_state(path: Path) -> tuple[str, float] | None:
     if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
         _codex_tail_cache.move_to_end(key)
         return cached[2]
-    result = _codex_tail_turn_state_scan(path, stat.st_size)
+    if cached is not None and cached[1] <= stat.st_size:
+        result = _codex_tail_turn_state_delta(path, cached[1], stat.st_size, cached[2])
+    else:
+        result = _codex_tail_turn_state_scan(path, stat.st_size)
     _codex_tail_cache[key] = (stat.st_mtime_ns, stat.st_size, result)
     _codex_tail_cache.move_to_end(key)
     if len(_codex_tail_cache) > _CODEX_TAIL_CACHE_MAX:
@@ -2816,18 +2831,32 @@ def _codex_tail_turn_state(path: Path) -> tuple[str, float] | None:
     return result
 
 
-def _codex_tail_turn_state_scan(path: Path, size: int) -> tuple[str, float] | None:
+def _codex_scan_range_for_turn_marker(
+    path: Path, floor: int, end: int
+) -> tuple[str, float] | None:
+    """Escalating-window scan for the latest task_started/task_complete/
+    turn_aborted event_msg record within byte range [floor, end) of `path`,
+    doubling the trailing window from _CODEX_TAIL_BYTES up to
+    _CODEX_TAIL_MAX_BYTES (or `floor`, whichever the window reaches first).
+    Returns None if nothing is found before that - the caller decides what
+    "nothing in this range" means: no marker exists at all (the cold/full
+    scan, floor=0), or nothing NEWER than an already-known one (the
+    incremental scan, floor=last confirmed offset). Shared by
+    _codex_tail_turn_state_scan and _codex_tail_turn_state_delta.
+    """
+    if end <= floor:
+        return None
     window = _CODEX_TAIL_BYTES
     while True:
-        offset = max(0, size - window)
+        offset = max(floor, end - window)
         try:
             with path.open("rb") as handle:
                 handle.seek(offset)
-                chunk = handle.read()
+                chunk = handle.read(end - offset)
         except OSError:
             return None
         lines = chunk.split(b"\n")
-        if offset > 0:
+        if offset > floor:
             lines = lines[1:]  # seeked mid-file: first line may be truncated
         latest: tuple[str, float] | None = None
         for line in lines:
@@ -2848,13 +2877,31 @@ def _codex_tail_turn_state_scan(path: Path, size: int) -> tuple[str, float] | No
                 continue
             if latest is None or epoch >= latest[1]:
                 latest = (kind, epoch)
-        if latest is not None or offset == 0 or window >= _CODEX_TAIL_MAX_BYTES:
-            # A window that reached start-of-file or the escalation ceiling
-            # with nothing found is a real "no marker here", not a signal to
-            # keep growing - only an empty window that could plausibly be
-            # hiding a marker just past its edge escalates.
+        if latest is not None or offset <= floor or window >= _CODEX_TAIL_MAX_BYTES:
+            # A window that reached the floor or the escalation ceiling with
+            # nothing found is a real "no marker here", not a signal to keep
+            # growing - only an empty window that could plausibly be hiding
+            # a marker just past its edge escalates.
             return latest
         window = min(window * 4, _CODEX_TAIL_MAX_BYTES)
+
+
+def _codex_tail_turn_state_scan(path: Path, size: int) -> tuple[str, float] | None:
+    return _codex_scan_range_for_turn_marker(path, 0, size)
+
+
+def _codex_tail_turn_state_delta(
+    path: Path, start: int, end: int, prior: tuple[str, float] | None
+) -> tuple[str, float] | None:
+    """Only the bytes appended since the last confirmed read (`start` to
+    `end`) can contain a marker newer than `prior` - everything below
+    `start` was already accounted for by an earlier call. Falls back to
+    `prior` rather than None when nothing new is found, so a marker found
+    early in a still-open turn survives however much unrelated tool output
+    that same turn goes on to emit after it.
+    """
+    found = _codex_scan_range_for_turn_marker(path, start, end)
+    return found if found is not None else prior
 
 
 def _codex_activity(session: "Session", status: dict | None) -> tuple[str, str]:

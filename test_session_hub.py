@@ -5971,17 +5971,87 @@ class SessionActivityTests(unittest.TestCase):
         with patch.object(
             session_hub, "_codex_tail_turn_state_scan",
             wraps=session_hub._codex_tail_turn_state_scan,
-        ) as scan:
+        ) as scan, patch.object(
+            session_hub, "_codex_tail_turn_state_delta",
+            wraps=session_hub._codex_tail_turn_state_delta,
+        ) as delta:
             first = session_hub._codex_tail_turn_state(path)
             second = session_hub._codex_tail_turn_state(path)
             self.assertEqual(scan.call_count, 1)
+            self.assertEqual(delta.call_count, 0)
             self.assertEqual(first, second)
 
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(self._event(time.time(), "task_complete")) + "\n")
             third = session_hub._codex_tail_turn_state(path)
-            self.assertEqual(scan.call_count, 2)
+            # Growth is scanned incrementally, not re-derived from scratch -
+            # the cold/full scan must NOT run again.
+            self.assertEqual(scan.call_count, 1)
+            self.assertEqual(delta.call_count, 1)
             self.assertEqual(third[0], "task_complete")
+
+    def test_codex_tail_delta_carries_forward_a_marker_past_the_ceiling(self):
+        """The exact reported false-Done ordering: a task_started is found
+        while the turn's transcript is still small, then that SAME open
+        turn keeps emitting tool output (no task_complete/turn_aborted in
+        between) until the marker is more than _CODEX_TAIL_MAX_BYTES from
+        the new end of file. A fresh cold scan from the new EOF would never
+        see it again; the incremental delta path must still report the
+        turn as working because nothing newer appeared in what was actually
+        appended since it was found."""
+        path = self._rollout([self._event(time.time(), "task_started")])
+        first = session_hub._codex_tail_turn_state(path)
+        self.assertEqual(first[0], "task_started")
+
+        filler = {
+            "timestamp": _iso(time.time()),
+            "type": "event_msg",
+            "payload": {"type": "item_completed", "blob": "x" * 500_000},
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            for _ in range(20):  # >= 10MB, past _CODEX_TAIL_MAX_BYTES (8MB)
+                handle.write(json.dumps(filler) + "\n")
+        self.assertGreater(path.stat().st_size, session_hub._CODEX_TAIL_MAX_BYTES)
+
+        grown = session_hub._codex_tail_turn_state(path)
+        self.assertEqual(grown[0], "task_started")
+        self.assertEqual(grown[1], first[1])
+
+        session = session_hub.Session("Codex", "id-mega-turn", "t", "/tmp", "/tmp", 0, path)
+        with patch.object(session_hub, "tmux_session_alive", return_value=True):
+            state, _ = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "working")
+
+        # Inverse: the turn actually completes (a tiny delta this time) -
+        # the carried-forward marker must not freeze the verdict forever.
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(self._event(time.time(), "task_complete")) + "\n")
+        with patch.object(session_hub, "tmux_session_alive", return_value=True):
+            state, _ = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "done")
+
+    def test_codex_tail_delta_a_truncated_file_gets_a_cold_scan(self):
+        """Negative control: if the file is SMALLER than the cached size (a
+        truncation, or a genuinely different/rotated file reusing the same
+        path), the incremental delta path - which cannot handle a negative
+        range - must not be used; a full cold scan must run instead."""
+        path = self._rollout([self._event(time.time(), "task_started")])
+        first = session_hub._codex_tail_turn_state(path)
+        self.assertEqual(first[0], "task_started")
+        self.assertGreater(path.stat().st_size, 50)
+
+        os.truncate(path, 5)  # unambiguously smaller than the cached size
+        with patch.object(
+            session_hub, "_codex_tail_turn_state_delta",
+            wraps=session_hub._codex_tail_turn_state_delta,
+        ) as delta, patch.object(
+            session_hub, "_codex_tail_turn_state_scan",
+            wraps=session_hub._codex_tail_turn_state_scan,
+        ) as scan:
+            second = session_hub._codex_tail_turn_state(path)
+        self.assertEqual(delta.call_count, 0)
+        self.assertEqual(scan.call_count, 1)
+        self.assertIsNone(second)
 
     def test_codex_tail_cache_evicts_oldest_path_once_over_the_bound(self):
         """codex_sessions() lists every thread ever recorded (no LIMIT), so a
