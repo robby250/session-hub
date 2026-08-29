@@ -3602,6 +3602,77 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_all_sessions_table_restored_to_six_original_columns_running_unchanged(self):
+        # task-2136: task-2114 added Status/Last message to All Sessions
+        # without being asked, corrupting the saved widths/order of its
+        # original six columns. Running is a different table/widget
+        # entirely and keeps its own Status/Last message unchanged.
+        metadata = {"sessions": {}, "settings": {}, "groups": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            headers = [
+                window.table.horizontalHeaderItem(i).text()
+                for i in range(window.table.columnCount())
+            ]
+            self.assertEqual(
+                headers,
+                ["Agent", "Model", "Name", "Working directory", "Last updated", "Session ID"],
+            )
+            running_headers = [
+                window.running_table.horizontalHeaderItem(i).text()
+                for i in range(window.running_table.columnCount())
+            ]
+            self.assertEqual(
+                running_headers, ["Project", "Name", "Provider", "Status", "Last message"]
+            )
+        finally:
+            window.close()
+
+    def test_all_sessions_column_state_ignores_stale_eight_column_blob_restores_v2(self):
+        # An eight-column state blob (from the rejected task-2114 layout)
+        # restored onto today's six-column header is exactly the corruption
+        # task-2136 fixes - restoreState() with a mismatched section count
+        # scrambles widths/order. The settings key changed to
+        # main_table_columns_v2 (mirroring ManageGroupDialog's own
+        # group_table_columns_v2 precedent) so the old blob is never read;
+        # a real six-column blob under the new key still round-trips.
+        eight_col_scratch = session_hub.QTableWidget(0, 8)
+        eight_col_scratch.setHorizontalHeaderLabels([str(i) for i in range(8)])
+        stale_eight_col_state = session_hub.column_widths_state(eight_col_scratch)
+        eight_col_scratch.deleteLater()
+
+        with patch("session_hub.read_metadata", return_value={"sessions": {}, "settings": {}, "groups": {}}):
+            scratch = session_hub.SessionHub()
+        agent_index = list(session_hub.SessionHub.SESSION_TABLE_COLUMNS).index("Agent")
+        scratch.table.horizontalHeader().resizeSection(agent_index, 321)
+        valid_six_col_state = session_hub.column_widths_state(scratch.table)
+        scratch.close()
+
+        metadata = {
+            "sessions": {},
+            "settings": {
+                "main_table_columns": stale_eight_col_state,
+                "main_table_columns_v2": valid_six_col_state,
+            },
+            "groups": {},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertEqual(window.table.columnCount(), 6)
+            headers = [
+                window.table.horizontalHeaderItem(i).text()
+                for i in range(window.table.columnCount())
+            ]
+            self.assertEqual(
+                headers,
+                ["Agent", "Model", "Name", "Working directory", "Last updated", "Session ID"],
+            )
+            self.assertEqual(window.table.horizontalHeader().sectionSize(agent_index), 321)
+        finally:
+            window.close()
+
     def test_manage_group_dialog_default_column_order_puts_status_first_and_agent_last(self):
         with tempfile.TemporaryDirectory() as temp:
             metadata = {

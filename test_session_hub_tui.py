@@ -1,9 +1,14 @@
-"""Direct model/column tests for the TUI panes - status_pipeline_plan.md's
-contract #5 requires Status AND Last message on every activity-showing
-surface; MainPane/RunningPane originally added Status only. These mount the
-real panes in a minimal Textual test App and assert the rendered columns/
-cells rather than just the data dicts, so a column silently dropped from
-add_columns/add_row would fail here even if the underlying JSON were right.
+"""Direct model/column tests for the TUI panes.
+
+RunningPane must keep Status/Last message (status_pipeline_plan.md's
+contract #5 - a provider-neutral activity verdict on every live-session
+surface). MainPane (All Sessions) does not: task-2114 added Status/Last
+message there too without being asked, corrupting the pane's original
+four-column layout, and task-2136 reverts that scope expansion. These mount
+the real panes in a minimal Textual test App and assert the rendered
+columns/cells rather than just the data dicts, so a column silently added or
+dropped from add_columns/add_row would fail here even if the underlying
+JSON were right.
 """
 from __future__ import annotations
 
@@ -29,7 +34,7 @@ def _column_labels(table) -> list[str]:
 
 
 class MainPaneColumnsTests(unittest.IsolatedAsyncioTestCase):
-    async def test_main_pane_has_status_and_last_message_columns(self):
+    async def test_main_pane_restored_to_original_four_columns_no_status(self):
         fake_data = {
             "sessions": [
                 {
@@ -55,11 +60,15 @@ class MainPaneColumnsTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 table = pane.query_one("#main")
                 labels = _column_labels(table)
-                self.assertIn("Status", labels)
-                self.assertIn("Last message", labels)
+                self.assertEqual(labels, ["Provider", "Name", "Working directory", "Session ID"])
+                self.assertNotIn("Status", labels)
+                self.assertNotIn("Last message", labels)
                 row = table.get_row_at(0)
-                self.assertIn("Working", row)
-                self.assertIn("writing the fix now", row)
+                self.assertNotIn("Working", row)
+                self.assertNotIn("writing the fix now", row)
+                self.assertIn("demo", row)
+                self.assertIn("/tmp/demo", row)
+                self.assertIn("id-1", row)
 
 
 class RunningPaneColumnsTests(unittest.IsolatedAsyncioTestCase):

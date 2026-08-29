@@ -244,8 +244,7 @@ def codex_combo_value(combo: QComboBox) -> str | None:
 # ManageGroupDialog both render from this (see SessionHub.populate_session_table)
 # so their common columns are defined once, in one order.
 SESSION_TABLE_COLUMNS = (
-    "Agent", "Model", "Name", "Status", "Last message", "Working directory",
-    "Last updated", "Session ID",
+    "Agent", "Model", "Name", "Working directory", "Last updated", "Session ID",
 )
 # Catalog of well-known agent environment variables. Each spec drives the
 # value editor (a slider, spin box, dropdown, or text field, per "kind") and
@@ -4563,10 +4562,8 @@ class ManageGroupDialog(QDialog):
         column
         for column in SESSION_TABLE_COLUMNS
         # This dialog keeps its own launch-liveness STATUS_COLUMN
-        # (Running/Stopped, via group_row_status) - the main listview's
-        # Status/Last message columns are a different fact (activity, not
-        # liveness - see session_activity) and would collide with it here.
-        if column not in ("Working directory", "Session ID", "Status", "Last message")
+        # (Running/Stopped, via group_row_status), separate from Session ID.
+        if column not in ("Working directory", "Session ID")
     )
     TRANSCRIPTS_COLUMN = len(SHARED_COLUMNS)
     STATUS_COLUMN = len(SHARED_COLUMNS) + 1
@@ -5559,12 +5556,19 @@ class SessionHub(QMainWindow):
             self.table,
             SessionHub.SESSION_TABLE_COLUMNS,
             {
-                "Agent": 90, "Model": 90, "Name": 220, "Status": 90,
-                "Last message": 260, "Working directory": 320, "Last updated": 140,
+                "Agent": 90, "Model": 90, "Name": 220, "Working directory": 320,
+                "Last updated": 140,
             },
             stretch_column="Session ID",
         )
-        restore_column_widths(self.table, self.settings().get("main_table_columns"))
+        # _v2: task-2136 reverted All Sessions from the rejected eight-column
+        # (Status/Last message added) layout back to six - an old eight-column
+        # blob restored onto a six-column header scrambles widths/order (the
+        # bug this reverts), so the settings key changes too, exactly like
+        # ManageGroupDialog's own group_table_columns_v2 bump for the same
+        # reason. A pre-existing six-column blob under the old key is simply
+        # not re-read; only a fresh v2 blob round-trips.
+        restore_column_widths(self.table, self.settings().get("main_table_columns_v2"))
         self.table.doubleClicked.connect(self.resume_selected)
         for key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             shortcut = QShortcut(QKeySequence(key), self.table)
@@ -5664,7 +5668,7 @@ class SessionHub(QMainWindow):
             latest["settings"]["window_geometry"] = bytes(
                 self.saveGeometry().toBase64()
             ).decode("ascii")
-            latest["settings"]["main_table_columns"] = column_widths_state(self.table)
+            latest["settings"]["main_table_columns_v2"] = column_widths_state(self.table)
             self.metadata = latest
             write_metadata(latest)
         super().closeEvent(event)
