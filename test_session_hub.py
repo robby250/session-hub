@@ -7709,5 +7709,96 @@ class SessionActivityTests(unittest.TestCase):
         self.assertEqual(tmux_calls[0][1], "list-sessions")
 
 
+# Real `tmux capture-pane -p -t VAMP-worker1` dump, 2026-08-29 -- a live Claude Code
+# session mid-tool-call. Ground truth for extract_last_meaningful_block, not a
+# hand-written approximation: the exact chrome shapes (border rules, bare prompt,
+# spinner-status line, permission footer, OSC8 hyperlink remnant) came from this pane.
+_CLAUDE_PANE_FIXTURE = (
+    "  Read 1 file, listed 1 directory, ran 3 shell commands\n"
+    "\n"
+    "● Gitignored build output isn't there; need to populate it and run import.\n"
+    "\n"
+    "● Running cd /tmp/vamp2149_old && XDG_DATA_HOME=$(mktemp -d… · 28s\n"
+    "  ⎿  $ cd /tmp/vamp2149_old && XDG_DATA_HOME=$(mktemp -d) timeout 180\n"
+    "     scripts/run_tool.sh --import 2>&1 | tail -15 (28s)\n"
+    "     (ctrl+b ctrl+b (twice) to run in background)\n"
+    "\n"
+    "· Bunning… (6m 41s · ↓ 22.0k tokens)\n"
+    "\n"
+    "● How is Claude doing this session? (optional)\n"
+    "  1: Bad    2: Fine   3: Good   0: Dismiss\n"
+    "\n"
+    "──────────────────────────────────────────────────────────────── VAMP-worker1 ─\n"
+    "❯\n"
+    "────────────────────────────────────────────────────────────────────────────────\n"
+    "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for ag…\n"
+    "                                                                           /rc\n"
+)
+
+# Synthetic Codex-style pane -- Codex CLI was not live on this host, so this fixture
+# exercises the STRUCTURAL rules (border rule, bare prompt, "Ctrl+C" footer phrase,
+# blank chrome) rather than any Codex-specific literal beyond the documented CLI hint
+# text, matching the brief's "only known ... borders, footers and blank chrome" limit.
+_CODEX_PANE_FIXTURE = (
+    "Applied patch to session_hub.py: added extract_last_meaningful_block.\n"
+    "\n"
+    "Running: python3 -m pytest test_session_hub.py -k pane_fixture\n"
+    "17 passed in 2.1s\n"
+    "\n"
+    "────────────────────────────────────────────────────────────────────────────────\n"
+    "> \n"
+    "────────────────────────────────────────────────────────────────────────────────\n"
+    "  Ctrl+C to interrupt · Ctrl+D to exit\n"
+)
+
+
+class ExtractLastMeaningfulBlockTests(unittest.TestCase):
+    def test_claude_pane_returns_the_running_tool_block_not_chrome(self):
+        block = session_hub.extract_last_meaningful_block(_CLAUDE_PANE_FIXTURE)
+        self.assertIn("Running cd /tmp/vamp2149_old", block)
+        self.assertIn("run_tool.sh --import", block)
+
+    def test_claude_pane_excludes_footer_border_prompt_and_spinner(self):
+        block = session_hub.extract_last_meaningful_block(_CLAUDE_PANE_FIXTURE)
+        self.assertNotIn("bypass permissions", block)
+        self.assertNotIn("VAMP-worker1", block)
+        self.assertNotIn("❯", block)
+        self.assertNotIn("Bunning", block)
+        self.assertNotIn("/rc", block)
+
+    def test_claude_pane_excludes_the_optional_rating_survey(self):
+        block = session_hub.extract_last_meaningful_block(_CLAUDE_PANE_FIXTURE)
+        self.assertNotIn("How is Claude doing", block)
+        self.assertNotIn("1: Bad", block)
+
+    def test_codex_pane_returns_the_test_result_block_not_chrome(self):
+        block = session_hub.extract_last_meaningful_block(_CODEX_PANE_FIXTURE)
+        self.assertIn("17 passed", block)
+        self.assertIn("pytest test_session_hub.py", block)
+
+    def test_codex_pane_excludes_footer_border_and_prompt(self):
+        block = session_hub.extract_last_meaningful_block(_CODEX_PANE_FIXTURE)
+        self.assertNotIn("Ctrl+C", block)
+        self.assertNotIn("─", block)
+        self.assertNotIn(">", block)
+
+    def test_empty_pane_returns_empty_string(self):
+        self.assertEqual(session_hub.extract_last_meaningful_block(""), "")
+
+    def test_chrome_only_pane_returns_empty_string(self):
+        chrome_only = "\n".join([
+            "────────────────────────────────────────────────────────────────",
+            "❯",
+            "────────────────────────────────────────────────────────────────",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt",
+        ])
+        self.assertEqual(session_hub.extract_last_meaningful_block(chrome_only), "")
+
+    def test_ansi_codes_are_stripped_before_filtering(self):
+        colored = "\x1b[38;5;231m● Something happened\x1b[39m\n\x1b[38;5;246m❯\x1b[39m\n"
+        block = session_hub.extract_last_meaningful_block(colored)
+        self.assertEqual(block, "● Something happened")
+
+
 if __name__ == "__main__":
     unittest.main()

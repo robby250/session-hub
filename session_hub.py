@@ -1173,6 +1173,73 @@ def strip_terminal_codes(text: str) -> str:
     return text.replace("\r", "\n")
 
 
+# task-2142: chrome patterns confirmed against a live `tmux capture-pane -p` dump of a
+# real running Claude Code session (VAMP-worker1, 2026-08-29) -- see the commit message
+# for the exact sample. Structural (border rules, blank lines, bare prompt carets,
+# spinner-status lines) rather than provider-specific text, so it also covers Codex's
+# equivalent box-drawn footer/border without needing a live Codex sample; the two
+# phrase lists below are the only provider-specific literals, both drawn from
+# documented CLI hint text, not guessed.
+_PANE_BORDER_RULE_RE = re.compile(r"^[─━═]{3,}(?:\s+\S.*)?[─━═]*$")
+_PANE_BARE_PROMPT_RE = re.compile(r"^[❯>▌]\s*$")
+# The spinner glyph cycles through several frames (✻, ∴, ✢, ✽, ·, braille dots, ...);
+# matching the shape -- a short leading glyph, a gerund ending in an ellipsis, then a
+# parenthesized "(Nm Ns · ... tokens)" stat block -- is more robust than an exhaustive
+# glyph whitelist, which a future spinner frame would silently fall through.
+_PANE_SPINNER_STATUS_RE = re.compile(r"^\S{1,2}\s+\S+…\s*\(.*\)$")
+_PANE_RATING_LINE_RE = re.compile(r"^(\d:\s+\S+\s*){2,}$")
+_PANE_FOOTER_PHRASES = (
+    "esc to interrupt", "shift+tab to cycle", "bypass permissions",
+    "for shortcuts", "ctrl+c to interrupt", "ctrl+c to exit", "to interrupt",
+)
+_PANE_KNOWN_CHROME_SUBSTRINGS = ("how is claude doing this session?",)
+
+
+def _is_pane_chrome_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    # An OSC8 hyperlink's visible remnant text (e.g. a trailing "/rc") renders on its
+    # own line in a plain `-p` capture; real content is never this short on its own.
+    if len(stripped) <= 3:
+        return True
+    if _PANE_BORDER_RULE_RE.match(stripped):
+        return True
+    if _PANE_BARE_PROMPT_RE.match(stripped):
+        return True
+    if _PANE_SPINNER_STATUS_RE.match(stripped):
+        return True
+    if _PANE_RATING_LINE_RE.match(stripped):
+        return True
+    lowered = stripped.lower()
+    if any(p in lowered for p in _PANE_FOOTER_PHRASES):
+        return True
+    if any(s in lowered for s in _PANE_KNOWN_CHROME_SUBSTRINGS):
+        return True
+    return False
+
+
+def extract_last_meaningful_block(raw_pane_text: str) -> str:
+    """The latest meaningful terminal-output block from a raw `tmux capture-pane -p`
+    dump: strips Claude/Codex prompt borders, footers, spinner-status and blank
+    chrome, then returns the last contiguous run of remaining lines (reading from the
+    bottom up, stopping at the first post-filter gap) joined by newlines. "" for a
+    pane with no meaningful content at all (fresh/empty session, chrome only).
+    """
+    lines = strip_terminal_codes(raw_pane_text).split("\n")
+    block: list[str] = []
+    started = False
+    for line in reversed(lines):
+        if _is_pane_chrome_line(line):
+            if started:
+                break
+            continue
+        block.append(line.rstrip())
+        started = True
+    block.reverse()
+    return "\n".join(block)
+
+
 def relative_reset_timestamp(value: str, now: datetime | None = None) -> str:
     hours = re.search(r"(\d+)\s*h", value)
     minutes = re.search(r"(\d+)\s*m", value)
