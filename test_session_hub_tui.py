@@ -12,10 +12,12 @@ JSON were right.
 """
 from __future__ import annotations
 
+import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from textual.app import App, ComposeResult
+from textual.widgets import TabbedContent
 
 import session_hub_tui
 
@@ -54,21 +56,22 @@ class MainPaneColumnsTests(unittest.IsolatedAsyncioTestCase):
             "groups": {},
         }
         pane = session_hub_tui.MainPane()
-        with patch.object(session_hub_tui, "sessions_json", return_value=fake_data):
-            app = _PaneHost(pane)
-            async with app.run_test() as pilot:
-                await pilot.pause()
-                table = pane.query_one("#main")
-                labels = _column_labels(table)
-                self.assertEqual(labels, ["Provider", "Name", "Working directory", "Session ID"])
-                self.assertNotIn("Status", labels)
-                self.assertNotIn("Last message", labels)
-                row = table.get_row_at(0)
-                self.assertNotIn("Working", row)
-                self.assertNotIn("writing the fix now", row)
-                self.assertIn("demo", row)
-                self.assertIn("/tmp/demo", row)
-                self.assertIn("id-1", row)
+        app = _PaneHost(pane)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            pane.apply_sessions(fake_data)
+            await pilot.pause()
+            table = pane.query_one("#main")
+            labels = _column_labels(table)
+            self.assertEqual(labels, ["Provider", "Name", "Working directory", "Session ID"])
+            self.assertNotIn("Status", labels)
+            self.assertNotIn("Last message", labels)
+            row = table.get_row_at(0)
+            self.assertNotIn("Working", row)
+            self.assertNotIn("writing the fix now", row)
+            self.assertIn("demo", row)
+            self.assertIn("/tmp/demo", row)
+            self.assertIn("id-1", row)
 
 
 class RunningPaneColumnsTests(unittest.IsolatedAsyncioTestCase):
@@ -89,17 +92,116 @@ class RunningPaneColumnsTests(unittest.IsolatedAsyncioTestCase):
             "groups": {},
         }
         pane = session_hub_tui.RunningPane()
-        with patch.object(session_hub_tui, "sessions_json", return_value=fake_data):
-            app = _PaneHost(pane)
+        app = _PaneHost(pane)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            pane.apply_sessions(fake_data)
+            await pilot.pause()
+            table = pane.query_one("#running")
+            labels = _column_labels(table)
+            self.assertIn("Status", labels)
+            self.assertIn("Last message", labels)
+            row = table.get_row_at(0)
+            self.assertIn("Needs input", row)
+            self.assertIn("approve the plan?", row)
+
+
+_FAKE_SESSIONS = {
+    "sessions": [
+        {
+            "is_group": False, "provider": "Claude", "title": "demo",
+            "cwd": "/tmp/demo", "session_id": "id-1", "key": "Claude:id-1",
+            "activity_label": "Idle", "activity_detail": "", "tmux": True,
+            "tmux_name": "demo", "status": "Running",
+        }
+    ],
+    "groups": {},
+}
+
+
+class SharedGenerationStartupTests(unittest.IsolatedAsyncioTestCase):
+    """task-2142: render shell first, one async fetch feeds both tabs."""
+
+    async def test_shell_renders_before_fetch_completes(self):
+        release = threading.Event()
+
+        def blocking_sessions_json():
+            release.wait(timeout=5)
+            return _FAKE_SESSIONS
+
+        with patch.object(session_hub_tui, "sessions_json", side_effect=blocking_sessions_json):
+            app = session_hub_tui.SessionHubTUI()
             async with app.run_test() as pilot:
                 await pilot.pause()
-                table = pane.query_one("#running")
-                labels = _column_labels(table)
-                self.assertIn("Status", labels)
-                self.assertIn("Last message", labels)
-                row = table.get_row_at(0)
-                self.assertIn("Needs input", row)
-                self.assertIn("approve the plan?", row)
+                # Shell (columns, an interactive empty table) is already up
+                # even though the fetch worker is still blocked.
+                main_table = app.query_one(session_hub_tui.MainPane).query_one("#main")
+                self.assertEqual(
+                    _column_labels(main_table),
+                    ["Provider", "Name", "Working directory", "Session ID"],
+                )
+                self.assertEqual(main_table.row_count, 0)
+
+                release.set()
+                for _ in range(20):
+                    await pilot.pause()
+                    if main_table.row_count:
+                        break
+                self.assertEqual(main_table.row_count, 1)
+
+    async def test_one_fetch_feeds_both_main_and_running_panes(self):
+        with patch.object(
+            session_hub_tui, "sessions_json", return_value=_FAKE_SESSIONS
+        ) as mock_fetch:
+            app = session_hub_tui.SessionHubTUI()
+            async with app.run_test() as pilot:
+                for _ in range(20):
+                    await pilot.pause()
+                    main_table = app.query_one(session_hub_tui.MainPane).query_one("#main")
+                    if main_table.row_count:
+                        break
+                self.assertEqual(mock_fetch.call_count, 1)
+                running_table = app.query_one(session_hub_tui.RunningPane).query_one("#running")
+                self.assertEqual(main_table.row_count, 1)
+                self.assertEqual(running_table.row_count, 1)
+
+    async def test_manual_refresh_error_leaves_prior_generation_intact(self):
+        with patch.object(
+            session_hub_tui, "sessions_json",
+            side_effect=[_FAKE_SESSIONS, {"status": "error", "message": "boom"}],
+        ):
+            app = session_hub_tui.SessionHubTUI()
+            async with app.run_test() as pilot:
+                main_table = app.query_one(session_hub_tui.MainPane).query_one("#main")
+                for _ in range(20):
+                    await pilot.pause()
+                    if main_table.row_count:
+                        break
+                self.assertEqual(main_table.row_count, 1)
+
+                notify_mock = app.notify = Mock()
+                await app.fetch_sessions().wait()
+                # The failed refresh reported an error and did not touch
+                # the table that already had the last good generation.
+                self.assertEqual(main_table.row_count, 1)
+                notify_mock.assert_called_once()
+                self.assertIn("boom", notify_mock.call_args.args[0])
+
+    async def test_usage_tab_does_no_work_until_opened(self):
+        with patch.object(session_hub_tui, "sessions_json", return_value=_FAKE_SESSIONS), \
+             patch.object(session_hub_tui, "usage_json", return_value={}) as mock_usage:
+            app = session_hub_tui.SessionHubTUI()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await pilot.pause()
+                mock_usage.assert_not_called()
+
+                app.query_one(TabbedContent).active = "usage"
+                for _ in range(20):
+                    await pilot.pause()
+                    if mock_usage.called:
+                        break
+                mock_usage.assert_called_once()
 
 
 if __name__ == "__main__":
