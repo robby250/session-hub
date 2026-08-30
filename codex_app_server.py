@@ -10,6 +10,8 @@ import os
 import secrets
 import signal
 import subprocess
+import socket
+import time
 from pathlib import Path
 
 SCHEMA_VERSION = 1
@@ -33,8 +35,11 @@ def remote_tui_argv(endpoint: Path, thread_id: str, cwd: str) -> list[str]:
 def publish_record(path: Path, *, row_id: str, endpoint: Path, thread_id: str, process: subprocess.Popen) -> dict:
     if path.exists():
         raise RuntimeError("Codex App Server owner record already exists")
+    start = process_start_time(process.pid)
+    if not start:
+        raise RuntimeError("Codex App Server has no process identity")
     record = {"schema": SCHEMA_VERSION, "row_id": row_id, "endpoint": str(endpoint),
-              "thread_id": thread_id, "pid": process.pid, "start_time": process_start_time(process.pid)}
+              "thread_id": thread_id, "pid": process.pid, "start_time": start}
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
     tmp.write_text(json.dumps(record, sort_keys=True) + "\n")
@@ -55,9 +60,12 @@ def live_record(path: Path, *, row_id: str) -> dict:
     if record.get("schema") != SCHEMA_VERSION or record.get("row_id") != row_id:
         raise RuntimeError("Codex App Server owner record mismatch")
     pid = int(record["pid"])
-    if process_start_time(pid) != record.get("start_time"):
+    if not record.get("start_time") or process_start_time(pid) != record.get("start_time"):
         raise RuntimeError("Codex App Server owner is stale or PID was reused")
-    if not Path(record["endpoint"]).exists():
+    endpoint = Path(record["endpoint"])
+    if endpoint.parent != REGISTRY_DIR and endpoint.parent != path.parent:
+        raise RuntimeError("Codex App Server endpoint is outside the owned registry")
+    if not endpoint.exists():
         raise RuntimeError("Codex App Server endpoint is unavailable")
     return record
 
@@ -67,3 +75,18 @@ def stop_owned(path: Path, *, row_id: str) -> None:
     os.kill(int(record["pid"]), signal.SIGTERM)
     Path(record["endpoint"]).unlink(missing_ok=True)
     path.unlink(missing_ok=True)
+
+
+def wait_ready(endpoint: Path, timeout: float = 5.0) -> bool:
+    """Handshake readiness: connect to the Unix endpoint before publication or TUI launch."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            peer.settimeout(0.25)
+            peer.connect(str(endpoint))
+            peer.close()
+            return True
+        except OSError:
+            time.sleep(0.05)
+    return False

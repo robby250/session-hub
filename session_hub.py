@@ -33,6 +33,7 @@ from datetime import date, datetime
 from pathlib import Path
 from codex_app_server import (
     REGISTRY_DIR, app_server_argv, endpoint_for, publish_record, remote_tui_argv,
+    stop_owned, wait_ready,
 )
 
 from PyQt6.QtCore import (
@@ -7981,6 +7982,9 @@ class SessionHub(QMainWindow):
             self.settings().pop("window_geometry", None)
 
     def closeEvent(self, event) -> None:
+        # task-2194 row518: the Hub owns every Codex App Server child; close tears down only
+        # records/endpoints it published, never an unrelated process or socket.
+        self.stop_all_codex_app_servers()
         # task-2170: undo installEventFilter(self) from __init__ -- an event filter installed on
         # the QApplication SINGLETON outlives this window unless explicitly removed, leaving a
         # dangling reference once this SessionHub instance is garbage collected (confirmed live:
@@ -10187,6 +10191,8 @@ class SessionHub(QMainWindow):
         server = subprocess.Popen(app_server_argv(endpoint, cwd), cwd=source_cwd or cwd)
         self._codex_app_servers[row_id] = (server, record_path)
         try:
+            if not wait_ready(endpoint):
+                raise RuntimeError("Codex App Server did not become ready")
             publish_record(record_path, row_id=row_id, endpoint=endpoint,
                            thread_id=session_id or "", process=server)
             terminal = shutil.which("gnome-terminal") or shutil.which("x-terminal-emulator")
@@ -10201,6 +10207,21 @@ class SessionHub(QMainWindow):
             endpoint.unlink(missing_ok=True)
             self._codex_app_servers.pop(row_id, None)
             raise
+
+    def stop_codex_app_server(self, row_id: str) -> None:
+        owned = self._codex_app_servers.pop(row_id, None)
+        if not owned:
+            return
+        process, record_path = owned
+        try:
+            stop_owned(record_path, row_id=row_id)
+        except (OSError, RuntimeError, ValueError):
+            process.terminate()
+            record_path.unlink(missing_ok=True)
+
+    def stop_all_codex_app_servers(self) -> None:
+        for row_id in list(self._codex_app_servers):
+            self.stop_codex_app_server(row_id)
 
     def _selected_search_member(self) -> tuple[str, str, str | None] | None:
         """(cwd, name, session_id) if the currently-selected All Sessions row is a search-
