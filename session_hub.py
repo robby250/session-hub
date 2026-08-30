@@ -7001,6 +7001,13 @@ class DeletedSessionsDialog(QDialog):
 
 class SessionHub(QMainWindow):
     SESSION_TABLE_COLUMNS = SESSION_TABLE_COLUMNS
+    # task-2169: two explicit flat settings keys, one per stable tab identity - never a
+    # single shared boolean (loses which tab it was for) and never an index-keyed array
+    # (its meaning would change if tab order ever changes).
+    USAGE_EXPANDED_SETTINGS_KEYS = {
+        "All Sessions": "usage_expanded_all_sessions",
+        "Running": "usage_expanded_running",
+    }
 
     def __init__(self) -> None:
         super().__init__()
@@ -7011,8 +7018,9 @@ class SessionHub(QMainWindow):
         self.usage_workers: dict[str, UsageWorker] = {}
         # task-2142: compact one-line usage summary (label + tiny bar per
         # enabled provider). The full per-window grid is now the "Expand"
-        # detail view, hidden until the user opens it - deliberately not a
-        # saved setting, so every launch starts compact.
+        # detail view, hidden until the user opens it. task-2169: expanded/
+        # collapsed is now remembered PER TAB (USAGE_EXPANDED_SETTINGS_KEYS) -
+        # a fresh install or a tab with no saved key still starts compact.
         self.usage_compact_labels: dict[str, QLabel] = {}
         self.usage_compact_bars: dict[str, QProgressBar] = {}
         self.thread_pool = QThreadPool.globalInstance()
@@ -7029,6 +7037,7 @@ class SessionHub(QMainWindow):
         self.resize(1280, 900)
         self.setMinimumSize(900, 650)
         self.build_ui()
+        self._apply_usage_expanded_for_tab(self.main_tabs.currentIndex())
         self.update_usage_visibility()
         self.update_new_provider_list()
         self.restore_window_geometry()
@@ -7067,7 +7076,11 @@ class SessionHub(QMainWindow):
             self.refresh_running_tab()
             self._check_embedded_terminal_liveness()
 
-    def _on_main_tab_changed(self, _index: int) -> None:
+    def _on_main_tab_changed(self, index: int) -> None:
+        # task-2169: apply (never persist) the destination tab's own remembered
+        # expand/collapse state before anything else - reading source tab's
+        # preference must never leak onto Running, or vice versa.
+        self._apply_usage_expanded_for_tab(index)
         # Refresh immediately on becoming visible instead of leaving the table up to
         # 2s stale after a tab switch -- cheap (one refresh), and it's exactly the
         # moment a capture is now worth paying for. refresh_running_tab() reapplies
@@ -7418,16 +7431,35 @@ class SessionHub(QMainWindow):
                 self.usage_compact_labels[provider].setVisible(enabled)
                 self.usage_compact_bars[provider].setVisible(enabled)
 
-    def set_usage_expanded(self, expanded: bool) -> None:
-        """Transient only - never written to settings, so every fresh
-        launch (or window reload) starts back in the compact view. Mutual
-        exclusion both directions (task-2142 row453 REWORK -- orchestrator
-        visual REWORK): expanding hides the compact strip entirely (labels,
-        bars, Expand button) so only the detailed per-window bars remain;
-        collapsing (via the button living inside the expanded panel's own
-        header) restores only the compact strip."""
+    def _usage_expanded_settings_key(self, tab_index: int | None = None) -> str | None:
+        if tab_index is None:
+            tab_index = self.main_tabs.currentIndex()
+        return SessionHub.USAGE_EXPANDED_SETTINGS_KEYS.get(self.main_tabs.tabText(tab_index))
+
+    def _apply_usage_expanded_for_tab(self, tab_index: int) -> None:
+        """Read-only: applies TAB_INDEX's remembered expand/collapse state to the
+        (single, shared-across-tabs) usage panel widgets. Never writes settings - a tab
+        switch must only ever READ the destination's own key, never touch either key's
+        stored value (task-2169). A missing or non-bool (malformed) value fails closed
+        to compact, independently per tab."""
+        key = self._usage_expanded_settings_key(tab_index)
+        expanded = self.settings().get(key) is True if key else False
         self.usage_detail_frame.setVisible(expanded)
         self.usage_compact_row.setVisible(not expanded)
+
+    def set_usage_expanded(self, expanded: bool) -> None:
+        """Expand/Collapse click handler. Persists EXPANDED under the currently visible
+        tab's own settings key only (task-2169) - the other tab's stored preference is
+        untouched. Mutual exclusion both directions (task-2142 row453 REWORK --
+        orchestrator visual REWORK): expanding hides the compact strip entirely (labels,
+        bars, Expand button) so only the detailed per-window bars remain; collapsing (via
+        the button living inside the expanded panel's own header) restores only the
+        compact strip."""
+        self.usage_detail_frame.setVisible(expanded)
+        self.usage_compact_row.setVisible(not expanded)
+        key = self._usage_expanded_settings_key()
+        if key:
+            self.settings()[key] = expanded
 
     def update_new_provider_list(self) -> None:
         settings = self.settings()
