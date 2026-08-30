@@ -9441,6 +9441,18 @@ class EmbeddedTerminalControllerTests(unittest.TestCase):
         self.assertIn("map", detail)
         self.assertIsNone(ctl.process)  # failed attach detaches, same as a resize failure
 
+    def test_focus_grab_failure_fails_closed(self):
+        """VAM-reviewer REWORK (task-2166 row482): finish_attach used to discard focus()'s
+        return value, so a real X11 focus error (map/resize/XID all fine) still reported a
+        successful attach while leaving the embed unable to receive keys."""
+        embedder = _FakeEmbedder(focus_fails=True)
+        ctl, _calls, _embedder, _container = self._controller(embedder=embedder)
+        ok, detail = ctl.attach("a")
+        self.assertFalse(ok)
+        self.assertIn("focus", detail)
+        self.assertIsNone(ctl.process)  # failed attach detaches, same as a map/resize failure
+        self.assertFalse(ctl._holds_focus)
+
     def test_detach_terminates_the_helper_only_never_tmux(self):
         ctl, _calls, _embedder, _container = self._controller()
         ctl.attach("a")
@@ -9912,6 +9924,27 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
             "/tmp/vampembed", "vamp-embed", "id-embed1", tmux_name="vamp-embed"
         )
 
+    def test_focus_grab_failure_shows_in_panel_and_falls_back_externally(self):
+        """VAM-reviewer REWORK (task-2166 row482, finding 1): a failed X11 focus grab must fail
+        the attach through the SAME production path (window._embedded_terminal, the real
+        EmbeddedTerminalController) and trigger the same external fallback a map/paint failure
+        does -- not report success while leaving the embed unusable."""
+        window = self._window_with_one_running_session()
+        item = window.running_table.item(0, 0)
+        self._wire_fake_embedding(window, embedder=_FakeEmbedder(focus_fails=True))
+        with (
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+            patch.object(window, "_focus_or_resume_session") as focus_mock,
+        ):
+            window._activate_running_row(item)
+        self.assertEqual(
+            window._running_terminal_stack.currentWidget(), window.running_terminal_failure
+        )
+        self.assertIn("focus", window.running_terminal_failure.text())
+        focus_mock.assert_called_once_with(
+            "/tmp/vampembed", "vamp-embed", "id-embed1", tmux_name="vamp-embed"
+        )
+
     def test_verify_embed_painted_false_shows_failure_and_falls_back_externally(self):
         """task-2156 REWORK finding 1 control: a confirmed-blank sample fails closed."""
         window = self._window_with_one_running_session()
@@ -10319,8 +10352,18 @@ class EmbeddedTerminalXvfbSmokeTest(unittest.TestCase):
         and no explicit XSetInputFocus anywhere in this embed). Proves the real fix end to end --
         real Gtk.Plug helper, real tmux pane, real `xdotool`-injected X11 KeyPress events -- with
         the pointer parked far from the child the whole time, then a negative control modeling
-        "the user deliberately focused another widget" at the same raw-window-id boundary
-        EmbeddedTerminalController.release_focus() operates at."""
+        "the user deliberately focused another widget".
+
+        VAM-reviewer REWORK (task-2166 row482, finding 2): drives the attach and the refocus
+        through the real production `EmbeddedTerminalController` (`begin_attach`/`finish_attach`/
+        `release_focus`), not raw `embedder.set_input_focus()` calls -- so this also proves
+        finish_attach's own focus() call (and its now-fail-closed handling, see finding 1) against
+        real X11, not just the primitive underneath it. A real Qt `QApplication`/`SessionHub`
+        can't run against this class's private Xvfb DISPLAY (it would pick up the process's own
+        real display instead), so `_on_qt_focus_changed`'s signal wiring stays covered by the
+        existing fake-embedder unit test (`test_qt_focus_changed_to_another_widget_releases_the_
+        embed_focus`); this proves the real-X11 half only `EmbeddedTerminalController` itself
+        touches: `finish_attach`'s own `focus()` call, and `release_focus`."""
         focus_session = "row482-xvfb-focus"
         subprocess.run(["tmux", "new-session", "-d", "-s", focus_session], check=True, env=self.env)
         self.addCleanup(lambda: subprocess.run(
@@ -10334,27 +10377,39 @@ class EmbeddedTerminalXvfbSmokeTest(unittest.TestCase):
         self.disp.sync()
         self.addCleanup(socket_win.destroy)
 
-        helper = str(Path(__file__).resolve().parent / "vte_embed_helper.py")
-        proc = subprocess.Popen(
-            [sys.executable, helper, "--socket-id", str(socket_win.id),
-             "--tmux-session", focus_session],
-            stdout=subprocess.PIPE, text=True, bufsize=1, env=self.env,
-        )
-        self.addCleanup(lambda: (proc.terminate(), proc.wait(timeout=5)))
-        ready, _, _ = select.select([proc.stdout], [], [], 10.0)
-        self.assertTrue(ready, "helper never reported an XID within 10s")
-        child_id = int(proc.stdout.readline().strip().split("=", 1)[1])
-
-        embedder = session_hub._EmbedWindowResizer(display_factory=lambda: self.disp)
-        self.assertTrue(embedder.map_child(child_id))
-        self.disp.sync()
-
         # Another real X window standing in for "a different Qt widget's own toplevel" -- the
         # exact raw-window-id boundary EmbeddedTerminalController.release_focus() operates at.
         other_win = root.create_window(400, 0, 100, 100, 0, self.disp.screen().root_depth)
         other_win.map()
         self.disp.sync()
         self.addCleanup(other_win.destroy)
+
+        def real_popen(argv, **kwargs):
+            # The one seam this class must override: the real production `begin_attach` never
+            # takes an `env` kwarg (it inherits this PROCESS's environment), but the helper must
+            # connect to THIS class's private Xvfb DISPLAY, not whatever the test runner has.
+            return subprocess.Popen(
+                argv, stdout=subprocess.PIPE, text=True, bufsize=1, env=self.env,
+            )
+
+        ctl = session_hub.EmbeddedTerminalController(
+            _FakeWinIdContainer(socket_win.id, 300, 200),
+            popen=real_popen,
+            platform_name=lambda: "xcb",
+            embedder=session_hub._EmbedWindowResizer(display_factory=lambda: self.disp),
+            helper_ready=lambda: True,
+            profile_uuid=lambda: None,
+        )
+        self.addCleanup(ctl.detach)
+
+        ok, reason = ctl.begin_attach(focus_session)
+        self.assertTrue(ok, reason)
+        ready, _, _ = select.select([ctl.process.stdout], [], [], 10.0)
+        self.assertTrue(ready, "helper never reported an XID within 10s")
+        line = ctl.process.stdout.readline()
+        ok, detail = ctl.finish_attach(line)
+        self.assertTrue(ok, detail)  # real map_child + real focus() both succeeded
+        self.assertTrue(ctl._holds_focus)
 
         def type_into_display(text: str) -> None:
             subprocess.run(
@@ -10370,7 +10425,6 @@ class EmbeddedTerminalXvfbSmokeTest(unittest.TestCase):
             )
             return result.stdout
 
-        self.assertTrue(embedder.set_input_focus(child_id))
         # Parked far from the child for the rest of the test -- the fix is that keyboard focus
         # no longer depends on pointer position at all.
         subprocess.run(
@@ -10391,7 +10445,8 @@ class EmbeddedTerminalXvfbSmokeTest(unittest.TestCase):
         # Explicit refocus elsewhere -- SessionHub._on_qt_focus_changed's release-back moment --
         # must stop keys from arriving; no race to poll for here, since a key event delivered to
         # the wrong (or no) window never renders in this pane at all, ever.
-        self.assertTrue(embedder.set_input_focus(other_win.id))
+        ctl.release_focus(other_win.id)
+        self.assertFalse(ctl._holds_focus)
         marker2 = "VAMP_FOCUS_PROOF_SHOULD_NOT_ARRIVE"
         type_into_display(marker2)
         self.assertNotIn(marker2, pane_text())

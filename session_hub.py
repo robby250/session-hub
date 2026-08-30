@@ -1488,7 +1488,12 @@ class EmbeddedTerminalController:
             return False, "failed to map the embedded terminal's window"
         self.current_name = name
         self._child_winid = child_winid
-        self.focus()
+        if not self.focus():
+            # A mapped, painted child the user can never type into is as unusable as a failed
+            # map/resize -- fail closed the same way (VAM-reviewer REWORK, task-2166 row482:
+            # this used to discard focus()'s result and report success regardless).
+            self.detach()
+            return False, "failed to focus the embedded terminal's window"
         return True, "attached"
 
     def attach(self, name: str) -> tuple[bool, str]:
