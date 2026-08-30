@@ -2946,7 +2946,11 @@ def linked_aware_sessions(sessions: list["Session"], links: dict) -> list["Sessi
     ] + active_sessions
 
 
-def group_row_candidates(metadata: dict, settings: dict) -> list[Session]:
+def group_row_candidates(
+    metadata: dict,
+    settings: dict,
+    tmux_owner_by_native_key: dict[str, str] | None = None,
+) -> list[Session]:
     """Every enabled-provider live session, link-aware - the pool a saved
     group row's identity must be resolved against. Never call
     claude_sessions()/codex_sessions() directly for a group-row match: a
@@ -2962,6 +2966,10 @@ def group_row_candidates(metadata: dict, settings: dict) -> list[Session]:
         live += codex_sessions()
     if settings.get("enable_antigravity", True):
         live += antigravity_sessions()
+    if resolve_pending_codex_group_rows(
+        metadata, live, tmux_owner_by_native_key=tmux_owner_by_native_key
+    ):
+        write_metadata(metadata)
     links = metadata.get("links", {})
     before = {key: link.get("active") for key, link in links.items()}
     candidates = linked_aware_sessions(live, links)
@@ -2974,7 +2982,12 @@ def group_row_candidates(metadata: dict, settings: dict) -> list[Session]:
     return candidates
 
 
-def resolve_pending_codex_group_rows(metadata: dict, sessions: list[Session]) -> bool:
+def resolve_pending_codex_group_rows(
+    metadata: dict,
+    sessions: list[Session],
+    *,
+    tmux_owner_by_native_key: dict[str, str] | None = None,
+) -> bool:
     """Bind newly launched Codex group rows to their exact tmux transcript.
 
     Codex has no --name flag, but its process keeps the rollout JSONL open.
@@ -2992,7 +3005,17 @@ def resolve_pending_codex_group_rows(metadata: dict, sessions: list[Session]) ->
                 # Resolve every pending row before mutating metadata.  This makes duplicate
                 # exact-name/key claims a cluster we can reject as a unit, never a row-order race.
                 name = sanitize_tmux_session_name(row.get("name", ""))
-                pending.append((row, name, codex_tmux_native_key(name)))
+                if tmux_owner_by_native_key is None:
+                    native_key = codex_tmux_native_key(name)
+                else:
+                    # The caller's one batched census is authoritative; do not spawn
+                    # one list-panes subprocess per pending row on a refresh/action path.
+                    native_key = next(
+                        (key for key, owner_name in tmux_owner_by_native_key.items()
+                         if owner_name == name),
+                        None,
+                    )
+                pending.append((row, name, native_key))
             elif row.get("session_key"):
                 existing_owners.setdefault(row["session_key"], []).append(row)
 
@@ -3012,7 +3035,9 @@ def resolve_pending_codex_group_rows(metadata: dict, sessions: list[Session]) ->
         if any(owner is not row for owner in prior):
             # A pending launch cannot steal a key already owned by another saved row.
             continue
-        match = pending_codex_exact_owner(row, by_key)
+        match = pending_codex_exact_owner(
+            row, by_key, tmux_owner_by_native_key=tmux_owner_by_native_key
+        )
         if match is None:
             continue
         row["session_key"] = native_key
@@ -3021,7 +3046,12 @@ def resolve_pending_codex_group_rows(metadata: dict, sessions: list[Session]) ->
     return changed
 
 
-def pending_codex_exact_owner(row: dict, by_key: dict[str, Session]) -> Session | None:
+def pending_codex_exact_owner(
+    row: dict,
+    by_key: dict[str, Session],
+    *,
+    tmux_owner_by_native_key: dict[str, str] | None = None,
+) -> Session | None:
     """Resolve a pending row only through its exact live tmux/native owner.
 
     A same-cwd transcript, recency, metadata order, or display-name similarity is deliberately
@@ -3030,7 +3060,15 @@ def pending_codex_exact_owner(row: dict, by_key: dict[str, Session]) -> Session 
     """
     if row.get("provider") != "Codex" or not row.get("codex_pending_since"):
         return None
-    native_key = codex_tmux_native_key(sanitize_tmux_session_name(row.get("name", "")))
+    row_name = sanitize_tmux_session_name(row.get("name", ""))
+    if tmux_owner_by_native_key is None:
+        native_key = codex_tmux_native_key(row_name)
+    else:
+        native_key = next(
+            (key for key, owner_name in tmux_owner_by_native_key.items()
+             if owner_name == row_name),
+            None,
+        )
     if native_key is None:
         return None
     match = by_key.get(native_key)
@@ -6718,13 +6756,16 @@ class ManageGroupDialog(QDialog):
         # this on their own), which is how a row whose provider was
         # overtaken by a linked continuation in another provider still
         # matches here.
-        live = group_row_candidates(self.hub.metadata, self.hub.settings())
         # One-shot dialog action, not a polled refresh - a fresh census here is fine (task-2171)
         # and lets group management show the same census-arbitrated owner the Running tab does,
         # rather than failing every duplicate closed the way the no-census discover_sessions
         # pass must.
+        tmux_owner_by_native_key = compute_codex_tmux_owner_census()
+        live = group_row_candidates(
+            self.hub.metadata, self.hub.settings(), tmux_owner_by_native_key
+        )
         codex_losers = codex_duplicate_row_losers(
-            group.get("rows", []), compute_codex_tmux_owner_census()
+            group.get("rows", []), tmux_owner_by_native_key
         )
         pairs = []
         claimed: set[str] = set()
@@ -7041,8 +7082,10 @@ class ManageGroupDialog(QDialog):
             # removed, nothing looks in that bucket anymore - so without this,
             # the session silently reverts to defaults (e.g. loses "launch as
             # opus") the moment it leaves the group.
-            provider = row.get("provider", "Claude")
-            candidates = claude_sessions() if provider == "Claude" else codex_sessions()
+            tmux_owner_by_native_key = compute_codex_tmux_owner_census()
+            candidates = group_row_candidates(
+                self.hub.metadata, self.hub.settings(), tmux_owner_by_native_key
+            )
             match = find_group_member_session(row, self.cwd, candidates)
             if match:
                 overrides = self.hub.metadata.setdefault("sessions", {})
@@ -8603,6 +8646,10 @@ class SessionHub(QMainWindow):
         # that moves to a different live tmux session is re-resolved on the very
         # next tick and no stale owner can survive into it (replacement control).
         tmux_name_by_native_key = compute_codex_tmux_owner_census()
+        if resolve_pending_codex_group_rows(
+            self.metadata, live, tmux_owner_by_native_key=tmux_name_by_native_key
+        ):
+            write_metadata(self.metadata)
         # task-2171: the SAME census also arbitrates duplicate Codex session_key rows across
         # every group in one in-memory pass, so metadata order never decides the winner.
         all_group_rows = [
@@ -10295,6 +10342,12 @@ class SessionHub(QMainWindow):
             live_sessions += codex_sessions()
         if settings.get("enable_antigravity", True):
             live_sessions += antigravity_sessions()
+        tmux_owner_by_native_key = compute_codex_tmux_owner_census()
+        if resolve_pending_codex_group_rows(
+            self.metadata, live_sessions,
+            tmux_owner_by_native_key=tmux_owner_by_native_key,
+        ):
+            write_metadata(self.metadata)
         failures = []
         for row in group.get("rows", []):
             live = find_group_member_session(row, cwd, live_sessions)
@@ -10815,12 +10868,6 @@ class SessionHub(QMainWindow):
         # `has-session -t "=name" || new-session ...; attach -t "=name"` script attaches to an
         # existing session instead of erroring, never spawning a duplicate.
 
-        # A pending marker only describes the process that was just launched.
-        # If its tmux row is gone, it is stale and must not mask the row's
-        # saved history or cause another orphan transcript on this click.
-        if provider == "Codex" and row.pop("codex_pending_since", None) is not None:
-            write_metadata(self.metadata)
-
         # A saved row is a persistent conversation. Reopening it after a
         # reboot must resume its history; a row that has never run (added
         # via "Add new…", never yet launched) has none, and history is
@@ -10830,13 +10877,22 @@ class SessionHub(QMainWindow):
         # it was saved under has no history under its OWN provider at all,
         # which used to fall through to "no history" and start a duplicate
         # fresh conversation instead of resuming the real one.
-        candidates = group_row_candidates(self.metadata, self.settings())
+        tmux_owner_by_native_key = compute_codex_tmux_owner_census()
+        candidates = group_row_candidates(
+            self.metadata, self.settings(), tmux_owner_by_native_key
+        )
+        # A pending marker only describes the process that was just launched.
+        # Repair ran above against this path's shared census before clearing it;
+        # if its exact tmux owner is gone, the marker is stale and must not mask
+        # the row's saved history or cause another orphan transcript on this click.
+        if provider == "Codex" and row.pop("codex_pending_since", None) is not None:
+            write_metadata(self.metadata)
         # task-2171: a Codex row that shares its saved session_key with a sibling never gets
         # treated as having history unless the fresh tmux census says THIS row's saved name is
         # the key's real live owner - otherwise a Launch click on the losing sibling would
         # silently attach to (and control) the other row's live conversation.
         codex_losers = codex_duplicate_row_losers(
-            group.get("rows", []), compute_codex_tmux_owner_census()
+            group.get("rows", []), tmux_owner_by_native_key
         )
         history = (
             None
@@ -10925,12 +10981,15 @@ class SessionHub(QMainWindow):
         # the row's stored (possibly stale) native key literally instead of
         # a link's current target, which is the "resume opens an older
         # linked rollout" bug this row exists to fix.
-        candidates = group_row_candidates(self.metadata, self.settings())
+        tmux_owner_by_native_key = compute_codex_tmux_owner_census()
+        candidates = group_row_candidates(
+            self.metadata, self.settings(), tmux_owner_by_native_key
+        )
         # task-2171: same census-arbitrated duplicate guard as launch_group_row - a Codex row
         # that loses a duplicate session_key tie is never resumed onto its sibling's live
         # conversation, regardless of what a plain exact-key match below would otherwise find.
         codex_losers = codex_duplicate_row_losers(
-            group.get("rows", []), compute_codex_tmux_owner_census()
+            group.get("rows", []), tmux_owner_by_native_key
         )
         live = (
             None
@@ -11326,6 +11385,10 @@ def sessions_json_cli() -> int:
     # TUI/JSON path stops reading a live-but-externally-renamed row as Stopped/
     # unknown too (the brief names this path explicitly).
     tmux_name_by_native_key = compute_codex_tmux_owner_census()
+    if resolve_pending_codex_group_rows(
+        metadata, live, tmux_owner_by_native_key=tmux_name_by_native_key
+    ):
+        write_metadata(metadata)
     # task-2171: the SAME census arbitrates duplicate Codex session_key rows across every
     # group in one in-memory pass, matching refresh_running_tab exactly.
     codex_losers = codex_duplicate_row_losers(
