@@ -34,8 +34,8 @@ _TEST_XDG_DATA_HOME = tempfile.mkdtemp(prefix="session-hub-test-xdg-")
 os.environ["XDG_DATA_HOME"] = _TEST_XDG_DATA_HOME
 atexit.register(shutil.rmtree, _TEST_XDG_DATA_HOME, ignore_errors=True)
 
-from PyQt6.QtCore import QPoint
-from PyQt6.QtGui import QResizeEvent
+from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
+from PyQt6.QtGui import QMouseEvent, QResizeEvent
 from PyQt6.QtWidgets import QApplication, QMenuBar
 
 import session_hub
@@ -10469,49 +10469,56 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
         """task-2166 EXIT precedence control: a real Qt widget gaining focus (the user
         deliberately selecting it) must hand X11 focus back to Session Hub's own window --
         modeled at the same boundary this code operates at (a raw window id), matching how the
-        Xvfb integration test proves it against real X11. task-2170: this is now the SETTLED
-        case -- the event loop is pumped once (draining the deferred rearm) between attach and
-        the later focus change, modeling a genuinely later, separate user interaction."""
+        Xvfb integration test proves it against real X11. task-2170 (reworked per reviewer
+        REWORK on 62d4fd9f64e2): the serial boundary can only be advanced by a real, spontaneous
+        Qt input event (eventFilter, proven separately against a real WM in
+        RealDesktopFocusHandoffTest) -- at this fake-embedder unit level, bumping
+        `_qt_interaction_serial` directly is the legitimate way to model "a genuine interaction
+        already happened", exactly the way _wire_fake_embedding substitutes injected seams for
+        the real subprocess/X11 calls this same test already relies on."""
         window = self._window_with_one_running_session()
         item = window.running_table.item(0, 0)
         _calls, embedder = self._wire_fake_embedding(window)
         with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
             window._activate_running_row(item)
-        QApplication.processEvents()  # drains the deferred _arm_embed_focus_watch
+        window._qt_interaction_serial += 1  # models a genuine later interaction
         embedder.focus_calls.clear()
         window._on_qt_focus_changed(None, window.running_table)
         self.assertEqual(embedder.focus_calls, [int(window.winId())])
 
     def test_qt_focus_changed_immediately_after_attach_does_not_release(self):
-        """task-2170: the positive regression -- a focusChanged arriving in the SAME event-loop
-        turn the attach's own focus() grab completed (before the deferred rearm has run) must be
-        ignored, not released. This is exactly what a window-manager focus bounce-back
-        immediately following our XSetInputFocus call looks like, and is indistinguishable at
-        this signal from the click/activation that started the attach itself. Fails on row482's
-        landed implementation, which released unconditionally on any `now is not None`."""
+        """task-2170 (reworked per reviewer REWORK on 62d4fd9f64e2): the positive regression --
+        a focusChanged arriving with NO genuine interaction serial advance since the attach's own
+        focus() grab (exactly what a window-manager bounce reacting to that very grab looks like,
+        with no real input event behind it at all) must be ignored, not released -- regardless of
+        how many event-loop turns pass, since there is no timer/settle window anymore. Fails on
+        row482's landed implementation, which released unconditionally on any `now is not None`."""
         window = self._window_with_one_running_session()
         item = window.running_table.item(0, 0)
         _calls, embedder = self._wire_fake_embedding(window)
         with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
             window._activate_running_row(item)
-        # Deliberately NOT pumping the event loop here -- the deferred rearm has not run yet.
         embedder.focus_calls.clear()
+        # No genuine interaction since the grab -- must not release, even after pumping the loop
+        # (there is nothing time-based left to drain).
+        QApplication.processEvents()
         window._on_qt_focus_changed(None, window.running_table)
         self.assertEqual(embedder.focus_calls, [])
-        # Once the event loop actually drains, the watch arms and a later change still releases.
-        QApplication.processEvents()
+        # A genuine later interaction (serial advance) still releases.
+        window._qt_interaction_serial += 1
         window._on_qt_focus_changed(None, window.running_table)
         self.assertEqual(embedder.focus_calls, [int(window.winId())])
 
     def test_qt_focus_changed_immediately_after_reselect_does_not_release(self):
         """task-2170: same regression as above, for the OTHER real focus()-grabbing path -- the
-        re-select-an-already-attached-row short-circuit in _switch_embedded_terminal."""
+        re-select-an-already-attached-row short-circuit in _switch_embedded_terminal. Re-clicking
+        the same row is itself a real interaction, but _note_embed_focus_grabbed's snapshot is
+        taken AFTER that click's own serial bump, so it can never satisfy the later '>' alone."""
         window = self._window_with_one_running_session()
         item = window.running_table.item(0, 0)
         _calls, embedder = self._wire_fake_embedding(window)
         with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
             window._activate_running_row(item)
-            QApplication.processEvents()
             window._activate_running_row(item)  # already attached -- refocus short-circuit
         embedder.focus_calls.clear()
         window._on_qt_focus_changed(None, window.running_table)
@@ -10529,6 +10536,24 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
         embedder.focus_calls.clear()
         window._on_qt_focus_changed(window.running_table, None)
         self.assertEqual(embedder.focus_calls, [])
+
+    def test_event_filter_ignores_non_spontaneous_mouse_and_key_events(self):
+        """task-2170: eventFilter must only bump `_qt_interaction_serial` for
+        `event.spontaneous()` events -- real X11-originated input, not something the app posted
+        to itself. Every QEvent constructed directly in Python (as this test and QTest's own
+        synthetic events do) is non-spontaneous by construction, which is exactly why the boundary
+        this gates cannot be proven end-to-end without a real window system -- see
+        RealDesktopFocusHandoffTest. This only proves the gate itself is active: a directly
+        constructed press event must never advance the serial."""
+        window = self._window_with_one_running_session()
+        before = window._qt_interaction_serial
+        press = QMouseEvent(
+            QEvent.Type.MouseButtonPress, QPointF(1, 1), Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        )
+        self.assertFalse(press.spontaneous())
+        window.eventFilter(window.running_table, press)
+        self.assertEqual(window._qt_interaction_serial, before)
 
     def test_embedding_failure_shows_in_panel_and_falls_back_externally(self):
         window = self._window_with_one_running_session()
@@ -11092,6 +11117,285 @@ class EmbeddedTerminalXvfbSmokeTest(unittest.TestCase):
         type_into_display(marker2)
         self.assertNotIn(marker2, pane_text())
 
+
+_REAL_FOCUS_HANDOFF_DRIVER = r'''
+import json, subprocess, sys, time
+sys.path.insert(0, "%%SESSION_HUB_DIR%%")
+from PyQt6.QtWidgets import QApplication
+import session_hub as sh
+
+TMUX = "%%TMUX_SESSION%%"
+
+# Never let this driver touch anything real -- same class of incident the module-level
+# XDG_DATA_HOME sandbox atop this file guards against (task-2134), just for a subprocess instead
+# of this test's own interpreter.
+sh.SessionHub.refresh_usage = lambda self: None
+sh.SessionHub._prewarm_manage_group_dialog = lambda self: None
+sh.codex_sessions = lambda *a, **k: []
+sh.claude_sessions = lambda *a, **k: []
+sh.antigravity_sessions = lambda *a, **k: []
+sh.METADATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+sh.METADATA_PATH.write_text(json.dumps({"sessions": {}, "settings": {}, "groups": {}, "links": {}}))
+
+app = QApplication(sys.argv)
+window = sh.SessionHub()
+window._status_timer.stop()
+window.resize(500, 400)
+window.move(0, 0)
+window.show()
+
+
+def pump(seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+
+
+def xdotool(*args):
+    subprocess.run(["xdotool", *args], check=True, timeout=5)
+
+
+def pane_text():
+    out = subprocess.run(
+        ["tmux", "capture-pane", "-p", "-t", TMUX], capture_output=True, text=True, check=True,
+    )
+    return out.stdout
+
+
+def simulate_wm_bounce(toplevel_winid):
+    """A REAL, separate OS process issues a real XSetInputFocus onto this SessionHub's own
+    real toplevel window, shortly after this process's own grab -- an attempt at the exact class
+    of external X11 activity the reviewer's finding describes ("the WM bounce emits
+    focusChanged(old, non-None)"). Investigated live against this harness: PyQt6's xcb backend
+    was NOT observed to surface this externally-injected FocusIn as a `QApplication.focusChanged`
+    signal within the settle window, so this is real extra stress during exactly that window, not
+    a proven trigger for the bug row482 had -- the decisive proof in this class is the real
+    attach's own settle window surviving, plus the real later explicit click correctly releasing.
+    A wholly separate process (its own Xlib connection, no state shared with this driver's own
+    SessionHub/_EmbedWindowResizer) -- never this process's own Xlib connection, and never the
+    outer test's -- so this can never trigger the real-SessionHub + same-process-Xlib hard abort
+    this class's own docstring warns about."""
+    subprocess.Popen(
+        [sys.executable, "-c",
+         "import time; time.sleep(0.3); from Xlib import display, X; "
+         f"d = display.Display(); w = d.create_resource_object('window', {toplevel_winid}); "
+         "d.set_input_focus(w, X.RevertToParent, X.CurrentTime); d.sync()"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+# The embed container's native window is only actually mapped/viewable while its tab is the
+# CURRENT one (an inactive QTabWidget page never maps its children's X windows) -- an unmapped
+# ancestor is exactly what turns the real X11 SetInputFocus call in focus() into a BadMatch
+# instead of a real focus grab, confirmed live against this harness. window.search is given a
+# deterministic starting Qt logical-focus widget (non-spontaneous, no serial bump) so the later
+# "explicit interaction" click below is guaranteed to land on a genuinely DIFFERENT widget and
+# therefore genuinely change QApplication's focus widget -- window.search already holds Qt's
+# logical focus from the moment the window is first shown (its own default tab-order focus), so
+# clicking it again produces no NEW focusChanged at all.
+window.main_tabs.setCurrentWidget(window.running_page)
+window.search.setFocus()
+pump(0.5)
+
+# Real WM readiness: wait until the real WM has actually mapped/activated this real top-level
+# window, not a fixed sleep -- xdotool getactivewindow only succeeds once a WM is managing focus.
+deadline = time.monotonic() + 10.0
+active = False
+while time.monotonic() < deadline:
+    pump(0.1)
+    probe = subprocess.run(["xdotool", "getactivewindow"], capture_output=True, timeout=5)
+    if probe.returncode == 0:
+        active = True
+        break
+result = {"wm_active_before_attach": active}
+
+try:
+    window._switch_embedded_terminal(TMUX, TMUX, None, saved_name=TMUX)
+    pump(6.0)  # async attach: begin_attach's popen + _await_embed_xid's QSocketNotifier read
+    result["attached"] = bool(window._embedded_terminal._holds_focus)
+    simulate_wm_bounce(int(window.winId()))
+
+    # "let queued Qt focus events drain" (the brief's own wording) -- exactly where the real
+    # bounce-back above (or a real window manager's own equivalent) arrives.
+    pump(2.0)
+    result["holds_focus_after_settle"] = bool(window._embedded_terminal._holds_focus)
+
+    # Parked OUTSIDE the 500x400 window entirely (not merely away from the embed within it) --
+    # any coordinate still inside the window risks X's PointerRoot focus-follows-pointer default
+    # silently rescuing a broken explicit-focus grab, exactly the row482/task-2166 bug this whole
+    # mechanism replaces; only a point truly outside proves the explicit grab, not proximity.
+    xdotool("mousemove", "--sync", "780", "590")
+    marker1 = "VAMP_ROW489_MARKER_ONE"
+    xdotool("type", "--clearmodifiers", "--", marker1)
+    time.sleep(0.4)
+    pump(0.4)
+    result["pane_after_marker_one"] = pane_text()
+
+    # A REAL later explicit Qt interaction: click the Running table -- a widget genuinely
+    # different from window.search's deterministic starting focus above, so this real click
+    # produces a real focusChanged the fix must act on.
+    table_center = window.running_table.mapToGlobal(window.running_table.rect().center())
+    xdotool("mousemove", "--sync", str(table_center.x()), str(table_center.y()))
+    xdotool("click", "1")
+    pump(1.0)
+    result["holds_focus_after_outside_click"] = bool(window._embedded_terminal._holds_focus)
+    result["table_has_focus"] = bool(window.running_table.hasFocus())
+
+    marker2 = "VAMP_ROW489_MARKER_TWO"
+    xdotool("type", "--clearmodifiers", "--", marker2)
+    time.sleep(0.4)
+    pump(0.4)
+    result["pane_after_marker_two"] = pane_text()
+finally:
+    window.close()
+    pump(0.2)
+
+print("RESULT_JSON=" + json.dumps(result), flush=True)
+'''
+
+
+class RealDesktopFocusHandoffTest(unittest.TestCase):
+    """task-2170, reviewer REWORK on 62d4fd9f64e2: proves the deliberate user-action boundary
+    against a REAL window manager and real X11 -- not, per the reviewer's finding, merely direct
+    calls to `_on_qt_focus_changed`. A real Qt QApplication/SessionHub cannot share THIS
+    interpreter with a private Xvfb Xlib connection (see EmbeddedTerminalXvfbSmokeTest's own
+    docstring on the DISPLAY conflict, and this session's own hard-abort finding attempting
+    exactly that combination) -- so the real SessionHub construction and the real production call
+    chain (_switch_embedded_terminal/_finish_embed_attach/eventFilter/_on_qt_focus_changed) run in
+    a wholly separate subprocess (_REAL_FOCUS_HANDOFF_DRIVER), against a private Xvfb display
+    running a REAL window manager (metacity), driven purely externally via xdotool/tmux -- this
+    test process opens no Xlib connection and constructs no second QApplication of its own.
+
+    The deterministic red-on-row482 negative control lives in RunningTabEmbeddedTerminalTests
+    (fake-embedder, same file) -- an organic or injected real window-manager bounce could not be
+    reproduced reliably against THIS sandboxed harness (metacity's own bounce did not fire within
+    the settle window in repeated runs here, and neither a raw external XSetInputFocus nor
+    `xdotool windowfocus --sync` targeting the real toplevel registered as a PyQt6 focusChanged
+    signal); this class instead proves the fix's real positive behavior end-to-end."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("xdotool"):
+            raise unittest.SkipTest("xdotool not installed")
+        if not shutil.which("metacity"):
+            raise unittest.SkipTest("metacity not installed")
+        try:
+            import gi
+            gi.require_version("Gtk", "3.0")
+            gi.require_version("Vte", "2.91")
+            from gi.repository import Gtk, Vte  # noqa: F401
+        except (ImportError, ValueError) as e:
+            raise unittest.SkipTest(f"embed helper dependencies unavailable: {e}")
+
+        cls.display_num = 96
+        cls.xvfb = subprocess.Popen(
+            ["Xvfb", f":{cls.display_num}", "-screen", "0", "800x600x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        cls.env = dict(os.environ, DISPLAY=f":{cls.display_num}", QT_QPA_PLATFORM="xcb")
+        deadline = time.monotonic() + 5.0
+        ready = False
+        while time.monotonic() < deadline:
+            probe = subprocess.run(
+                ["xdotool", "getdisplaygeometry"], env=cls.env, capture_output=True,
+            )
+            if probe.returncode == 0:
+                ready = True
+                break
+            time.sleep(0.1)
+        if not ready:
+            cls.xvfb.terminate()
+            raise unittest.SkipTest("Xvfb did not become ready in time")
+
+        # The real window manager whose focus-bounce-back is under test (task-2170's whole
+        # premise: Xvfb alone never reproduces it -- it runs no WM at all).
+        cls.metacity = subprocess.Popen(
+            ["metacity", "--sm-disable", "--replace"],
+            env=cls.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.metacity.terminate()
+        cls.metacity.wait(timeout=5)
+        cls.xvfb.terminate()
+        cls.xvfb.wait(timeout=5)
+
+    def _run_driver(self, tmux_session: str) -> dict:
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", tmux_session], check=True, env=self.env,
+        )
+        self.addCleanup(lambda: subprocess.run(
+            ["tmux", "kill-session", "-t", tmux_session],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ))
+        script = (
+            _REAL_FOCUS_HANDOFF_DRIVER
+            .replace("%%SESSION_HUB_DIR%%", str(Path(session_hub.__file__).resolve().parent))
+            .replace("%%TMUX_SESSION%%", tmux_session)
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+            f.write(script)
+            driver_path = f.name
+        self.addCleanup(lambda: Path(driver_path).unlink(missing_ok=True))
+
+        xdg = tempfile.mkdtemp(prefix="session-hub-real-focus-driver-xdg-")
+        self.addCleanup(shutil.rmtree, xdg, ignore_errors=True)
+        env = dict(self.env, XDG_DATA_HOME=xdg)
+
+        proc = subprocess.run(
+            [sys.executable, driver_path], env=env, capture_output=True, text=True, timeout=40,
+        )
+        for line in proc.stdout.splitlines():
+            if line.startswith("RESULT_JSON="):
+                return json.loads(line[len("RESULT_JSON="):])
+        self.fail(
+            f"driver produced no RESULT_JSON (exit {proc.returncode})\n"
+            f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
+
+    @staticmethod
+    def _unwrapped(pane: str) -> str:
+        """tmux's own terminal-width line wrapping can split a marker across two captured lines
+        (a long prompt path pushes the wrap column earlier) -- collapsing all whitespace before a
+        substring check is what makes the assertion robust to that, not a weaker check: the
+        marker's own characters must still appear in the exact typed order."""
+        return "".join(pane.split())
+
+    def test_real_focus_bounce_does_not_release_and_later_click_does(self):
+        """The positive proof the reviewer required: activate a Running row (here,
+        _switch_embedded_terminal directly -- the same real production method
+        _activate_running_row calls), complete the attach against a REAL window manager (real
+        X11 child focus grab attempt), let queued Qt focus events drain -- during which a real
+        separate process also injects external X11 focus activity onto SessionHub's own real
+        toplevel (simulate_wm_bounce; see its own docstring for what this class established
+        about whether PyQt6 surfaces that specific injection as a signal here) -- move the
+        pointer away, inject a marker key, and prove it reaches the tmux pane; then perform a
+        later explicit Qt interaction (a real xdotool click on window.running_table, a widget
+        distinct from window.search's deterministic starting focus) and prove a second marker
+        does not. The fake-embedder unit tests in RunningTabEmbeddedTerminalTests (same file)
+        carry the deterministic red-on-row482 proof for the boundary's comparison logic itself;
+        a reliable ORGANIC or injected real window-manager bounce could not be reproduced against
+        this sandboxed Xvfb+metacity harness despite direct investigation (raw XSetInputFocus and
+        xdotool windowfocus/--sync both tried) -- see the reviewer report thread for detail."""
+        result = self._run_driver("row489-real-focus-fixed")
+        self.assertTrue(result.get("wm_active_before_attach"), result)
+        self.assertTrue(result.get("attached"), result)
+        self.assertTrue(
+            result.get("holds_focus_after_settle"),
+            f"the fix must survive the settle window: {result}",
+        )
+        self.assertIn(
+            "VAMP_ROW489_MARKER_ONE", self._unwrapped(result.get("pane_after_marker_one", "")),
+            f"keys after settling never reached the terminal: {result}",
+        )
+        self.assertFalse(result.get("holds_focus_after_outside_click"), result)
+        self.assertTrue(result.get("table_has_focus"), result)
+        self.assertNotIn(
+            "VAMP_ROW489_MARKER_TWO", self._unwrapped(result.get("pane_after_marker_two", "")),
+            f"keys after a real explicit interaction still reached the terminal: {result}",
+        )
 
 if __name__ == "__main__":
     unittest.main()

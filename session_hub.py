@@ -32,7 +32,8 @@ from datetime import date, datetime
 from pathlib import Path
 
 from PyQt6.QtCore import (
-    QByteArray, QObject, QRunnable, QSocketNotifier, QThreadPool, QTimer, QUrl, Qt, pyqtSignal,
+    QByteArray, QEvent, QObject, QRunnable, QSocketNotifier, QThreadPool, QTimer, QUrl, Qt,
+    pyqtSignal,
 )
 from PyQt6.QtGui import (
     QAction,
@@ -7348,14 +7349,23 @@ class SessionHub(QMainWindow):
         self._running_terminal_stack = running_terminal_stack
         self._embedded_terminal = EmbeddedTerminalController(self.running_terminal_container)
         self._embedded_terminal_meta: dict[str, tuple[str, str | None]] = {}
-        # task-2170: whether _on_qt_focus_changed is currently allowed to release the embed's
-        # focus at all -- see _switch_embedded_terminal/_arm_embed_focus_watch. A real desktop
-        # restart proved a bare Gtk.Plug embed (no XEMBED handshake) can make some window
-        # managers immediately bounce X input focus back to Session Hub's own toplevel as a
-        # side effect of our own XSetInputFocus grab, indistinguishable at the focusChanged
-        # signal level from a genuine user action -- Xvfb never reproduces this since it runs
-        # no window manager.
-        self._embed_focus_watch_armed = False
+        # task-2170 (reworked per reviewer REWORK on 62d4fd9f64e2): a deliberate user-action
+        # BOUNDARY, not a timer. `_qt_interaction_serial` is bumped by eventFilter() ONLY for a
+        # real, spontaneous mouse/key event Qt itself dispatches to some widget -- and a click or
+        # key landing inside the embedded child never reaches this application's event loop at
+        # all (it is a separate X11 window the Gtk.Plug helper owns), so any such event is
+        # inherently "outside the embed" by construction, with no ancestry check needed.
+        # `_embed_focus_grab_serial` snapshots that counter the instant our OWN focus() grab
+        # succeeds (_note_embed_focus_grabbed) -- see that method's docstring for why this
+        # snapshot already absorbs the very click that started the attach, and why a
+        # window-manager bounce reacting to the grab itself can never satisfy the '>' comparison
+        # in _on_qt_focus_changed below (a bare WM FocusIn dispatches no QMouseEvent/QKeyEvent to
+        # any widget, so it can never bump the serial). A real desktop restart proved a bare
+        # Gtk.Plug embed (no XEMBED handshake) can make some window managers immediately bounce X
+        # input focus back to Session Hub's own toplevel as a side effect of our own
+        # XSetInputFocus grab -- Xvfb never reproduces this since it runs no window manager.
+        self._qt_interaction_serial = 0
+        self._embed_focus_grab_serial = 0
         # task-2166: the other half of the explicit focus handoff -- release() only ever fires
         # from `focus()` grabbing the embed's X window directly (never from Qt's own toplevel, so
         # this cannot see itself and immediately hand focus back). Any REAL Qt widget gaining
@@ -7363,6 +7373,7 @@ class SessionHub(QMainWindow):
         # selected another widget"; `release_focus` itself no-ops unless the embed currently holds
         # X focus, so this costs nothing on every other focus change in the app.
         QApplication.instance().focusChanged.connect(self._on_qt_focus_changed)
+        QApplication.instance().installEventFilter(self)
 
         running_splitter = QSplitter(Qt.Orientation.Horizontal)
         running_splitter.addWidget(running_list_page)
@@ -7409,6 +7420,12 @@ class SessionHub(QMainWindow):
             self.settings().pop("window_geometry", None)
 
     def closeEvent(self, event) -> None:
+        # task-2170: undo installEventFilter(self) from __init__ -- an event filter installed on
+        # the QApplication SINGLETON outlives this window unless explicitly removed, leaving a
+        # dangling reference once this SessionHub instance is garbage collected (confirmed live:
+        # the full test suite, which constructs and discards many SessionHub instances against
+        # one shared QApplication, segfaulted on interpreter teardown without this).
+        QApplication.instance().removeEventFilter(self)
         # task-2142 row453: end only the embedded xterm CLIENT process -- detach() never touches
         # tmux, so the session it was attached to (if any) stays running headless exactly as if
         # the user had detached it themselves.
@@ -8319,6 +8336,24 @@ class SessionHub(QMainWindow):
         # cares about the saved row name, only `name` is carried through for the fallback path.
         self._switch_embedded_terminal(cwd, tmux_name, session_id, saved_name=name)
 
+    def eventFilter(self, obj, event) -> bool:
+        """task-2170: the deliberate-user-action boundary _on_qt_focus_changed gates release on.
+        A real click or key press that Qt itself dispatches to a widget can only ever originate
+        from OUTSIDE the embedded child: that child is a separate X11 window owned by the
+        Gtk.Plug helper process, so input landing on it is delivered by the X server directly to
+        that process and never reaches this application's event loop at all -- no ancestry check
+        needed. `event.spontaneous()` restricts this to real X11-originated input, not something
+        the app posted to itself. Bumping a monotonic serial (not a bool) is what lets
+        _on_qt_focus_changed require a STRICTLY LATER genuine interaction than the embed's own
+        last focus() grab -- see _note_embed_focus_grabbed."""
+        if event.spontaneous() and event.type() in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonDblClick,
+            QEvent.Type.KeyPress,
+        ):
+            self._qt_interaction_serial += 1
+        return super().eventFilter(obj, event)
+
     def _on_qt_focus_changed(self, _old, now) -> None:
         """task-2166: Qt's own toplevel window loses real X11 input focus for as long as the
         embed holds it (see EmbeddedTerminalController.focus/set_input_focus), so a click on a
@@ -8328,48 +8363,39 @@ class SessionHub(QMainWindow):
         `focus()` grabbing the embed's window away from Qt's own toplevel itself produces, not a
         user action, and releasing then would just fight our own grab.
 
-        task-2170: also skipped whenever `_embed_focus_watch_armed` is False -- the click/
-        activation gesture that itself STARTS an attach (and any window-manager focus churn its
-        own XSetInputFocus grab produces) must never be misread as a later request to leave the
-        terminal; see _arm_embed_focus_watch."""
-        if now is not None and self._embed_focus_watch_armed:
+        task-2170 (reworked per reviewer REWORK on 62d4fd9f64e2 -- a QTimer.singleShot(0, ...)
+        settle boundary cannot distinguish a later window-manager focus bounce, which can arrive
+        after any number of event-loop turns, from a genuinely later user action): also requires
+        `_qt_interaction_serial` to have advanced STRICTLY PAST `_embed_focus_grab_serial` --
+        i.e. a real, spontaneous mouse/key event reached some Qt widget AFTER the embed's own
+        last focus() grab. A window-manager bounce reacting to that very grab is a bare X11
+        FocusIn with no such event behind it at all (see eventFilter), so it can never satisfy
+        this regardless of how many event-loop turns it takes to arrive; only a genuine
+        subsequent click, keyboard navigation, dialog, or control activation can."""
+        if now is not None and self._qt_interaction_serial > self._embed_focus_grab_serial:
             self._embedded_terminal.release_focus(int(self.winId()))
 
-    def _arm_embed_focus_watch(self, generation: int) -> None:
-        """task-2170: the deferred half of the boundary -- runs once the event loop has drained
-        whatever focusChanged churn the attach's own focus grab produced, at which point any
-        FURTHER focusChanged is a genuinely later, real event. `generation` no longer matching
-        the controller's current one means a newer attach has since superseded this one; do
-        nothing (that newer attach's own settle will arm the watch itself)."""
-        if generation == self._embedded_terminal.generation:
-            self._embed_focus_watch_armed = True
-
-    def _defer_arm_embed_focus_watch(self) -> None:
-        """task-2170: schedules the rearm for the CURRENT generation's own successful focus()
-        grab (either finish_attach's internal call on a fresh attach, or the re-select
-        short-circuit's direct call in _switch_embedded_terminal -- both are exactly as exposed
-        to the same window-manager focus bounce-back). Never a poll or a recurring timer:
-        QTimer.singleShot(0, ...) runs once, after the current batch of already-queued/in-flight
-        native events has been delivered, and is the standard Qt idiom for "wait for this event
-        loop turn to settle" (see also _EMBED_PAINT_VERIFY_DELAY_MS's sibling one-shot
-        follow-up)."""
-        generation = self._embedded_terminal.generation
-        QTimer.singleShot(0, lambda gen=generation: self._arm_embed_focus_watch(gen))
+    def _note_embed_focus_grabbed(self) -> None:
+        """task-2170: called right after a successful EmbeddedTerminalController.focus() grab --
+        either finish_attach's internal call on a fresh attach, or the re-select short-circuit's
+        direct call in _switch_embedded_terminal, both exposed to the identical window-manager
+        bounce-back risk. Snapshots _qt_interaction_serial as the boundary _on_qt_focus_changed
+        requires later events to clear. Not a timer: the very click/activation that started this
+        attach already bumped the serial (eventFilter runs synchronously, before the resulting
+        signal chain reaches this method), so that snapshot already absorbs it -- it can never
+        itself satisfy the STRICTLY-LATER '>' comparison, no settle delay required."""
+        self._embed_focus_grab_serial = self._qt_interaction_serial
 
     def _switch_embedded_terminal(
         self, cwd: str, name: str, session_id: str | None, *, saved_name: str | None = None,
     ) -> None:
-        # task-2170: disarm up front, for BOTH branches below -- the click/activation that
-        # reaches this method must never itself be misread by _on_qt_focus_changed as a later
-        # request to leave the terminal (see _arm_embed_focus_watch).
-        self._embed_focus_watch_armed = False
         if (self._embedded_terminal.current_name == name
                 and self._embedded_terminal.poll_alive()):
             # Already attached -- no needless restart, but re-selecting/re-clicking an
             # already-embedded row is itself a real "select/click it" gesture (task-2166 EXIT)
             # and must re-grab keyboard focus the same as a fresh attach does.
             if self._embedded_terminal.focus():
-                self._defer_arm_embed_focus_watch()
+                self._note_embed_focus_grabbed()
             return
         ok, detail = self._embedded_terminal.begin_attach(name)
         if not ok:
@@ -8422,9 +8448,9 @@ class SessionHub(QMainWindow):
             # finish_attach() already resized the child to the container's exact current size --
             # no need for a second _on_terminal_container_resize() call here. It also already
             # called focus() internally and only returns ok=True if that grab succeeded, so the
-            # rearm boundary here (task-2170) covers this path exactly like the re-select
+            # boundary snapshot here (task-2170) covers this path exactly like the re-select
             # short-circuit's own direct focus() call in _switch_embedded_terminal.
-            self._defer_arm_embed_focus_watch()
+            self._note_embed_focus_grabbed()
             self._embedded_terminal_meta[name] = (cwd, session_id, saved_name)
             self._running_terminal_stack.setCurrentWidget(self.running_terminal_container)
             # task-2156: a valid XID + successful resize is not proof anything ever actually
