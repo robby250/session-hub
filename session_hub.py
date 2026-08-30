@@ -4886,7 +4886,7 @@ def standalone_tmux_status(
     refresh.
     """
     explicit = overrides.get("tmux")
-    tmux_enabled = explicit if explicit is not None else settings.get("launch_in_tmux", False)
+    tmux_enabled = explicit if explicit is not None else True
     if not tmux_enabled:
         return False, None, None
     name = (overrides.get("flags") or {}).get("--name") or overrides.get("name") or session.title
@@ -8302,15 +8302,15 @@ class SessionHub(QMainWindow):
         return group.get("env") or {}, group.get("flags") or {}
 
     def effective_tmux(self, explicit: bool | None) -> bool:
-        """Resolve a per-session/per-group tmux override against the global default.
+        """Resolve a legacy per-session/per-group tmux override.
 
-        `explicit` is whatever a "tmux" key currently holds: None means the
-        session/group has never been toggled and should follow the global
-        "launch_in_tmux" setting; True/False means it was explicitly set and
-        wins outright, per-item, over the global default.
+        `explicit` is whatever a "tmux" key currently holds, read only to
+        correctly report the live state of an already-running legacy
+        (pre-mandatory-tmux) process. None means no legacy key exists, so
+        tmux is used - it is mandatory for every Claude/Codex launch now.
         """
         if explicit is None:
-            return bool(self.settings().get("launch_in_tmux", False))
+            return True
         return explicit
 
     def effective_model(self, session_key: str | None, provider: str = "Claude") -> str | None:
@@ -11210,7 +11210,7 @@ def sessions_json_cli() -> int:
     groups = {}
     for cwd, group in metadata.get("groups", {}).items():
         explicit = group.get("tmux")
-        tmux_enabled = explicit if explicit is not None else settings.get("launch_in_tmux", False)
+        tmux_enabled = explicit if explicit is not None else True
         rows_out = []
         for row in group.get("rows", []):
             match = (
