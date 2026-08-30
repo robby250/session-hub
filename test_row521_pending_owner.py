@@ -8,6 +8,20 @@ def resolve(row, live_by_name):
     if owner is None or owner["updated_ms"] < row["codex_pending_since"]: return None
     return owner["key"]
 
+
+def resolve_from_census(row, live_by_key, owner_by_key):
+    """Small pure model of the production batched-census path."""
+    if row.get("provider") != "Codex" or not row.get("codex_pending_since"):
+        return None
+    native_key = next(
+        (key for key, name in owner_by_key.items() if name == row.get("name")),
+        None,
+    )
+    owner = live_by_key.get(native_key)
+    if owner is None or owner["updated_ms"] < row["codex_pending_since"]:
+        return None
+    return owner["key"]
+
 def main():
     worker = {"name": "VAMP-worker4", "provider": "Codex", "codex_pending_since": 100}
     orch = {"name": "VAMP-orchestrator", "provider": "Codex", "session_key": "Codex:orch"}
@@ -16,6 +30,14 @@ def main():
     assert resolve(worker, {"VAMP-orchestrator": newer_orch}) is None
     assert resolve(worker, {"VAMP-worker4": {"key": "Codex:w4", "updated_ms": 101}}) == "Codex:w4"
     assert resolve(worker, {"VAMP-worker4": {"key": "Codex:w4", "updated_ms": 99}}) is None
+    census = {"Codex:w4": "VAMP-worker4", "Codex:orch": "VAMP-orchestrator"}
+    live_by_key = {
+        "Codex:w4": {"key": "Codex:w4", "updated_ms": 101},
+        "Codex:orch": {"key": "Codex:orch", "updated_ms": 200},
+    }
+    assert resolve_from_census(worker, live_by_key, census) == "Codex:w4"
+    assert resolve_from_census(worker, live_by_key, {"Codex:orch": "VAMP-orchestrator"}) is None
+    assert resolve_from_census(worker, live_by_key, {"Codex:w4": "VAMP-worker4"}) == "Codex:w4"
     # Metadata order reversal cannot alter exact-name ownership.
     assert [resolve(row, {"VAMP-worker4": {"key": "Codex:w4", "updated_ms": 101}})
             for row in (worker, orch)] == ["Codex:w4", None]
