@@ -747,24 +747,24 @@ class SessionHubTests(unittest.TestCase):
         )
 
     def test_usage_pace_flags_usage_under_pace_and_missing_data(self):
+        # task-2153 REWORK: below-pace usage returns no label at all, not a numeric "under pace".
         now = datetime(2026, 6, 19, 12, 0)
         reset = now + timedelta(days=5)
         under = session_hub.UsageWindow(
             "Weekly", 10, "Resets later", window_minutes=10080, reset_epoch=reset.timestamp()
         )
-        self.assertEqual(
-            session_hub.usage_pace_text(under, now=now),
-            "28.6% expected · 18.6% under pace",
-        )
+        self.assertIsNone(session_hub.usage_pace_text(under, now=now))
         missing = session_hub.UsageWindow("Weekly", 10, "Resets later")
         self.assertIsNone(session_hub.usage_pace_text(missing, now=now))
 
     def test_usage_pace_percentage_point_table(self):
-        """task-2153: the reported deviation is the absolute percentage-point difference between
-        used and expected (used - expected), restoring the pre-row453 interpretation -- 10% used
-        at 5% expected is "5% over pace" (the brief's own worked example), and 25% used at 20%
-        expected is likewise "5% over pace". On-pace, missing data, and expected=0 at window start
-        are unchanged: no percentage-point number, only a neutral label."""
+        """task-2153 (REWORK on 369280c6ba33): the reported deviation is the absolute percentage-
+        point difference between used and expected (used - expected), restoring the pre-row453
+        interpretation for OVER pace only -- 10% used at 5% expected is "5% over pace" (the brief's
+        own worked example), 25% used at 20% expected is likewise "5% over pace". Usage at or below
+        even pace returns no label at all (None), per the reviewer's exact 5/10 and 10/10 controls
+        -- 5% used at 10% expected and 10% used at 10% expected must both be None, not a numeric
+        under-pace figure. Missing data and expected=0 at window start are unchanged."""
         now = datetime(2026, 6, 19, 12, 0)
         reset = now + timedelta(days=5)  # 5 of 7 days remain => 2/7 = 28.5714...% expected
 
@@ -788,12 +788,24 @@ class SessionHubTests(unittest.TestCase):
             self._window_with_used(20, used_percent=25, now=now), now=now)
         self.assertEqual(text, "20.0% expected · 5.0% over pace")
 
-        # under pace: used below expected by more than the 0.5-point threshold
+        # 5% used at 10% expected -> below pace, no label (reviewer's exact control)
+        self.assertIsNone(session_hub.usage_pace_text(
+            self._window_with_used(10, used_percent=5, now=now), now=now))
+
+        # 10% used at 10% expected -> exactly on pace: the on-pace branch fires first (delta=0 is
+        # within the 0.5-point on-pace threshold), so this is the qualitative "on pace" text, not
+        # a bare None -- still "no [numeric] label" in the sense the reviewer's pairing means.
+        on_pace_text = session_hub.usage_pace_text(
+            self._window_with_used(10, used_percent=10, now=now), now=now)
+        self.assertIn("on pace", on_pace_text)
+        self.assertNotIn("under pace", on_pace_text)
+        self.assertNotIn("over pace", on_pace_text)
+
+        # further under pace: no label either, not merely a suppressed number
         half = session_hub.UsageWindow(
             "Weekly", 14, "Resets later", window_minutes=10080, reset_epoch=reset.timestamp()
         )
-        text = session_hub.usage_pace_text(half, now=now)
-        self.assertEqual(text, "28.6% expected · 14.6% under pace")
+        self.assertIsNone(session_hub.usage_pace_text(half, now=now))
 
         # expected == 0: window just opened (now == reset - window_minutes exactly), unchanged
         start = reset - timedelta(days=7)
@@ -802,7 +814,6 @@ class SessionHubTests(unittest.TestCase):
         )
         text = session_hub.usage_pace_text(just_started, now=start)
         self.assertNotIn("over pace", text)
-        self.assertNotIn("under pace", text)
         self.assertIn("just started", text)
 
     @staticmethod

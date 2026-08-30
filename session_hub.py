@@ -1154,9 +1154,12 @@ def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | N
     exact string (never recompute the arithmetic) -- desktop calls it directly and the TUI reads
     the same value back from `--sessions-json`'s "pace" field.
 
+    Usage AT OR BELOW even pace shows no label at all (task-2153 REWORK, reviewer finding on
+    369280c6ba33: 5% used at 10% expected must return None, not "5.0% under pace") -- being behind
+    is not itself noteworthy, and a numeric under-pace figure invited reading it as a problem.
     On-pace (delta under 0.5 points), missing window data, and a near-zero expected percentage at
-    the exact window start are unchanged from before: no percentage-point number, only a neutral
-    label."""
+    the exact window start are unchanged: no percentage-point number, only a neutral label (or
+    None). Only genuinely OVER pace prints the delta."""
     if not window.window_minutes or not window.reset_epoch:
         return None
     window_seconds = window.window_minutes * 60
@@ -1171,8 +1174,9 @@ def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | N
         return f"{expected_percent:.1f}% expected · on pace"
     if expected_percent < 0.05:
         return f"{expected_percent:.1f}% expected · just started"
-    direction = "over" if delta > 0 else "under"
-    return f"{expected_percent:.1f}% expected · {abs(delta):.1f}% {direction} pace"
+    if delta <= 0:
+        return None
+    return f"{expected_percent:.1f}% expected · {delta:.1f}% over pace"
 
 
 _GIREPOSITORY_SEARCH_DIRS = (
