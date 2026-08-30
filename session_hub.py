@@ -212,6 +212,21 @@ PID_DIR = DATA_DIR / "pids"
 # written by the --hook-notify / --hook-notify-codex handlers and read back
 # by refresh_running_tab - see install_status_hooks/install_status_hooks_codex.
 STATUS_DIR = DATA_DIR / "status"
+
+# Fresh-install UI defaults captured from the user's settled desktop layout on 2026-08-30.
+# These are Qt geometry/header/splitter state only: no session, group, directory, provider,
+# account, model, or launch setting belongs here. Existing saved values always win via
+# setdefault in read_metadata().
+DEFAULT_LAYOUT_SETTINGS = {
+    "window_geometry": "AdnQywADAAAAAAXKAAAC0wAACf8AAAV8AAAFygAAAvMAAAn/AAAFfAAAAAAAAAAACgAAAAXKAAAC8wAACf8AAAV8",
+    "main_table_columns_v2": "AAAA/wAAAAAAAAABAAAAAQAAAAQBAAAAAAAAAAAAAAAAAAAAAAAABB4AAAAGAQEBAAAAAAABAAAAAAAAAGT/////AAAAhAAAAAAAAAAGAAAAWgAAAAEAAAAAAAAAWgAAAAEAAAAAAAAA3AAAAAEAAAAAAAABQAAAAAEAAAAAAAAAjAAAAAEAAAAAAAAAwgAAAAEAAAABAAAD6AAAAAAAAAAAAAAAAAAAAAAAAAAAAQ==",
+    "running_table_columns_v1": "AAAA/wAAAAAAAAABAAAAAQAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAXsAAAADAAEBAAAAAAAAAAAAAAAAAGT/////AAAAhAAAAAAAAAADAAAAcQAAAAEAAAAAAAAAOwAAAAEAAAAAAAAAzwAAAAEAAAAAAAAD6AAAAAAAAAAAAAAAAAAAAAAAAAAAAQ==",
+    "running_splitter_state_v1": "AAAA/wAAAAEAAAACAAABgQAAAp8B/////wEAAAABAA==",
+    "group_dialog_geometry": "AdnQywADAAAAAAPuAAABgwAACRsAAAKwAAAD7gAAAYMAAAkbAAACsAAAAAAAAAAACgAAAAPuAAABgwAACRsAAAKw",
+    "group_table_columns_v2": "AAAA/wAAAAAAAAABAAAAAAAAAAUBAAAABwAAAAUAAAABAAAAAgAAAAMAAAAEAAAAAAAAAAYAAAAHAAAABQAAAAEAAAACAAAAAwAAAAQAAAAAAAAABgAAAAAAAAAAAAAFFgAAAAcBAQEAAAAAAAEAAAACAAAAZP////8AAACEAAAAAAAAAAcAAAA4AAAAAQAAAAMAAABYAAAAAQAAAAAAAAEBAAAAAQAAAAAAAACQAAAAAQAAAAAAAABfAAAAAQAAAAMAAABFAAAAAQAAAAAAAAJRAAAAAQAAAAEAAAPoAAAAAAAAAAAAAAAAAAAAAAAAAAAB",
+    "usage_expanded_all_sessions": True,
+    "usage_expanded_running": False,
+}
 PROC_ROOT = Path("/proc")
 APP_ICON = Path(__file__).resolve().parent / "assets" / "session-hub.svg"
 # One-off sessions launch here instead of literally $HOME, so they don't
@@ -2132,9 +2147,16 @@ class UsageWorker(QRunnable):
 def read_metadata() -> dict:
     try:
         data = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {"sessions": {}}
+        data = data if isinstance(data, dict) else {"sessions": {}}
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {"sessions": {}}
+        data = {"sessions": {}}
+    settings = data.get("settings")
+    if not isinstance(settings, dict):
+        settings = {}
+        data["settings"] = settings
+    for key, value in DEFAULT_LAYOUT_SETTINGS.items():
+        settings.setdefault(key, value)
+    return data
 
 
 METADATA_BACKUP_DIR = DATA_DIR / "backups" / "metadata"
