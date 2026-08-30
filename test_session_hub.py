@@ -602,11 +602,12 @@ class SessionHubTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_usage_expand_button_toggles_detail_frame_transiently(self):
+    def test_usage_expand_button_toggles_detail_frame(self):
         """task-2142 row453 REWORK (orchestrator visual REWORK): Expand/Collapse are two
         separate fixed-label buttons now, not one checkable button that renames itself -- see
         the mutual-exclusion tests below for the compact-strip-hides / collapse-lives-in-header
-        halves of this."""
+        halves of this. task-2169: toggling now persists under the visible tab's own key
+        (see the dedicated per-tab persistence cluster) rather than staying purely transient."""
         metadata = {
             "sessions": {},
             "settings": {"enable_codex": True, "enable_claude": True,
@@ -619,7 +620,7 @@ class SessionHubTests(unittest.TestCase):
             self.assertFalse(window.usage_detail_frame.isHidden())
             window.usage_collapse_button.click()
             self.assertTrue(window.usage_detail_frame.isHidden())
-            self.assertNotIn("usage_expanded", window.settings())
+            self.assertIs(window.settings()["usage_expanded_all_sessions"], False)
         finally:
             window.close()
 
@@ -662,6 +663,139 @@ class SessionHubTests(unittest.TestCase):
             )
         finally:
             window.close()
+
+    def test_usage_expanded_defaults_compact_on_missing_or_malformed_saved_value(self):
+        """task-2169: a fresh install (no key) and a malformed saved value (wrong type,
+        never possible through the app itself but a settings.json could be hand-edited or
+        come from an older version) must both fail closed to compact, independently
+        per tab."""
+        metadata = {
+            "sessions": {},
+            "settings": {
+                "enable_codex": True, "enable_claude": True, "enable_antigravity": True,
+                "usage_expanded_all_sessions": "yes",  # malformed: not a bool
+                "usage_expanded_running": 1,  # malformed: not a bool
+            },
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertTrue(window.usage_detail_frame.isHidden())
+            self.assertFalse(window.usage_compact_row.isHidden())
+            with (
+                patch.object(window, "refresh_running_tab"),
+                patch.object(window, "apply_filter"),
+            ):
+                window.main_tabs.setCurrentIndex(1)
+            self.assertTrue(window.usage_detail_frame.isHidden())
+            self.assertFalse(window.usage_compact_row.isHidden())
+        finally:
+            window.close()
+
+    def test_usage_expanded_state_asymmetric_across_tabs_both_switch_directions(self):
+        """task-2169: All expanded, Running collapsed -- proven switching BOTH ways, and
+        each switch must apply only the destination tab's own remembered state."""
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            with (
+                patch.object(window, "refresh_running_tab"),
+                patch.object(window, "apply_filter"),
+            ):
+                # Starts on All Sessions (index 0) -- expand it.
+                window.usage_expand_button.click()
+                self.assertFalse(window.usage_detail_frame.isHidden())
+
+                # All -> Running: Running has no saved key yet, must show compact.
+                window.main_tabs.setCurrentIndex(1)
+                self.assertTrue(window.usage_detail_frame.isHidden())
+                self.assertFalse(window.usage_compact_row.isHidden())
+
+                # Running -> All: All's own expanded state must still be there.
+                window.main_tabs.setCurrentIndex(0)
+                self.assertFalse(window.usage_detail_frame.isHidden())
+
+                # All -> Running again, same result -- All's expand never leaked.
+                window.main_tabs.setCurrentIndex(1)
+                self.assertTrue(window.usage_detail_frame.isHidden())
+            self.assertEqual(window.settings()["usage_expanded_all_sessions"], True)
+            self.assertNotIn("usage_expanded_running", window.settings())
+        finally:
+            window.close()
+
+    def test_usage_expanded_changing_one_tab_never_touches_the_other_key_or_widgets(self):
+        """Negative control: expanding Running must not write or change All Sessions' key,
+        and switching back to All Sessions must still read compact."""
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            with (
+                patch.object(window, "refresh_running_tab"),
+                patch.object(window, "apply_filter"),
+            ):
+                window.main_tabs.setCurrentIndex(1)  # Running, still compact
+                window.usage_expand_button.click()
+                self.assertFalse(window.usage_detail_frame.isHidden())
+
+                window.main_tabs.setCurrentIndex(0)  # back to All Sessions
+                self.assertTrue(window.usage_detail_frame.isHidden())
+                self.assertFalse(window.usage_compact_row.isHidden())
+            self.assertEqual(window.settings()["usage_expanded_running"], True)
+            self.assertNotIn("usage_expanded_all_sessions", window.settings())
+        finally:
+            window.close()
+
+    def test_usage_expanded_state_survives_close_and_relaunch(self):
+        """task-2169 EXIT: closing and reopening Session Hub retains both tabs' state --
+        a real metadata.json round trip, not just an in-memory dict."""
+        with tempfile.TemporaryDirectory() as temp:
+            metadata_path = Path(temp) / "metadata.json"
+            metadata_path.write_text(
+                json.dumps({"sessions": {}, "settings": {}}), encoding="utf-8",
+            )
+            with (
+                patch("session_hub.METADATA_PATH", metadata_path),
+                patch("session_hub.codex_sessions", return_value=[]),
+                patch("session_hub.claude_sessions", return_value=[]),
+                patch("session_hub.antigravity_sessions", return_value=[]),
+                patch("session_hub.QApplication.platformName", return_value="xcb"),
+            ):
+                window = session_hub.SessionHub()
+                window.usage_expand_button.click()  # All Sessions -> expanded
+                with (
+                    patch.object(window, "refresh_running_tab"),
+                    patch.object(window, "apply_filter"),
+                ):
+                    window.main_tabs.setCurrentIndex(1)  # Running -> stays compact
+                window.close()
+
+                saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+                self.assertIs(saved["settings"]["usage_expanded_all_sessions"], True)
+                self.assertNotIn("usage_expanded_running", saved["settings"])
+
+                relaunched = session_hub.SessionHub()
+                try:
+                    self.assertFalse(relaunched.usage_detail_frame.isHidden())
+                    self.assertTrue(relaunched.usage_compact_row.isHidden())
+                    with (
+                        patch.object(relaunched, "refresh_running_tab"),
+                        patch.object(relaunched, "apply_filter"),
+                    ):
+                        relaunched.main_tabs.setCurrentIndex(1)
+                    self.assertTrue(relaunched.usage_detail_frame.isHidden())
+                    self.assertFalse(relaunched.usage_compact_row.isHidden())
+                finally:
+                    relaunched.close()
 
     def test_no_menubar_no_duplicate_settings_entry_remaining_button_still_opens_settings(self):
         """task-2142 row453 REWORK (orchestrator layout REWORK): the redundant top-left
