@@ -1331,6 +1331,7 @@ def _default_read_xid_line(process: subprocess.Popen, timeout: float) -> str | N
 
 
 _EMBED_PAINT_VERIFY_DELAY_MS = 1200  # one bounded singleShot after attach, see _verify_embed_painted
+_EMBED_PAINT_VERIFY_RETRY_DELAY_MS = 400  # single retry when the first sample is None (race), then fail closed
 
 
 class EmbeddedTerminalController:
@@ -3566,6 +3567,22 @@ def tmux_native_key_census(
         if native_key:
             census[name] = native_key
     return census
+
+
+def tmux_name_by_native_key_failing_closed(census: dict[str, str]) -> dict[str, str]:
+    """Reverse a `tmux_native_key_census()` map to {native_key: tmux_name}, FAILING CLOSED on
+    ambiguity (reworked per reviewer REWORK on 51cc5a6711c6 finding 2): if the same native key
+    is reported by more than one live tmux name -- two live sessions with an fd on the same
+    Codex rollout, or a pane walk that briefly sees a session mid-rename under both its old and
+    new name -- the key is DROPPED from the result entirely rather than resolved to whichever
+    name happened to be seen last. A dropped key means every caller's `.get(key, row["name"])`
+    falls back to the row's own saved name, so an ambiguous owner is never claimed as live under
+    a resolved identity; it is judged strictly on whether its OWN saved name is still live.
+    """
+    owners_by_key: dict[str, list[str]] = {}
+    for name, key in census.items():
+        owners_by_key.setdefault(key, []).append(name)
+    return {key: owners[0] for key, owners in owners_by_key.items() if len(owners) == 1}
 
 
 def stop_tmux_session(name: str) -> None:
@@ -7722,7 +7739,7 @@ class SessionHub(QMainWindow):
         pane_snapshot = tmux_pane_activity_snapshot()
         pane_pid_by_name = {name: pid for name, (_pane_id, pid, _activity) in pane_snapshot.items()}
         native_key_by_tmux_name = tmux_native_key_census(pane_pid_by_name)
-        tmux_name_by_native_key = {key: name for name, key in native_key_by_tmux_name.items()}
+        tmux_name_by_native_key = tmux_name_by_native_key_failing_closed(native_key_by_tmux_name)
 
         running: list[tuple[str, str, dict, Session | None, str]] = []
         claimed: set[str] = set()
@@ -8036,18 +8053,25 @@ class SessionHub(QMainWindow):
         else:
             self._show_embed_failure(cwd, name, session_id, detail, saved_name=saved_name)
 
-    def _verify_embed_painted(self, generation: int) -> None:
-        """Bounded one-shot follow-up to a successful `_finish_embed_attach` (task-2156): a
-        Gtk.Plug/Vte.Terminal that reports a valid XID and resizes cleanly can still never
-        actually paint a frame -- proof method #5's requirement that success mean visibly
-        painted content, not just "the widget exists". A confirmed-blank (`False`) surface
-        selects the failure widget and falls back exactly like any other embed failure; `None`
-        (could not sample -- no X server, window already gone) changes nothing, since it is not
-        evidence of anything either way."""
+    def _verify_embed_painted(self, generation: int, retries_left: int = 1) -> None:
+        """Bounded follow-up to a successful `_finish_embed_attach` (task-2156, reworked per
+        reviewer REWORK on 51cc5a6711c6 finding 1): a Gtk.Plug/Vte.Terminal that reports a valid
+        XID and resizes cleanly can still never actually paint a frame -- proof method #5's
+        requirement that success mean visibly painted content, not just "the widget exists".
+        `None` (could not sample -- transient X read race right after map, no X server, window
+        already gone) gets one short bounded retry, since a sample taken the instant after
+        finish_attach can race the X server; a still-uncheckable `None` after that retry is
+        FAIL-CLOSED exactly like a confirmed `False` -- an unproven pane is not a painted one."""
         if generation != self._embedded_terminal.generation:
             return  # superseded by a newer attach -- this verdict is stale, ignore it
         painted = self._embedded_terminal.verify_painted()
-        if painted is not False:
+        if painted is True:
+            return
+        if painted is None and retries_left > 0:
+            QTimer.singleShot(
+                _EMBED_PAINT_VERIFY_RETRY_DELAY_MS,
+                lambda: self._verify_embed_painted(generation, retries_left - 1),
+            )
             return
         name = self._embedded_terminal.current_name
         if name is None:
@@ -9925,9 +9949,9 @@ def sessions_json_cli() -> int:
     pane_pid_by_name = {
         name: pid for name, (_pane_id, pid, _activity) in tmux_pane_activity_snapshot().items()
     }
-    tmux_name_by_native_key = {
-        key: name for name, key in tmux_native_key_census(pane_pid_by_name).items()
-    }
+    tmux_name_by_native_key = tmux_name_by_native_key_failing_closed(
+        tmux_native_key_census(pane_pid_by_name)
+    )
 
     claimed: set[str] = set()
     groups = {}
