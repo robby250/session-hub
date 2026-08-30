@@ -1147,15 +1147,22 @@ class UsageActivity:
 
 def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | None:
     """Compare actual usage against an even pace across the window's duration. The reported
-    deviation is relative to EXPECTED usage, not the full quota (task-2142 row453): 10% used at
-    5% expected is "100% over pace" -- an absolute-percentage-point delta ("5% over pace") buries
-    how much worse than expected that actually is once usage is still low. Desktop and the phone
-    TUI both render this exact string (never recompute the arithmetic) -- desktop calls it directly
-    and the TUI reads the same value back from `--sessions-json`'s "pace" field.
+    deviation is the absolute percentage-point difference between used and expected (task-2153,
+    restoring the pre-row453 interpretation): 10% used at 5% expected is "5% over pace", not
+    the row453-era relative-to-expected "100% over pace" -- the relative form buried how much
+    usage actually was once expected was still small. Desktop and the phone TUI both render this
+    exact string (never recompute the arithmetic) -- desktop calls it directly and the TUI reads
+    the same value back from `--sessions-json`'s "pace" field.
 
-    When expected usage is near zero, a relative percentage is undefined (unbounded, or a
-    divide-by-zero at exactly zero) rather than merely large, so a neutral bounded label is shown
-    instead of a number."""
+    Usage AT OR BELOW even pace shows no label at all (task-2153 REWORK on c06c623de46e: the
+    non-positive check must run BEFORE the on-pace band, or an exact 10%/10% delta-0 match wrongly
+    reads as the on-pace band instead of "at or below pace" -- 5% used at 10% expected and 10%
+    used at 10% expected must both return None, not "5.0% under pace" or a truthy "on pace"
+    string). Being at or behind pace is not itself noteworthy, and both a numeric under-pace
+    figure and an "on pace" label for a non-positive delta invited reading it as meaningful.
+    Strictly-positive on-pace (delta under 0.5 points), missing window data, and a near-zero
+    expected percentage at the exact window start are unchanged: no percentage-point number, only
+    a neutral label (or None). Only genuinely OVER pace prints the delta."""
     if not window.window_minutes or not window.reset_epoch:
         return None
     window_seconds = window.window_minutes * 60
@@ -1165,14 +1172,17 @@ def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | N
     remaining_seconds = max(0.0, window.reset_epoch - now_epoch)
     elapsed_fraction = max(0.0, min(1.0, 1 - remaining_seconds / window_seconds))
     expected_percent = elapsed_fraction * 100
-    delta = window.used_percent - expected_percent
-    if abs(delta) < 0.5:
+    # Rounded to neutralize floating-point dust in elapsed_fraction (e.g. 1 - 9000/10000 lands on
+    # 0.09999999999999998, not 0.1) -- an exact-equal case like 10% used at 10% expected must
+    # compare as delta<=0, not as a tiny positive epsilon that slips into the on-pace band.
+    delta = round(window.used_percent - expected_percent, 6)
+    if delta <= 0:
+        return None
+    if delta < 0.5:
         return f"{expected_percent:.1f}% expected · on pace"
     if expected_percent < 0.05:
         return f"{expected_percent:.1f}% expected · just started"
-    relative_percent = abs(delta) / expected_percent * 100
-    direction = "over" if delta > 0 else "under"
-    return f"{expected_percent:.1f}% expected · {relative_percent:.1f}% {direction} pace"
+    return f"{expected_percent:.1f}% expected · {delta:.1f}% over pace"
 
 
 _GIREPOSITORY_SEARCH_DIRS = (
