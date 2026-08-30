@@ -2664,6 +2664,65 @@ class SessionHubTests(unittest.TestCase):
             finally:
                 subprocess.run([str(wrapper), "kill-server"], capture_output=True, timeout=5)
 
+    @patch("session_hub.shutil.which")
+    def test_row498_risky_paths_leave_explicit_sentinel_server_unchanged(self, which):
+        """The focused row498 paths cannot escape their disposable tmux socket.
+
+        This is deliberately a second named server, independent of the fixture under
+        test.  Its PID, sessions, global option, and environment are recorded before
+        the risky reconciliation/launch builders run and must remain byte-identical.
+        Both wrappers force ``-L``; inherited TMUX is removed before this module is
+        imported at the top of this file, so TMUX_TMPDIR is not mistaken for isolation.
+        """
+        sentinel_socket = f"vamp-row498-sentinel-{os.getpid()}"
+        fixture_socket = f"vamp-row498-fixture-{os.getpid()}"
+        sentinel_session = "vamp-row498-sentinel-session"
+        fixture_session = "vamp-row498-fixture-session"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sentinel, _ = self._disposable_tmux_wrapper(tmpdir, sentinel_socket)
+            fixture, _ = self._disposable_tmux_wrapper(tmpdir, fixture_socket)
+            which.side_effect = lambda name: str(fixture) if name == "tmux" else None
+
+            def run(wrapper, *args, **kwargs):
+                return subprocess.run([str(wrapper), *args], capture_output=True,
+                                      text=True, timeout=5, **kwargs)
+
+            def state(wrapper, session):
+                pid = run(wrapper, "display-message", "-p", "#{pid}").stdout
+                sessions = run(wrapper, "list-sessions", "-F", "#{session_name}").stdout
+                option = run(wrapper, "show-options", "-g", "-v", "update-environment").stdout
+                env = run(wrapper, "show-environment", "-g").stdout
+                session_env = run(wrapper, "show-environment", "-t", session).stdout
+                return (pid, sessions, option, env, session_env)
+
+            try:
+                run(sentinel, "new-session", "-d", "-s", sentinel_session, check=True)
+                run(sentinel, "set-option", "-g", "update-environment",
+                    "MY_CUSTOM_VAR SSH_AUTH_SOCK", check=True)
+                run(sentinel, "set-environment", "-g", "ROW498_SENTINEL", "unchanged", check=True)
+                run(sentinel, "set-environment", "-t", sentinel_session,
+                    "ROW498_SESSION_SENTINEL", "unchanged", check=True)
+                run(fixture, "new-session", "-d", "-s", fixture_session, check=True)
+                before = state(sentinel, sentinel_session)
+
+                # Exercise every focused path that can mutate tmux: reconciliation and
+                # the launch command's option phase.  They receive only the fixture wrapper.
+                session_hub.reconcile_tmux_desktop_env(
+                    {"DISPLAY": ":77", "XAUTHORITY": "/tmp/row498-xauth"},
+                    tmux=str(fixture),
+                )
+                launch_phase = self._launch_option_phase(fixture_session, fixture)
+                result = subprocess.run(
+                    ["bash", "-c", launch_phase, "session-hub", str(fixture),
+                     fixture_session, "/tmp", "claude"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(state(sentinel, sentinel_session), before)
+            finally:
+                run(fixture, "kill-server")
+                run(sentinel, "kill-server")
+
     def test_rename_group_row_in_renames_row_key_and_bucket(self):
         metadata = {
             "sessions": {
