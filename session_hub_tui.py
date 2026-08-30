@@ -33,6 +33,7 @@ from textual.widgets import (
 )
 
 SESSION_HUB = Path(__file__).resolve().parent / "session_hub.py"
+PHONE_ROW_HEIGHT = 2
 
 
 def run_cli(args: list[str], *, offscreen: bool = False) -> dict:
@@ -142,7 +143,9 @@ class GroupScreen(Screen):
         table.add_columns("Name", "Provider", "Status")
         table.cursor_type = "row"
         for row in self.rows:
-            table.add_row(row["name"], row["provider"], row["status"])
+            table.add_row(
+                row["name"], row["provider"], row["status"], height=PHONE_ROW_HEIGHT
+            )
 
     def selected_row(self) -> dict | None:
         table = self.query_one("#rows", DataTable)
@@ -235,6 +238,7 @@ class MainPane(Vertical):
                 session["title"],
                 session["cwd"],
                 session["session_id"],
+                height=PHONE_ROW_HEIGHT,
             )
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -338,6 +342,7 @@ class RunningPane(Vertical):
             table.add_row(
                 row["display"], row["name"], row["provider"], row["status_label"],
                 detail if len(detail) <= 60 else detail[:59] + "…",
+                height=PHONE_ROW_HEIGHT,
             )
 
     def selected(self) -> dict | None:
