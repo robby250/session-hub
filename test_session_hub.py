@@ -4937,6 +4937,25 @@ class SessionHubTests(unittest.TestCase):
         self.assertNotIn("codex_pending_since", worker_row)
         self.assertEqual(orchestrator_row["session_key"], "Codex:orchestrator")
 
+    def test_pending_codex_group_rows_duplicate_exact_owner_fail_closed(self):
+        """Two pending rows resolving to the same exact tmux/native owner are
+        ambiguous; neither marker may be cleared or assigned the shared key."""
+        rows = [
+            {"name": "VAMP-worker4", "provider": "Codex", "codex_pending_since": 200},
+            {"name": "VAMP-worker4", "provider": "Codex", "codex_pending_since": 201},
+        ]
+        shared = session_hub.Session(
+            "Codex", "shared", "shared", "/tmp/vamp", "/tmp/vamp", 500,
+            Path("/tmp/shared.jsonl"),
+        )
+        metadata = {"groups": {"/tmp/vamp": {"rows": rows}}}
+        with patch("session_hub.codex_tmux_native_key", return_value="Codex:shared"):
+            changed = session_hub.resolve_pending_codex_group_rows(metadata, [shared])
+        self.assertFalse(changed)
+        for row in rows:
+            self.assertNotIn("session_key", row)
+            self.assertIn("codex_pending_since", row)
+
     def test_discover_sessions_collapses_group_members_into_one_row(self):
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp) / "-tmp-vamp"

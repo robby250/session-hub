@@ -2976,22 +2976,42 @@ def resolve_pending_codex_group_rows(metadata: dict, sessions: list[Session]) ->
     disambiguates simultaneous Codex workers sharing one project directory.
     """
     by_key = {session.native_key: session for session in sessions}
-    changed = False
+    pending: list[tuple[dict, str, str | None]] = []
+    existing_owners: dict[str, list[dict]] = {}
     for group in metadata.get("groups", {}).values():
-        # REWORK (VAMP-reviewer HIGH-1, bbb2616): a group's "tmux" key is legacy debris from the
-        # removed per-group override control -- no code path writes it anymore, and every
-        # Codex launch is unconditionally tmux now, so a stale `tmux: false` here must never skip
-        # binding a genuinely live tmux-launched pending row to its transcript.
         for row in group.get("rows", []):
-            if row.get("provider") != "Codex" or not row.get("codex_pending_since"):
+            if row.get("provider") != "Codex":
                 continue
-            native_key = codex_tmux_native_key(row["name"])
-            match = by_key.get(native_key)
-            if match is None or match.updated_ms < int(row["codex_pending_since"]):
-                continue
-            row["session_key"] = native_key
-            row.pop("codex_pending_since", None)
-            changed = True
+            if row.get("codex_pending_since"):
+                # Resolve every pending row before mutating metadata.  This makes duplicate
+                # exact-name/key claims a cluster we can reject as a unit, never a row-order race.
+                name = sanitize_tmux_session_name(row.get("name", ""))
+                pending.append((row, name, codex_tmux_native_key(name)))
+            elif row.get("session_key"):
+                existing_owners.setdefault(row["session_key"], []).append(row)
+
+    pending_key_counts = collections.Counter(
+        key for _row, _name, key in pending if key is not None
+    )
+    pending_name_counts = collections.Counter(name for _row, name, _key in pending)
+    changed = False
+    for row, name, native_key in pending:
+        if native_key is None:
+            continue
+        # Multiple pending rows resolving to one exact tmux name/native key are ambiguous;
+        # leave every marker intact so no metadata write can assign one live rollout twice.
+        if pending_name_counts[name] > 1 or pending_key_counts[native_key] > 1:
+            continue
+        prior = existing_owners.get(native_key, [])
+        if any(owner is not row for owner in prior):
+            # A pending launch cannot steal a key already owned by another saved row.
+            continue
+        match = by_key.get(native_key)
+        if match is None or match.updated_ms < int(row["codex_pending_since"]):
+            continue
+        row["session_key"] = native_key
+        row.pop("codex_pending_since", None)
+        changed = True
     return changed
 
 
