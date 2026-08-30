@@ -47,9 +47,9 @@ os.environ["TMUX_TMPDIR"] = _TEST_TMUX_TMPDIR
 os.environ.pop("TMUX", None)
 atexit.register(shutil.rmtree, _TEST_TMUX_TMPDIR, ignore_errors=True)
 
-from PyQt6.QtCore import QEvent, QPoint, QPointF, QSize, Qt
-from PyQt6.QtGui import QMouseEvent, QResizeEvent
-from PyQt6.QtWidgets import QApplication, QMenuBar
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QRect, QSize, Qt
+from PyQt6.QtGui import QMouseEvent, QPainter, QPixmap, QResizeEvent
+from PyQt6.QtWidgets import QApplication, QMenuBar, QStyleOptionViewItem
 
 import session_hub
 import session_hub_tui
@@ -6022,7 +6022,8 @@ class SessionHubTests(unittest.TestCase):
         # task-2136: task-2114 added Status/Last message to All Sessions
         # without being asked, corrupting the saved widths/order of its
         # original six columns. Running is a different table/widget entirely;
-        # task-2142 later reduced it to exactly Name/Status/Last message.
+        # task-2142 reduced it to Name/Status/Last message, and task-2191
+        # later folded Status into the Name cell's relative-age corner.
         metadata = {"sessions": {}, "settings": {}, "groups": {}}
         with patch("session_hub.read_metadata", return_value=metadata):
             window = session_hub.SessionHub()
@@ -6039,7 +6040,7 @@ class SessionHubTests(unittest.TestCase):
                 window.running_table.horizontalHeaderItem(i).text()
                 for i in range(window.running_table.columnCount())
             ]
-            self.assertEqual(running_headers, ["Name", "Status", "Last message"])
+            self.assertEqual(running_headers, ["Name", "Last message"])
         finally:
             window.close()
 
@@ -9069,7 +9070,10 @@ class SessionActivityTests(unittest.TestCase):
             with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
                 window = session_hub.SessionHub()
                 window.refresh_running_tab()
-                gui_label = window.running_table.item(0, 1).text()
+                # task-2191: the Status column is gone; the same activity label survives on
+                # the Name item's accessible text (AccessibleTextRole, VAMP-reviewer HIGH-1).
+                accessible = window.running_table.item(0, 0).data(Qt.ItemDataRole.AccessibleTextRole)
+                gui_label = accessible.split(", ")[2]
                 window.close()
 
         self.assertEqual(json_label, "Needs input")
@@ -9407,7 +9411,7 @@ class SessionActivityTests(unittest.TestCase):
         ):
             window = session_hub.SessionHub()
             window.refresh_running_tab()
-            first_message = window.running_table.item(0, 2).text()
+            first_message = window.running_table.item(0, 1).text()
 
             with transcript.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps({
@@ -9415,7 +9419,7 @@ class SessionActivityTests(unittest.TestCase):
                     "message": {"content": [{"type": "text", "text": "second reply"}]},
                 }) + "\n")
             window.refresh_running_tab()
-            second_message = window.running_table.item(0, 2).text()
+            second_message = window.running_table.item(0, 1).text()
             window.close()
 
         self.assertEqual(first_message, "first reply")
@@ -9821,7 +9825,7 @@ class SessionActivityTests(unittest.TestCase):
                 _cwd, saved_name, session_id, _tmux_name = item.data(
                     session_hub.Qt.ItemDataRole.UserRole
                 )
-                rows_by_name[saved_name] = (session_id, window.running_table.item(r, 2).text())
+                rows_by_name[saved_name] = (session_id, window.running_table.item(r, 1).text())
             window.close()
 
         self.assertEqual(rows_by_name["VAMPULSE-orchestrator"][0], "id-orch")
@@ -11496,8 +11500,8 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
 class SearchFilterTests(unittest.TestCase):
     """task-2142 row453 REWORK (orchestrator search REWORK): the search box filters whichever
     tab is visible. Running gets a cached-data-only filter over its already-populated rows
-    (name/status/last-message plus hidden identity fields); All Sessions additionally surfaces
-    matching saved group members as their own directly-activatable rows."""
+    (name/relative-age/last-message plus hidden identity fields); All Sessions additionally
+    surfaces matching saved group members as their own directly-activatable rows."""
 
     def setUp(self):
         # Same real-I/O safety net as SessionHubTests.setUp (row432 audit, extended
@@ -11520,25 +11524,26 @@ class SearchFilterTests(unittest.TestCase):
         self.addCleanup(window.close)
         return window
 
-    def test_running_search_matches_name_status_last_message_and_hidden_identity_field(self):
+    def test_running_search_matches_name_age_last_message_and_hidden_identity_field(self):
         window = self._window()
         window.running_table.setRowCount(2)
         item_a = session_hub.QTableWidgetItem("alpha")
         item_a.setData(session_hub.Qt.ItemDataRole.UserRole, ("/tmp/alpha", "alpha", "sess-alpha-id"))
+        # task-2191: relative age lives on the Name item (UserRole+5), not a Status column.
+        item_a.setData(session_hub.Qt.ItemDataRole.UserRole + 5, "8m ago")
         window.running_table.setItem(0, 0, item_a)
-        window.running_table.setItem(0, 1, session_hub.QTableWidgetItem("Working"))
-        window.running_table.setItem(0, 2, session_hub.QTableWidgetItem("building the widget"))
+        window.running_table.setItem(0, 1, session_hub.QTableWidgetItem("building the widget"))
         item_b = session_hub.QTableWidgetItem("beta")
         item_b.setData(session_hub.Qt.ItemDataRole.UserRole, ("/tmp/beta", "beta", "sess-beta-id"))
+        item_b.setData(session_hub.Qt.ItemDataRole.UserRole + 5, "2h ago")
         window.running_table.setItem(1, 0, item_b)
-        window.running_table.setItem(1, 1, session_hub.QTableWidgetItem("Idle"))
-        window.running_table.setItem(1, 2, session_hub.QTableWidgetItem("waiting"))
+        window.running_table.setItem(1, 1, session_hub.QTableWidgetItem("waiting"))
 
         window._apply_running_filter("beta")  # name
         self.assertTrue(window.running_table.isRowHidden(0))
         self.assertFalse(window.running_table.isRowHidden(1))
 
-        window._apply_running_filter("working")  # status
+        window._apply_running_filter("8m ago")  # relative age
         self.assertFalse(window.running_table.isRowHidden(0))
         self.assertTrue(window.running_table.isRowHidden(1))
 
@@ -11564,8 +11569,7 @@ class SearchFilterTests(unittest.TestCase):
         item = session_hub.QTableWidgetItem("alpha")
         item.setData(session_hub.Qt.ItemDataRole.UserRole, ("/tmp/alpha", "alpha", None))
         window.running_table.setItem(0, 0, item)
-        window.running_table.setItem(0, 1, session_hub.QTableWidgetItem("Idle"))
-        window.running_table.setItem(0, 2, session_hub.QTableWidgetItem(""))
+        window.running_table.setItem(0, 1, session_hub.QTableWidgetItem(""))
         with patch("session_hub.codex_sessions") as codex, \
                 patch("session_hub.claude_sessions") as claude, \
                 patch("session_hub.antigravity_sessions") as antigravity, \
@@ -11639,6 +11643,61 @@ class SearchFilterTests(unittest.TestCase):
         codex.assert_not_called()
         claude.assert_not_called()
         antigravity.assert_not_called()
+
+
+class RunningNameAgeDelegateTests(unittest.TestCase):
+    """task-2191 REWORK (VAMP-reviewer): pure model/formatting controls for the delegate that
+    replaced the Status column -- no SessionHub(), no tmux, just the item/delegate contract."""
+
+    def test_paint_does_not_crash_with_or_without_age(self):
+        table = session_hub.QTableWidget(0, 2)
+        table.setItemDelegateForColumn(0, session_hub.RunningNameAgeDelegate(table))
+        table.setRowCount(1)
+        for age in ("8m ago", ""):  # "" covers the missing-timestamp fallback
+            item = session_hub.QTableWidgetItem("agentname\nClaude · vampulse")
+            item.setData(Qt.ItemDataRole.UserRole + 5, age)
+            table.setItem(0, 0, item)
+            delegate = table.itemDelegateForColumn(0)
+            index = table.model().index(0, 0)
+            opt = QStyleOptionViewItem()
+            delegate.initStyleOption(opt, index)
+            opt.rect = QRect(0, 0, 185, 62)
+            opt.widget = table
+            pix = QPixmap(200, 62)
+            painter = QPainter(pix)
+            delegate.paint(painter, opt, index)  # raises on a real Qt/paint failure
+            painter.end()
+
+    def test_running_tab_accessible_text_carries_the_activity_label_and_age(self):
+        # VAMP-reviewer HIGH-1: the delegate paints activity/age manually, so
+        # refresh_running_tab() must still stamp AccessibleTextRole with what the
+        # removed Status column's DisplayRole text used to carry.
+        session = session_hub.Session(
+            "Claude", "id-shared", "shared", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/shared.jsonl"),
+        )
+        session_hub.write_session_status(
+            "id-shared", "needs_input", "approve the plan?", reason="permission_prompt"
+        )
+        row = {"name": "VAMP-shared", "provider": "Claude", "session_key": "Claude:id-shared"}
+        metadata = {
+            "settings": {}, "sessions": {},
+            "groups": {"/tmp/vamp": {"tmux": True, "rows": [row]}},
+        }
+        with (
+            patch("session_hub.read_metadata", return_value=metadata),
+            patch.object(session_hub, "claude_sessions", return_value=[session]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub, "tmux_session_alive", return_value=True),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            window.refresh_running_tab()
+            accessible = window.running_table.item(0, 0).data(Qt.ItemDataRole.AccessibleTextRole)
+            window.close()
+        self.assertIn("Needs input", accessible)
+        self.assertIn("VAMP-shared", accessible)
 
 
 @unittest.skipUnless(shutil.which("Xvfb"), "Xvfb not installed")
