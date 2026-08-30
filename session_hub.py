@@ -4502,16 +4502,14 @@ def _codex_activity(session: "Session", status: dict | None) -> tuple[str, str]:
         return "working", ""
     if status:
         if (
-            status.get("state") == "working"
-            and turn is not None
+            turn is not None
             and turn[0] in ("task_complete", "turn_aborted")
             and turn[1] > status.get("ts", 0)
         ):
-            # The status file is stale: it was last written mid-turn
-            # ("working") but the transcript proves that turn has since
-            # ended (notify hook never fired for the completion event, or
-            # its write raced/lost). Without this a session gets stuck
-            # showing Working forever once its rollout moves on.
+            # The status file is stale: the transcript proves a newer turn has ended, whether
+            # the older record says Working or Idle (the latter is written when a session is
+            # resumed before its first new prompt). A deliberately acknowledged Idle remains
+            # Idle because its write timestamp is newer than this completion marker.
             return "done", ""
         return status.get("state", "unknown"), status.get("detail", "")
     if turn:
