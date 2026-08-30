@@ -5493,15 +5493,6 @@ class SettingsDialog(QDialog):
         )
         launch_note.setWordWrap(True)
         launch_layout.addWidget(launch_note)
-        self.launch_in_tmux = QCheckBox("Launch every session in tmux by default")
-        self.launch_in_tmux.setToolTip(
-            "Resumes and new group-row launches run detached inside tmux "
-            "unless a session's own \"Launch in tmux\" checkbox (right-click "
-            "a session → Launch options…, or a group's own checkbox) has "
-            "been explicitly set to override this."
-        )
-        self.launch_in_tmux.setChecked(bool(settings.get("launch_in_tmux", False)))
-        launch_layout.addWidget(self.launch_in_tmux)
         self.launch_options = LaunchOptionsEditor(
             settings.get("global_env") or {}, settings.get("global_flags") or {}
         )
@@ -5608,7 +5599,6 @@ class SettingsDialog(QDialog):
                 "global_flags": self.flags_editor.env(),
                 "claude_accounts_enabled": self.enable_accounts.isChecked(),
                 "claude_accounts": self.accounts_editor.env(),
-                "launch_in_tmux": self.launch_in_tmux.isChecked(),
                 "status_hooks_enabled": self.status_hooks_enabled.isChecked(),
             }
         )
@@ -5656,7 +5646,6 @@ class NewSessionDialog(QDialog):
         self.model: str | None = None
         self.reasoning_effort: str | None = None
         self.account_config_dir: str | None = None
-        self.use_tmux: bool = bool(settings.get("launch_in_tmux", False))
         self.claude_accounts = settings.get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS
         self.setWindowTitle(f"New {provider} Session")
         self.setMinimumWidth(600)
@@ -5724,17 +5713,6 @@ class NewSessionDialog(QDialog):
         self.existing_widget.setLayout(existing_row)
         form.addRow("Existing folder:", self.existing_widget)
         layout.addLayout(form)
-
-        self.tmux_checkbox = QCheckBox("Launch detached inside tmux")
-        self.tmux_checkbox.setChecked(self.use_tmux)
-        self.tmux_checkbox.setToolTip(
-            "Runs this session inside its own tmux session instead of "
-            "directly in a terminal, so tooling can drive it via "
-            "`tmux send-keys` with no focus impact. Requires tmux to be "
-            "installed. Defaults to the global Settings toggle, but can be "
-            "changed for this session only."
-        )
-        layout.addWidget(self.tmux_checkbox)
 
         self.preview = QLabel()
         self.preview.setWordWrap(True)
@@ -5835,7 +5813,6 @@ class NewSessionDialog(QDialog):
             if reason:
                 QMessageBox.warning(self, "Unsupported model/effort", reason)
                 return
-        self.use_tmux = self.tmux_checkbox.isChecked()
         super().accept()
 
 
@@ -5995,7 +5972,6 @@ class LaunchNewGroupSessionsDialog(QDialog):
         self,
         cwd: str,
         existing_names: set[str],
-        tmux: bool,
         parent=None,
         claude_accounts: dict[str, str] | None = None,
         accounts_enabled: bool = False,
@@ -6005,7 +5981,6 @@ class LaunchNewGroupSessionsDialog(QDialog):
         self.cwd = cwd
         self.existing_names = existing_names
         self.group_rows: list[dict] = []
-        self.use_tmux: bool = tmux
         self.claude_accounts = claude_accounts or DEFAULT_CLAUDE_ACCOUNTS
         self.accounts_enabled = accounts_enabled
         self.will_launch = will_launch
@@ -6016,23 +5991,6 @@ class LaunchNewGroupSessionsDialog(QDialog):
         directory_label = QLabel(f"Working directory: {cwd}")
         directory_label.setWordWrap(True)
         layout.addWidget(directory_label)
-
-        # will_launch=False ("Add new…"): the tmux choice has no effect here
-        # (register_group_row/add_new_rows_into_group never launches
-        # anything), so showing it would promise a behavior this dialog
-        # doesn't perform - it applies the next time the saved row is
-        # actually launched, via the group's own "Launch in tmux" checkbox.
-        self.tmux_checkbox = QCheckBox("Launch detached inside tmux")
-        self.tmux_checkbox.setChecked(tmux)
-        self.tmux_checkbox.setToolTip(
-            "Runs each session inside its own tmux session (named to match "
-            "--name) instead of directly in a terminal, so tooling can drive "
-            "it via `tmux send-keys` with no focus impact. Requires tmux to "
-            "be installed. /clear-detection isn't available yet for "
-            "tmux-launched sessions."
-        )
-        self.tmux_checkbox.setVisible(will_launch)
-        layout.addWidget(self.tmux_checkbox)
 
         layout.addWidget(QLabel("Sessions to launch:" if will_launch else "Sessions to add:"))
         self.table = QTableWidget(0, 5)
@@ -6244,7 +6202,6 @@ class LaunchNewGroupSessionsDialog(QDialog):
                     return
 
         self.group_rows = rows
-        self.use_tmux = self.tmux_checkbox.isChecked()
         super().accept()
 
 
@@ -6580,18 +6537,6 @@ class ManageGroupDialog(QDialog):
         )
         group_options_button.clicked.connect(self.edit_group_launch_options)
         controls.addWidget(group_options_button)
-        self.tmux_checkbox = QCheckBox("Launch in tmux")
-        self.tmux_checkbox.setToolTip(
-            "New launches of this group's members run detached inside tmux "
-            "instead of directly in a terminal. Already-running sessions "
-            "are unaffected until relaunched."
-        )
-        group = self.group()
-        self.tmux_checkbox.setChecked(
-            self.hub.effective_tmux(group.get("tmux") if group else None)
-        )
-        self.tmux_checkbox.toggled.connect(self.set_tmux)
-        controls.addWidget(self.tmux_checkbox)
         controls.addStretch(1)
         layout.addLayout(controls)
 
@@ -6798,13 +6743,6 @@ class ManageGroupDialog(QDialog):
         row["transcripts"] = enabled
         write_metadata(self.hub.metadata)
 
-    def set_tmux(self, enabled: bool) -> None:
-        group = self.group()
-        if not group:
-            return
-        group["tmux"] = enabled
-        write_metadata(self.hub.metadata)
-
     def launch_row(self, name: str) -> None:
         group = self.group()
         override_key = next(
@@ -6895,7 +6833,6 @@ class ManageGroupDialog(QDialog):
         dialog = LaunchNewGroupSessionsDialog(
             self.cwd,
             existing_names,
-            self.tmux_checkbox.isChecked(),
             self,
             claude_accounts=self.hub.settings().get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS,
             accounts_enabled=bool(self.hub.settings().get("claude_accounts_enabled")),
