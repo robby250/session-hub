@@ -689,7 +689,14 @@ class SessionHubTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_usage_compact_bar_mirrors_worst_visible_window(self):
+    def _usage_window(self, name, pct):
+        return session_hub.UsageWindow(name, pct, "Resets later")
+
+    def test_usage_compact_bar_selects_ordinary_weekly_not_the_worst_window(self):
+        """task-2162 EXIT/proof method #1: 5-hour is MORE depleted (10 remaining) than Weekly
+        (80 remaining) for both Claude and Codex -- the old worst-of-visible algorithm would
+        show 10%; the compact bar is a specific semantic window and must show Weekly's 80
+        remaining regardless."""
         metadata = {
             "sessions": {},
             "settings": {"enable_codex": True, "enable_claude": True,
@@ -698,25 +705,147 @@ class SessionHubTests(unittest.TestCase):
         with patch("session_hub.read_metadata", return_value=metadata):
             window = session_hub.SessionHub()
         try:
-            def make(name, pct):
-                return session_hub.UsageWindow(name, pct, "Resets later")
+            window.usage_loaded(
+                "Claude", [self._usage_window("5-hour", 90), self._usage_window("Weekly", 20)], ""
+            )
+            claude_bar = window.usage_compact_bars["Claude"]
+            self.assertEqual(claude_bar.value(), 80)
+            self.assertEqual(claude_bar.format(), "80%")
+            self.assertIn("5-hour", claude_bar.toolTip())
+            self.assertIn("Weekly", claude_bar.toolTip())
 
             window.usage_loaded(
-                "Claude", [make("5-hour", 10), make("Weekly", 60)], ""
+                "Codex", [self._usage_window("5-hour", 90), self._usage_window("Weekly", 20)], ""
             )
-            compact_bar = window.usage_compact_bars["Claude"]
-            # 5-hour is 10% used (90 remaining), Weekly is 60% used (40
-            # remaining) - the compact bar mirrors the worst (lowest
-            # remaining), and both windows' detail lives in its tooltip.
-            self.assertEqual(compact_bar.value(), 40)
-            self.assertIn("5-hour", compact_bar.toolTip())
-            self.assertIn("Weekly", compact_bar.toolTip())
-            # Centered remaining-% text at the SAME fixed size, not an added row
-            # (task-2142 row453 REWORK -- orchestrator visual REWORK).
-            self.assertTrue(compact_bar.isTextVisible())
-            self.assertEqual(compact_bar.alignment(), session_hub.Qt.AlignmentFlag.AlignCenter)
-            self.assertEqual(compact_bar.format(), "40%")
-            self.assertEqual((compact_bar.width(), compact_bar.height()), (60, 8))
+            codex_bar = window.usage_compact_bars["Codex"]
+            self.assertEqual(codex_bar.value(), 80)
+            self.assertEqual(codex_bar.format(), "80%")
+            # Centered remaining-% text (task-2142 row453 REWORK -- orchestrator visual REWORK).
+            self.assertTrue(claude_bar.isTextVisible())
+            self.assertEqual(claude_bar.alignment(), session_hub.Qt.AlignmentFlag.AlignCenter)
+        finally:
+            window.close()
+
+    def test_usage_compact_bar_ignores_row_order_and_optional_rows(self):
+        """task-2162 proof method #2: Claude lists 5-hour before Weekly while Codex's real data
+        can list Weekly first (row 0) -- selection is by the window's NAME, never table
+        position. An optional row (Weekly (Fable)) present alongside must never be confused for
+        the ordinary Weekly window."""
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            window.usage_loaded(
+                "Codex", [self._usage_window("Weekly", 15), self._usage_window("5-hour", 70)], ""
+            )
+            self.assertEqual(window.usage_compact_bars["Codex"].value(), 85)
+
+            window.usage_loaded(
+                "Claude",
+                [
+                    self._usage_window("5-hour", 5),
+                    self._usage_window("Weekly", 30),
+                    self._usage_window("Weekly (Fable)", 95),
+                ],
+                "",
+            )
+            claude_bar = window.usage_compact_bars["Claude"]
+            self.assertEqual(claude_bar.value(), 70)  # Weekly (30% used), never Fable's 5%
+        finally:
+            window.close()
+
+    def test_usage_compact_bar_fails_closed_when_no_ordinary_weekly_window(self):
+        """task-2162 proof method #3, missing-weekly control: Codex reporting only a
+        model-specific breakdown ("<model> Weekly", never plain "Weekly") must show an
+        unavailable compact value, never silently fall back to 5-hour or the model-specific
+        weekly percentage."""
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            window.usage_loaded(
+                "Codex",
+                [
+                    self._usage_window("5-hour", 90),
+                    self._usage_window("GPT-5.3-Codex-Spark 5-hour", 10),
+                    self._usage_window("GPT-5.3-Codex-Spark Weekly", 10),
+                ],
+                "",
+            )
+            self.assertEqual(window.usage_compact_bars["Codex"].format(), "—")
+        finally:
+            window.close()
+
+    def test_usage_compact_bar_activity_only_never_reports_a_different_limit_as_weekly(self):
+        """task-2162 proof method #3, activity-only/error control: no percentage windows at all
+        (activity-only fallback, or an outright error) must never populate the compact bar as
+        if a weekly percentage were known."""
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            window.usage_loaded("Claude", [], "connection failed")
+            self.assertEqual(window.usage_compact_bars["Claude"].format(), "—")
+        finally:
+            window.close()
+
+    def test_usage_compact_bar_antigravity_still_mirrors_worst_visible_window(self):
+        """task-2162: Antigravity has no single account-level weekly (Gemini and Claude/GPT
+        track separately), so it deliberately keeps the prior worst-of-visible selection --
+        unchanged behavior, not a regression."""
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            window.usage_loaded(
+                "Antigravity",
+                [
+                    self._usage_window("Gemini weekly", 10),
+                    self._usage_window("Claude/GPT weekly", 60),
+                ],
+                "",
+            )
+            # Gemini weekly 90 remaining, Claude/GPT weekly 40 remaining -- worst wins, as before.
+            self.assertEqual(window.usage_compact_bars["Antigravity"].value(), 40)
+        finally:
+            window.close()
+
+    def test_usage_compact_bar_geometry_fits_100_percent_at_the_current_font(self):
+        """task-2162 proof method #4: the "100%" text bounding rectangle must fit inside the
+        compact bar's own content rectangle at the app's active font -- the old fixed 60x8 rect
+        clipped the text. Also confirms the header still fits one line (five providers' worth of
+        bar width stays a small, bounded increase, not an unbounded guess)."""
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            bar = window.usage_compact_bars["Claude"]
+            metrics = session_hub.QFontMetrics(bar.font())
+            text_rect = metrics.boundingRect("100%")
+            self.assertLessEqual(text_rect.width(), bar.width())
+            self.assertLessEqual(text_rect.height(), bar.height())
+            self.assertGreater(bar.width(), 60)  # modestly wider than the old clipped 60x8
+            self.assertLess(bar.width(), 160)    # bounded -- header must stay one line
         finally:
             window.close()
 

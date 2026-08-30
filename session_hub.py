@@ -38,6 +38,7 @@ from PyQt6.QtGui import (
     QAction,
     QColor,
     QDesktopServices,
+    QFontMetrics,
     QIcon,
     QKeySequence,
     QShortcut,
@@ -214,6 +215,15 @@ APP_ICON = Path(__file__).resolve().parent / "assets" / "session-hub.svg"
 # scatter loose files/clones directly in the home directory.
 DEFAULT_SESSION_DIR = HOME / "projects"
 PROVIDERS = ("Codex", "Claude", "Antigravity")
+# task-2162: the compact bar's semantic window contract. Both Codex (parse_claude_usage's sibling
+# read_codex_usage) and Claude (parse_claude_usage) name their ordinary account-level weekly window
+# EXACTLY "Weekly" -- never prefixed/suffixed -- while a model-specific breakdown is always named
+# "<model> Weekly" and Claude's Fable variant is "Weekly (Fable)"; matching the exact string tells
+# the ordinary window apart from either without any row-position or substring assumption. Antigravity
+# has no single account-level weekly (Gemini and Claude/GPT track separately, both plainly named
+# "<family> weekly"), so it is deliberately excluded and keeps the prior worst-of-visible selection.
+ORDINARY_WEEKLY_WINDOW_NAME = "Weekly"
+SEMANTIC_WEEKLY_PROVIDERS = frozenset({"Codex", "Claude"})
 # Claude's CLI has no command to enumerate models, but --model accepts these
 # family aliases, which always resolve to the latest model of each family, so
 # they stay valid across model refreshes. "Default" omits --model entirely.
@@ -6860,7 +6870,14 @@ class SessionHub(QMainWindow):
             bar.setTextVisible(True)
             bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
             bar.setFormat("…")
-            bar.setFixedSize(60, 8)
+            # task-2162: the old fixed 60x8 rect was smaller than "100%" at the active desktop
+            # font/DPI, clipping the centered text. Size from the bar's OWN font metrics (not a
+            # bigger guessed constant) so it stays correctly sized across desktop font settings,
+            # with enough headroom that the header still fits on one line at the app's minimum
+            # width (5 provider bars + labels + Expand button).
+            metrics = QFontMetrics(bar.font())
+            text_rect = metrics.boundingRect("100%")
+            bar.setFixedSize(max(72, text_rect.width() + 20), max(18, text_rect.height() + 6))
             bar.setToolTip("Loading…")
             usage_compact.addWidget(label)
             usage_compact.addWidget(bar)
@@ -7470,29 +7487,45 @@ class SessionHub(QMainWindow):
         self._sync_usage_compact(provider, error)
 
     def _sync_usage_compact(self, provider: str, error: str) -> None:
-        """Mirror the worst (most-used) visible window onto the compact
-        one-line bar; the reset/pace detail lives in its tooltip instead of
-        the always-visible full grid this replaces."""
+        """Mirror the compact one-line bar onto the ORDINARY WEEKLY window for Codex/Claude
+        (task-2162 -- a user-facing contract, not "whichever window is worst"); Antigravity has
+        no single account-level weekly window (see ORDINARY_WEEKLY_WINDOW_NAME) so it keeps the
+        prior worst-of-visible selection. The reset/pace detail for every window still lives in
+        the tooltip instead of the always-visible full grid this replaces."""
         compact_bar = self.usage_compact_bars.get(provider)
         if compact_bar is None:
             return
+        semantic = provider in SEMANTIC_WEEKLY_PROVIDERS
         worst: tuple[int, str] | None = None
+        weekly: tuple[int, str] | None = None
+        saw_percentage_window = False
         tooltip_lines = []
         for label, bar, detail in self.usage_widgets[provider]:
             if bar.isHidden():
                 continue
             if "% left" in bar.format():
+                saw_percentage_window = True
                 remaining = bar.value()
                 if worst is None or remaining < worst[0]:
                     worst = (remaining, bar.styleSheet())
+                if label.text() == ORDINARY_WEEKLY_WINDOW_NAME:
+                    weekly = (remaining, bar.styleSheet())
                 detail_text = detail.text().replace("\n", " · ")
                 tooltip_lines.append(f"{label.text()}: {bar.format()} ({detail_text})")
             elif "requests" in bar.format():
                 tooltip_lines.append(f"{label.text()}: {bar.format()} ({detail.text()})")
-        if worst is not None:
-            compact_bar.setValue(worst[0])
-            compact_bar.setStyleSheet(worst[1])
-            compact_bar.setFormat(f"{worst[0]}%")
+        chosen = weekly if semantic else worst
+        if chosen is not None:
+            compact_bar.setValue(chosen[0])
+            compact_bar.setStyleSheet(chosen[1])
+            compact_bar.setFormat(f"{chosen[0]}%")
+        elif semantic and saw_percentage_window:
+            # task-2162: percentage windows are visible but none is the ordinary weekly one
+            # (e.g. Codex reporting only a model-specific breakdown) -- fail closed rather than
+            # silently substituting 5-hour or a model-specific weekly value.
+            compact_bar.setValue(0)
+            compact_bar.setStyleSheet("")
+            compact_bar.setFormat("—")
         elif error:
             compact_bar.setValue(0)
             compact_bar.setStyleSheet("")
