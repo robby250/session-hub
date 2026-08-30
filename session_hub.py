@@ -1036,8 +1036,6 @@ class SessionLaunchOptionsDialog(QDialog):
         flag_overrides: dict,
         parent=None,
         scope: str = "this session",
-        show_tmux: bool = False,
-        tmux_override: bool | None = None,
         provider: str = "Claude",
         model: str | None = None,
         reasoning_effort: str | None = None,
@@ -1092,28 +1090,6 @@ class SessionLaunchOptionsDialog(QDialog):
             )
         self.editor = LaunchOptionsEditor(env_overrides, flag_overrides)
         layout.addWidget(self.editor)
-        self.tmux_checkbox: QCheckBox | None = None
-        if show_tmux:
-            self.tmux_checkbox = QCheckBox("Launch in tmux")
-            self.tmux_checkbox.setTristate(True)
-            self.tmux_checkbox.setToolTip(
-                "Relaunches/resumes this session detached inside a tmux "
-                "session (named to match its --name flag, set in the CLI "
-                "flags tab above), with a terminal attached to it. Requires "
-                "tmux and gnome-terminal, and a --name flag set for this "
-                "session.\n\n"
-                "Three states: checked = always tmux, unchecked = never "
-                "tmux, dashed/partial = follow the global \"Launch every "
-                "session in tmux\" setting."
-            )
-            self.tmux_checkbox.setCheckState(
-                Qt.CheckState.PartiallyChecked
-                if tmux_override is None
-                else Qt.CheckState.Checked
-                if tmux_override
-                else Qt.CheckState.Unchecked
-            )
-            layout.addWidget(self.tmux_checkbox)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Cancel
@@ -1127,14 +1103,6 @@ class SessionLaunchOptionsDialog(QDialog):
 
     def flags(self) -> dict:
         return self.editor.flags()
-
-    def tmux(self) -> bool | None:
-        if self.tmux_checkbox is None:
-            return None
-        state = self.tmux_checkbox.checkState()
-        if state == Qt.CheckState.PartiallyChecked:
-            return None
-        return state == Qt.CheckState.Checked
 
     def model(self) -> str | None:
         return codex_combo_value(self.codex_model_combo) if self.codex_model_combo else None
@@ -9667,8 +9635,6 @@ class SessionHub(QMainWindow):
             {**(self.settings().get("global_flags") or {}), **group_flags},
             flag_overrides,
             self,
-            show_tmux=not self.is_group_session(session),
-            tmux_override=existing.get("tmux"),
             provider=session.provider,
             model=existing.get("model"),
             reasoning_effort=existing.get("reasoning_effort"),
@@ -9698,11 +9664,6 @@ class SessionHub(QMainWindow):
                     entry["reasoning_effort"] = effort
                 else:
                     entry.pop("reasoning_effort", None)
-            tmux = dialog.tmux()
-            if tmux is None:
-                entry.pop("tmux", None)
-            else:
-                entry["tmux"] = tmux
             write_metadata(self.metadata)
             self.refresh()
 
