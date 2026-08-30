@@ -2717,7 +2717,11 @@ def find_group_member_session(
        Not cwd-gated: an exact session_key match (or linked_keys membership) is
        already unambiguous identity, and a long-running agent's own cwd can
        legitimately drift (cd into a worktree, a subdirectory, etc.) without
-       that meaning the row now belongs to a different session.
+       that meaning the row now belongs to a different session. Still
+       `exclude_keys`-gated (task-2164 rework): two rows sharing the identical
+       stale session_key must not both resolve to - and both render/control -
+       the one live session; whichever sibling this pass claims it first wins,
+       the other falls through unmatched.
     1b. If step 1 found nothing AND `session_key` is itself a member of some
        link (`linked_session_keys`, from every metadata["links"] members
        list), the row's identity is under link management, not a fresh
@@ -2778,6 +2782,13 @@ def find_group_member_session(
             None,
         )
         if match:
+            # task-2164 rework: an exact session_key match is still a
+            # sibling row's claim if that native key was already resolved
+            # earlier this same pass (exclude_keys) - two rows recording
+            # the identical stale session_key (a duplicated/merged row)
+            # must not both render/control the one live session.
+            if match.native_key in exclude_keys:
+                return None
             return match
         if session_key in linked_session_keys:
             return None

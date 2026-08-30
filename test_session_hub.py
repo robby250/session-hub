@@ -4236,6 +4236,25 @@ class SessionHubTests(unittest.TestCase):
         )
         self.assertIsNone(match_claimed)
 
+    def test_find_group_member_session_exact_session_key_match_respects_exclude_keys(self):
+        """task-2164 REWORK: an exact-session_key match (step 1, not the step-2 name+cwd
+        fallback the test above covers) must ALSO fail closed on exclude_keys -- two rows
+        recording the identical stale session_key (a duplicated/merged row) must not both
+        resolve to, and both render/control, the one live session."""
+        shared_target = session_hub.Session(
+            "Claude", "id-shared", "t", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/shared.jsonl"),
+        )
+        row_a = {"provider": "Claude", "session_key": "Claude:id-shared"}
+        row_b = {"provider": "Claude", "session_key": "Claude:id-shared"}
+        match_a = session_hub.find_group_member_session(row_a, "/tmp/vamp", [shared_target])
+        self.assertEqual(match_a.native_key, "Claude:id-shared")
+        # row_b resolves in the same pass, after row_a already claimed the key.
+        match_b = session_hub.find_group_member_session(
+            row_b, "/tmp/vamp", [shared_target], frozenset({"Claude:id-shared"}),
+        )
+        self.assertIsNone(match_b)
+
     def test_codex_tmux_native_key_reads_the_open_rollout_fd(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
