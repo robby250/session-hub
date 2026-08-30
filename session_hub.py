@@ -3012,13 +3012,31 @@ def resolve_pending_codex_group_rows(metadata: dict, sessions: list[Session]) ->
         if any(owner is not row for owner in prior):
             # A pending launch cannot steal a key already owned by another saved row.
             continue
-        match = by_key.get(native_key)
-        if match is None or match.updated_ms < int(row["codex_pending_since"]):
+        match = pending_codex_exact_owner(row, by_key)
+        if match is None:
             continue
         row["session_key"] = native_key
         row.pop("codex_pending_since", None)
         changed = True
     return changed
+
+
+def pending_codex_exact_owner(row: dict, by_key: dict[str, Session]) -> Session | None:
+    """Resolve a pending row only through its exact live tmux/native owner.
+
+    A same-cwd transcript, recency, metadata order, or display-name similarity is deliberately
+    absent from this function: until ``codex_tmux_native_key(row.name)`` proves the owner, the row
+    remains unmatched.  This is the recurrence guard for task-2196/row521.
+    """
+    if row.get("provider") != "Codex" or not row.get("codex_pending_since"):
+        return None
+    native_key = codex_tmux_native_key(sanitize_tmux_session_name(row.get("name", "")))
+    if native_key is None:
+        return None
+    match = by_key.get(native_key)
+    if match is None or match.updated_ms < int(row["codex_pending_since"]):
+        return None
+    return match
 
 
 def discover_sessions(metadata: dict) -> list[Session]:
