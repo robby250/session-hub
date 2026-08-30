@@ -6898,8 +6898,8 @@ class ManageGroupDialog(QDialog):
                 continue
             if label == "Resume in new terminal":
                 # Not the generic bound slot: that calls hub.launch()
-                # directly with no use_tmux/tmux_name, so a tmux-enabled
-                # group silently resumed in a plain terminal instead.
+                # directly with no tmux_name, so a group row silently
+                # resumed with the wrong tmux session name instead.
                 # resume_group_row is the same tmux-aware path double-
                 # click already uses.
                 # 0-arg closure over `row` (fixed for this whole menu, not a
@@ -9770,7 +9770,7 @@ class SessionHub(QMainWindow):
         it, often onto an already-running server that does NOT inherit
         Popen's env=), so it needs these injected explicitly into the
         command tmux execs instead - see tmux_group_launch_command and
-        launch's use_tmux branch.
+        launch's tmux branch.
         """
         global_env = self.settings().get("global_env") or {}
         group_env, _ = self.group_launch_options(session_key)
@@ -9811,7 +9811,6 @@ class SessionHub(QMainWindow):
         focus: bool = True,
         strip_env: list[str] | None = None,
         wait_for_tracking: bool = False,
-        use_tmux: bool = False,
         tmux_name: str | None = None,
         reasoning_effort: str | None = None,
         initial_prompt: str | None = None,
@@ -9837,7 +9836,7 @@ class SessionHub(QMainWindow):
                     f"{config_error}\n\nFix that file, then launch or resume again.",
                 )
                 return
-        if use_tmux and self.settings().get("status_hooks_enabled", False):
+        if provider in ("Claude", "Codex") and self.settings().get("status_hooks_enabled", False):
             if provider == "Claude":
                 install_status_hooks(Path(cwd))
             elif provider == "Codex" and not install_status_hooks_codex() and not self._codex_notify_warned:
@@ -9850,7 +9849,7 @@ class SessionHub(QMainWindow):
                     "live status until you clear or replace that `notify` line yourself.",
                 )
         try:
-            if use_tmux and provider in ("Claude", "Codex"):
+            if provider in ("Claude", "Codex"):
                 # tmux_name, not flag_overrides["--name"]: resuming a group
                 # row (session_id set) never passes --name at all - Claude
                 # already knows which conversation to continue via --resume,
@@ -9873,7 +9872,7 @@ class SessionHub(QMainWindow):
                 if provider == "Claude"
                 else []
             )
-            if use_tmux and provider in ("Claude", "Codex"):
+            if provider in ("Claude", "Codex"):
                 if provider == "Codex":
                     # Codex has no --name; the tmux session name IS its address
                     # (VAMPULSE peers reach it with `session_ctl.py send <name>`).
@@ -9998,7 +9997,6 @@ class SessionHub(QMainWindow):
             # transcript saving off.
             strip_env=["CLAUDE_CODE_CHILD_SESSION"],
             wait_for_tracking=wait_for_tracking,
-            use_tmux=self.effective_tmux(overrides.get("tmux")),
             # --name is Claude-only; a Codex row's address is its display name
             # (the Hub rename, e.g. VAMP-worker4), else the session title.
             tmux_name=(overrides.get("flags") or {}).get("--name")
@@ -10459,7 +10457,6 @@ class SessionHub(QMainWindow):
                 # the ANTHROPIC_MODEL env var) silently lost its model
                 # and launched with the CLI's bare default instead.
                 session_key=lookup_key,
-                use_tmux=use_tmux,
                 tmux_name=tmux_name,
             )
         elif target == "Claude":
@@ -10482,7 +10479,6 @@ class SessionHub(QMainWindow):
                 model=model,
                 session_key=target_key,
                 flag_overrides={"--name": session.title, "--session-id": target_id},
-                use_tmux=use_tmux,
                 tmux_name=tmux_name,
             )
         else:
@@ -10510,7 +10506,7 @@ class SessionHub(QMainWindow):
                     # process under that row exposes its exact rollout via an
                     # open fd, so resolve_pending_links never has to guess
                     # among sibling Codex sessions sharing the same cwd.
-                    "target_tmux_name": tmux_name if use_tmux else None,
+                    "target_tmux_name": tmux_name if target in ("Claude", "Codex") else None,
                 }
             )
             self.launch(
@@ -10519,7 +10515,6 @@ class SessionHub(QMainWindow):
                 session.cwd,
                 model=model,
                 reasoning_effort=reasoning_effort if target == "Codex" else None,
-                use_tmux=use_tmux,
                 tmux_name=tmux_name,
             )
 
@@ -10561,7 +10556,7 @@ class SessionHub(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.directory:
             tmux_name = (
                 suggest_session_name(dialog.directory, dialog.model, set())
-                if dialog.use_tmux
+                if provider in ("Claude", "Codex")
                 else None
             )
             self.launch(
@@ -10571,7 +10566,6 @@ class SessionHub(QMainWindow):
                 model=dialog.model,
                 reasoning_effort=dialog.reasoning_effort,
                 account_config_dir=dialog.account_config_dir,
-                use_tmux=dialog.use_tmux,
                 tmux_name=tmux_name,
             )
 
@@ -10676,7 +10670,6 @@ class SessionHub(QMainWindow):
         if not row:
             return {"status": "error", "message": f"No row named {name!r} in this group"}
         provider = row.get("provider", "Claude")
-        use_tmux = self.effective_tmux(group.get("tmux"))
         # No tmux-alive short-circuit here (task-2142): a live-but-detached row (no window open)
         # reaches this function through _focus_or_resume_session precisely because window_titled()
         # found nothing, and an early "already_running" return used to hand back a status dict
@@ -10750,7 +10743,6 @@ class SessionHub(QMainWindow):
             flag_overrides={"--name": row["name"]},
             strip_env=strip_env,
             wait_for_tracking=wait_for_tracking,
-            use_tmux=use_tmux,
         )
         return {"status": "launched", "name": name}
 
@@ -10834,7 +10826,6 @@ class SessionHub(QMainWindow):
             if provider == "Codex"
             else None,
             session_key=row["override_key"],
-            use_tmux=self.effective_tmux(group.get("tmux")),
             tmux_name=row["name"],
         )
         return {"status": "resumed", "name": name}
@@ -11470,6 +11461,13 @@ def resume_session_cli(argv: list[str]) -> int:
 
 
 def main() -> int:
+    if shutil.which("tmux") is None:
+        print(
+            "Session Hub requires tmux (every Claude/Codex launch runs inside "
+            "it) - install tmux and try again.",
+            file=sys.stderr,
+        )
+        return 1
     if "--diagnose" in sys.argv:
         return diagnostic()
     if "--sessions-json" in sys.argv:
