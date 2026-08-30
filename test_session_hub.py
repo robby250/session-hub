@@ -8889,6 +8889,51 @@ class EmbeddedTerminalControllerTests(unittest.TestCase):
         self.assertFalse(b_process.terminated)
         self.assertEqual(embedder.calls, [(777, 640, 480)])
 
+    def test_stale_generation_survives_a_failed_replacement_launch(self):
+        """A pending, B's replacement launch itself raises OSError -- A's generation must
+        already be invalid by the time that failure is reported, so A's late XID/timeout
+        cannot resurrect A's state through B's just-failed transition (task-2142 row453
+        REWORK round 2 -- reviewer HIGH finding: generation was previously bumped only after
+        popen() succeeded, leaving a hole between detach()ing A and a failed B popen())."""
+        container = _FakeWinIdContainer(999, 640, 480)
+        embedder = _FakeEmbedder()
+        calls = []
+
+        def flaky_popen(argv, **kw):
+            calls.append(argv)
+            if len(calls) == 1:
+                return _FakeEmbedProcess(argv, stdout_lines=())
+            raise OSError("helper binary vanished")
+
+        ctl = session_hub.EmbeddedTerminalController(
+            container, popen=flaky_popen, which=lambda name: f"/usr/bin/{name}",
+            platform_name=lambda: "xcb", embedder=embedder,
+            read_xid_line=lambda proc, timeout: None, helper_ready=lambda: True,
+            profile_uuid=lambda: None,
+        )
+        ok, _detail = ctl.begin_attach("session-a")
+        self.assertTrue(ok)
+        generation_a = ctl.generation
+        ok, detail = ctl.begin_attach("session-b")
+        self.assertFalse(ok)
+        self.assertIn("failed to launch", detail)
+        # The failed replacement must already have invalidated A's generation and torn down
+        # A's process (detach() ran before the failing popen()) -- nothing is "current".
+        self.assertIsNone(ctl.process)
+        self.assertIsNone(ctl.current_name)
+        # A's late XID arrives after B's launch already failed -- must be silently ignored,
+        # never resurrected as a live attach and never reported through B's failure callback.
+        ok, _detail = ctl.finish_attach("XID=111\n", generation_a)
+        self.assertIsNone(ok)
+        self.assertIsNone(ctl.current_name)
+        self.assertIsNone(ctl.process)
+        self.assertEqual(embedder.calls, [])
+        # Same for A's late timeout/EOF instead of a late XID.
+        ok, _detail = ctl.finish_attach(None, generation_a)
+        self.assertIsNone(ok)
+        self.assertIsNone(ctl.current_name)
+        self.assertEqual(embedder.calls, [])
+
 
 class MetadataShrinkGuardTests(unittest.TestCase):
     """task-2142 row453 incident, 2026-08-30: write_metadata must refuse to silently replace a

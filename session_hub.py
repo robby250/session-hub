@@ -1300,12 +1300,18 @@ class EmbeddedTerminalController:
         self.current_name: str | None = None
         self._child_winid: int | None = None
         self._pending_name: str | None = None
-        # Bumped on every successful launch (task-2142 row453 REWORK -- reviewer
-        # rework, stale-attach race: selecting session B while A's XID is still
-        # outstanding must not let A's late notifier/timeout callback finish or
-        # fail B's attach). The GUI layer snapshots `generation` right after
-        # `begin_attach` and passes it back into `finish_attach`; a mismatch
-        # means a newer attach has already superseded this one.
+        # Bumped the moment a replacement attach COMMITS to displacing the previous one --
+        # at the detach() call in begin_attach, before the new popen() even runs (task-2142
+        # row453 REWORK -- reviewer rework round 2: bumping only after popen() succeeded left
+        # a hole where A is pending, B's precheck passes and detach()s A, B's popen() raises
+        # OSError, and A's still-current generation lets its late XID/timeout resurrect A's
+        # state through the just-failed B transition). Bumping at commit-to-replace time means
+        # ANY outcome of the replacement -- success, launch failure, or later stale callback --
+        # leaves the old generation permanently invalid, while a precheck failure (which returns
+        # before detach() is ever called) still touches neither the generation nor any existing
+        # state. The GUI layer snapshots `generation` right after `begin_attach` returns True and
+        # passes it back into `finish_attach`; a mismatch means a newer attach has already
+        # superseded this one.
         self.generation = 0
 
     def begin_attach(self, name: str) -> tuple[bool, str]:
@@ -1327,6 +1333,13 @@ class EmbeddedTerminalController:
         if reason:
             return False, reason
         self.detach()
+        # Invalidate the outgoing attach's generation HERE, at commit-to-replace, not after a
+        # successful popen() below -- a failed replacement launch must not leave the previous
+        # generation looking current to a late XID/timeout callback (task-2142 row453 REWORK
+        # round 2). Clearing _pending_name too: there is no pending attach until popen()
+        # actually succeeds, and the mismatch branch in finish_attach never reads it anyway.
+        self._pending_name = None
+        self.generation += 1
         argv = [self._which("python3"), self._helper_script,
                 "--socket-id", str(winid), "--tmux-session", name]
         profile_uuid = self._profile_uuid()
@@ -1338,7 +1351,6 @@ class EmbeddedTerminalController:
             self.process = None
             return False, f"failed to launch the embedded terminal helper: {e}"
         self._pending_name = name
-        self.generation += 1
         return True, "launching"
 
     def finish_attach(self, line: str | None, generation: int | None = None) -> tuple[bool | None, str]:
