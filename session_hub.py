@@ -7519,14 +7519,10 @@ class SessionHub(QMainWindow):
             compact_bar.setValue(chosen[0])
             compact_bar.setStyleSheet(chosen[1])
             compact_bar.setFormat(f"{chosen[0]}%")
-        elif semantic and saw_percentage_window:
-            # task-2162: percentage windows are visible but none is the ordinary weekly one
-            # (e.g. Codex reporting only a model-specific breakdown) -- fail closed rather than
-            # silently substituting 5-hour or a model-specific weekly value.
-            compact_bar.setValue(0)
-            compact_bar.setStyleSheet("")
-            compact_bar.setFormat("—")
-        elif error:
+        elif semantic or error:
+            # task-2162 rework: no exact visible ordinary Weekly window for a semantic provider
+            # -- clear any stale prior value regardless of why (model-only breakdown, activity-only
+            # refresh, empty result, or an error) rather than leaving the old percentage displayed.
             compact_bar.setValue(0)
             compact_bar.setStyleSheet("")
             compact_bar.setFormat("—")

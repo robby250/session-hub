@@ -801,6 +801,50 @@ class SessionHubTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_usage_compact_bar_stale_weekly_clears_on_activity_only_refresh(self):
+        """Row479 REWORK: a valid Weekly value must not survive a LATER refresh that has no
+        ordinary Weekly window. Sequence: load Weekly 20% used (80% remaining, shown) -> load an
+        activity-only fallback (no error) -> the compact bar must clear to unavailable, not keep
+        showing the earlier 80%."""
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            window.usage_loaded("Claude", [self._usage_window("Weekly", 20)], "")
+            claude_bar = window.usage_compact_bars["Claude"]
+            self.assertEqual(claude_bar.format(), "80%")
+
+            window.usage_loaded(
+                "Claude", [session_hub.UsageActivity("Weekly", 5, 2)], ""
+            )
+            self.assertEqual(claude_bar.format(), "—")
+        finally:
+            window.close()
+
+    def test_usage_compact_bar_stale_weekly_clears_on_empty_no_error_refresh(self):
+        """Same stale-value hazard, empty-result variant: a later refresh returning no windows
+        and no error must also clear a previously-shown Weekly value."""
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            window.usage_loaded("Codex", [self._usage_window("Weekly", 15)], "")
+            codex_bar = window.usage_compact_bars["Codex"]
+            self.assertEqual(codex_bar.format(), "85%")
+
+            window.usage_loaded("Codex", [], "")
+            self.assertEqual(codex_bar.format(), "—")
+        finally:
+            window.close()
+
     def test_usage_compact_bar_antigravity_still_mirrors_worst_visible_window(self):
         """task-2162: Antigravity has no single account-level weekly (Gemini and Claude/GPT
         track separately), so it deliberately keeps the prior worst-of-visible selection --
