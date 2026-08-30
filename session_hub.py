@@ -1147,15 +1147,16 @@ class UsageActivity:
 
 def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | None:
     """Compare actual usage against an even pace across the window's duration. The reported
-    deviation is relative to EXPECTED usage, not the full quota (task-2142 row453): 10% used at
-    5% expected is "100% over pace" -- an absolute-percentage-point delta ("5% over pace") buries
-    how much worse than expected that actually is once usage is still low. Desktop and the phone
-    TUI both render this exact string (never recompute the arithmetic) -- desktop calls it directly
-    and the TUI reads the same value back from `--sessions-json`'s "pace" field.
+    deviation is the absolute percentage-point difference between used and expected (task-2153,
+    restoring the pre-row453 interpretation): 10% used at 5% expected is "5% over pace", not
+    the row453-era relative-to-expected "100% over pace" -- the relative form buried how much
+    usage actually was once expected was still small. Desktop and the phone TUI both render this
+    exact string (never recompute the arithmetic) -- desktop calls it directly and the TUI reads
+    the same value back from `--sessions-json`'s "pace" field.
 
-    When expected usage is near zero, a relative percentage is undefined (unbounded, or a
-    divide-by-zero at exactly zero) rather than merely large, so a neutral bounded label is shown
-    instead of a number."""
+    On-pace (delta under 0.5 points), missing window data, and a near-zero expected percentage at
+    the exact window start are unchanged from before: no percentage-point number, only a neutral
+    label."""
     if not window.window_minutes or not window.reset_epoch:
         return None
     window_seconds = window.window_minutes * 60
@@ -1170,9 +1171,8 @@ def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | N
         return f"{expected_percent:.1f}% expected · on pace"
     if expected_percent < 0.05:
         return f"{expected_percent:.1f}% expected · just started"
-    relative_percent = abs(delta) / expected_percent * 100
     direction = "over" if delta > 0 else "under"
-    return f"{expected_percent:.1f}% expected · {relative_percent:.1f}% {direction} pace"
+    return f"{expected_percent:.1f}% expected · {abs(delta):.1f}% {direction} pace"
 
 
 _GIREPOSITORY_SEARCH_DIRS = (
