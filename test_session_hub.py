@@ -2054,6 +2054,48 @@ class SessionHubTests(unittest.TestCase):
         args = ["claude", "--name", "vamp-s1"]
         self.assertEqual(session_hub.prefix_env_command(args, {}, None), args)
 
+    def test_desktop_clipboard_env_overrides_reads_exactly_the_allowlist(self):
+        """task-2165: only CLIPBOARD_ENV_ALLOWLIST names are read from the Hub's own
+        os.environ, and an unrelated ambient variable never leaks in alongside them."""
+        with patch.dict(
+            session_hub.os.environ,
+            {
+                "DISPLAY": ":0",
+                "WAYLAND_DISPLAY": "wayland-0",
+                "XAUTHORITY": "/home/user/.Xauthority",
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+                "XDG_SESSION_TYPE": "x11",
+                "SOME_UNRELATED_SECRET": "do-not-leak",
+            },
+        ):
+            overrides = session_hub.SessionHub.desktop_clipboard_env_overrides()
+        self.assertEqual(
+            overrides,
+            {
+                "DISPLAY": ":0",
+                "WAYLAND_DISPLAY": "wayland-0",
+                "XAUTHORITY": "/home/user/.Xauthority",
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+                "XDG_SESSION_TYPE": "x11",
+            },
+        )
+
+    def test_desktop_clipboard_env_overrides_omits_absent_names_not_invents_them(self):
+        """Negative control: a name absent from the Hub's own environment (the exact
+        stale-tmux-server shape -- e.g. a systemd unit with no WAYLAND_DISPLAY) must be
+        OMITTED from the result, never invented as an empty string."""
+        with patch.dict(
+            session_hub.os.environ,
+            {"DISPLAY": ":0"},
+            clear=True,
+        ):
+            overrides = session_hub.SessionHub.desktop_clipboard_env_overrides()
+        self.assertEqual(overrides, {"DISPLAY": ":0"})
+        self.assertNotIn("WAYLAND_DISPLAY", overrides)
+        self.assertNotIn("XAUTHORITY", overrides)
+
     @patch("session_hub.shutil.which")
     def test_tmux_group_launch_command_matches_name_to_tmux_session(self, which):
         # VAMPULSE-orchestrator's request: the tmux session name and the
@@ -3264,6 +3306,88 @@ class SessionHubTests(unittest.TestCase):
             self.assertIn("--dangerously-skip-permissions", claude_command)
             self.assertIn("--name vamp-s1", claude_command)
             self.assertNotIn("pidfile", spawn.call_args.kwargs)
+        finally:
+            window.close()
+
+    @patch("session_hub.shutil.which")
+    def test_launch_with_tmux_propagates_desktop_clipboard_env_despite_stale_tmux_server(
+        self, which
+    ):
+        """task-2165 EXIT: a long-lived tmux server started from a tty (modeled here by the
+        server having no clipboard env of its own -- launch() never reads or depends on the
+        tmux server's environment at all, only os.environ + prefix_env_command's explicit
+        `env NAME=VALUE` prefix on the exec'd command) must still get the Hub's live desktop
+        clipboard values propagated into the exec'd child, exactly the allowlisted names."""
+        which.side_effect = lambda name: {
+            "gnome-terminal": "/usr/bin/gnome-terminal",
+            "tmux": "/usr/bin/tmux",
+            "claude": "/home/user/.local/bin/claude",
+        }.get(name)
+        metadata = {"sessions": {}, "settings": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            with (
+                patch.object(session_hub.SessionHub, "spawn") as spawn,
+                patch("session_hub.Path.is_dir", return_value=True),
+                patch.dict(
+                    session_hub.os.environ,
+                    {
+                        "DISPLAY": ":0",
+                        "XDG_RUNTIME_DIR": "/run/user/1000",
+                        "SOME_UNRELATED_SECRET": "do-not-leak",
+                    },
+                    clear=True,
+                ),
+            ):
+                window.launch(
+                    "Claude",
+                    None,
+                    "/tmp/vamp",
+                    flag_overrides={"--name": "vamp-s1"},
+                    use_tmux=True,
+                )
+            claude_command = spawn.call_args.args[0][-2]
+            self.assertIn("DISPLAY=:0", claude_command)
+            self.assertIn("XDG_RUNTIME_DIR=/run/user/1000", claude_command)
+            self.assertNotIn("WAYLAND_DISPLAY", claude_command)
+            self.assertNotIn("do-not-leak", claude_command)
+        finally:
+            window.close()
+
+    @patch("session_hub.shutil.which")
+    def test_launch_with_tmux_explicit_env_override_wins_over_desktop_clipboard(self, which):
+        """Precedence control: an explicit configured session env override for the SAME name
+        the desktop clipboard allowlist would supply must win -- the desktop value is a
+        fallback default, not authoritative."""
+        which.side_effect = lambda name: {
+            "gnome-terminal": "/usr/bin/gnome-terminal",
+            "tmux": "/usr/bin/tmux",
+            "claude": "/home/user/.local/bin/claude",
+        }.get(name)
+        metadata = {
+            "sessions": {"group:/tmp/vamp#vamp-s1": {"env": {"DISPLAY": ":99"}}},
+            "settings": {},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            with (
+                patch.object(session_hub.SessionHub, "spawn") as spawn,
+                patch("session_hub.Path.is_dir", return_value=True),
+                patch.dict(session_hub.os.environ, {"DISPLAY": ":0"}, clear=True),
+            ):
+                window.launch(
+                    "Claude",
+                    None,
+                    "/tmp/vamp",
+                    session_key="group:/tmp/vamp#vamp-s1",
+                    flag_overrides={"--name": "vamp-s1"},
+                    use_tmux=True,
+                )
+            claude_command = spawn.call_args.args[0][-2]
+            self.assertIn("DISPLAY=:99", claude_command)
+            self.assertNotIn("DISPLAY=:0", claude_command)
         finally:
             window.close()
 
