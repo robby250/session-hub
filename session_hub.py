@@ -1615,7 +1615,7 @@ class _TerminalCacheEntry:
 
     __slots__ = (
         "container", "controller", "tmux_name", "meta", "state", "last_used",
-        "_await_notifier", "_await_timer",
+        "_await_notifier", "_await_timer", "paint_verified",
     )
 
     def __init__(self, container, controller):
@@ -1627,6 +1627,10 @@ class _TerminalCacheEntry:
         self.last_used = 0.0
         self._await_notifier = None
         self._await_timer = None
+        # task-2172 fold-in (row504): whether `_verify_embed_painted` has ever confirmed this
+        # slot's current identity actually rendered. Reset on every new identity assignment (see
+        # `_assign_cache_slot`/`_evict_entry`) so a fresh attach is always reverified.
+        self.paint_verified = False
 
 
 def format_reset_timestamp(timestamp: int | None) -> str:
@@ -8951,6 +8955,12 @@ class SessionHub(QMainWindow):
         else:
             self._focused_entry = entry
             self._note_embed_focus_grabbed(attach_start_serial)
+        # task-2172 fold-in (row504): a background preload's own completion deliberately never
+        # verified paint while the pane sat hidden in the stacked widget (a hidden child is
+        # unviewable, so the sample could only ever be None -> bounded-retry -> evict) -- THIS is
+        # the first moment the pane is actually visible, so verify exactly once here.
+        if not entry.paint_verified:
+            self._schedule_paint_verify(entry)
         return True
 
     def _select_running_terminal(
@@ -9088,16 +9098,21 @@ class SessionHub(QMainWindow):
             else:
                 # A background preload finished while the user has SINCE selected this exact
                 # identity ("rapid selection during preload") -- promote it now, fail-closed on
-                # the focus grab the preload deliberately skipped.
-                if self._promote_entry(entry, attach_start_serial):
-                    self._schedule_paint_verify(entry)
-        else:
-            # Ordinary background preload completion, nobody is looking -- still schedule paint
-            # verification so a silently-blank preload gets evicted before it is ever selected.
-            self._schedule_paint_verify(entry)
+                # the focus grab the preload deliberately skipped. `_promote_entry` itself
+                # schedules paint verification exactly once, now that the pane is visible.
+                self._promote_entry(entry, attach_start_serial)
+        # else: ordinary background preload completion, nobody is looking -- task-2172 fold-in
+        # (row504): paint verification is deliberately DEFERRED, not skipped. The pane sits
+        # hidden in `_running_terminal_stack` (a QStackedWidget); a hidden child is unviewable, so
+        # `sample_non_background_pixels` could only ever read None here, and the bounded retry
+        # then failed closed and evicted a perfectly good ready cache entry -- the reported
+        # alternating instant/cold same-row switches. `_promote_entry` verifies once the pane
+        # actually becomes visible instead.
         self._advance_preload_queue(entry)
 
     def _schedule_paint_verify(self, entry: "_TerminalCacheEntry") -> None:
+        if entry.paint_verified:
+            return  # task-2172 fold-in (row504): dedupe -- already confirmed painted, don't re-arm
         generation_now = entry.controller.generation
         # task-2156: a valid XID + successful resize is not proof anything ever actually painted
         # (the observed bug) -- verify once, a short bounded delay later (real render + tmux
@@ -9122,6 +9137,7 @@ class SessionHub(QMainWindow):
             return  # superseded by a newer attach on this slot -- this verdict is stale, ignore
         painted = entry.controller.verify_painted()
         if painted is True:
+            entry.paint_verified = True
             return
         if painted is None and retries_left > 0:
             QTimer.singleShot(
@@ -9182,6 +9198,7 @@ class SessionHub(QMainWindow):
         entry.tmux_name = None
         entry.meta = None
         entry.state = "empty"
+        entry.paint_verified = False
         if entry in self._preload_queue:
             self._preload_queue.remove(entry)
         if self._preload_in_flight is entry:
@@ -9209,6 +9226,7 @@ class SessionHub(QMainWindow):
         entry.tmux_name = name
         entry.meta = (cwd, session_id, saved_name)
         entry.state = "assigned"
+        entry.paint_verified = False
         return entry
 
     def _reconcile_terminal_cache(
