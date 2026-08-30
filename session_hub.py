@@ -224,6 +224,20 @@ PROVIDERS = ("Codex", "Claude", "Antigravity")
 # "<family> weekly"), so it is deliberately excluded and keeps the prior worst-of-visible selection.
 ORDINARY_WEEKLY_WINDOW_NAME = "Weekly"
 SEMANTIC_WEEKLY_PROVIDERS = frozenset({"Codex", "Claude"})
+# task-2165: a long-lived tmux server started from a tty (e.g. the Session Hub systemd service's
+# earlier boot, or before the desktop session existed) has no clipboard-capable environment of its
+# own, and every new/resumed pane it creates inherits THAT stale environment, not Session Hub's --
+# tmux only refreshes a server's environment for names explicitly pushed via `set-environment` or
+# an `env` prefix on the exec'd command. Narrow allowlist, not a blanket os.environ passthrough:
+# only names an X11/Wayland clipboard tool (xclip) or D-Bus session actually needs.
+CLIPBOARD_ENV_ALLOWLIST = (
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_SESSION_TYPE",
+)
 # Claude's CLI has no command to enumerate models, but --model accepts these
 # family aliases, which always resolve to the latest model of each family, so
 # they stay valid across model refreshes. "Default" omits --model entirely.
@@ -8633,6 +8647,19 @@ class SessionHub(QMainWindow):
                     combined[str(name)] = str(value)
         return combined
 
+    @staticmethod
+    def desktop_clipboard_env_overrides() -> dict[str, str]:
+        """The Hub's OWN os.environ, narrowed to CLIPBOARD_ENV_ALLOWLIST - names absent from
+        the Hub's environment are omitted, never invented (see tmux_group_launch_command's
+        stale-tmux-server problem). Explicit configured overrides (group_env_overrides) take
+        precedence over this when both set the same name - the caller merges these first, then
+        overlays group_env_overrides on top."""
+        return {
+            name: os.environ[name]
+            for name in CLIPBOARD_ENV_ALLOWLIST
+            if os.environ.get(name)
+        }
+
     def launch(
         self,
         provider: str,
@@ -8724,7 +8751,10 @@ class SessionHub(QMainWindow):
                         claude_args += ["--resume", session_id]
                     if initial_prompt:
                         claude_args += [initial_prompt]
-                env_overrides = self.group_env_overrides(session_key)
+                env_overrides = {
+                    **self.desktop_clipboard_env_overrides(),
+                    **self.group_env_overrides(session_key),
+                }
                 if account_config_dir:
                     env_overrides = {**env_overrides, "CLAUDE_CONFIG_DIR": account_config_dir}
                 claude_args = prefix_env_command(claude_args, env_overrides, strip_env)
