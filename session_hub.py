@@ -33,8 +33,8 @@ from datetime import date, datetime
 from pathlib import Path
 
 from PyQt6.QtCore import (
-    QByteArray, QEvent, QObject, QRunnable, QSocketNotifier, QThreadPool, QTimer, QUrl, Qt,
-    pyqtSignal,
+    QByteArray, QEvent, QItemSelectionModel, QObject, QRunnable, QSocketNotifier, QThreadPool,
+    QTimer, QUrl, Qt, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QAction,
@@ -8680,6 +8680,7 @@ class SessionHub(QMainWindow):
         self.running_table.clearSelection()
         self.running_table.selectionModel().clearCurrentIndex()
         table_row = 0
+        selected_row: int | None = None
         for state, records in active_groups:
             label, color = activity_label(state)
             header_item = QTableWidgetItem(f"{(label or 'Other').upper()}  ·  {len(records)}")
@@ -8731,8 +8732,19 @@ class SessionHub(QMainWindow):
                     index, 2, self._detail_column_item(last_message)
                 )
                 self.running_table.setRowHeight(index, 62)
-                if resolved_name == self._selected_tmux_name:
-                    self.running_table.setCurrentCell(index, 0)
+                if resolved_name == self._selected_tmux_name and selected_row is None:
+                    selected_row = index
+        if selected_row is not None:
+            # Rebuilding a QTableWidget can leave its selection model holding the old visual
+            # row even after setCurrentCell() moves the current index. Select once, after every
+            # row exists, and bind the highlight to the selected tmux identity rather than the
+            # identity's former row number (rows reorder as activity buckets change).
+            current = self.running_table.model().index(selected_row, 0)
+            self.running_table.selectionModel().setCurrentIndex(
+                current,
+                QItemSelectionModel.SelectionFlag.ClearAndSelect
+                | QItemSelectionModel.SelectionFlag.Rows,
+            )
         # Reapply whatever query is currently typed (task-2142 row453 REWORK -- orchestrator
         # search REWORK): this repopulates every 2s via _on_running_status_tick, and a search
         # must keep filtering the live rows rather than reverting to unfiltered on the next tick.
