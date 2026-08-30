@@ -1615,7 +1615,7 @@ class _TerminalCacheEntry:
 
     __slots__ = (
         "container", "controller", "tmux_name", "meta", "state", "last_used",
-        "_await_notifier", "_await_timer", "paint_verified",
+        "_await_notifier", "_await_timer", "paint_verified", "paint_verify_pending_generation",
     )
 
     def __init__(self, container, controller):
@@ -1631,6 +1631,11 @@ class _TerminalCacheEntry:
         # slot's current identity actually rendered. Reset on every new identity assignment (see
         # `_assign_cache_slot`/`_evict_entry`) so a fresh attach is always reverified.
         self.paint_verified = False
+        # REWORK (VAMP-reviewer HIGH-2, bbb2616): the controller.generation a paint-verify check
+        # is currently reserved/in-flight for, or None -- covers both the initial delayed check
+        # and its bounded retry, so a second promotion/re-entry before the callback fires cannot
+        # install a duplicate QTimer for the same attach. Reset alongside paint_verified.
+        self.paint_verify_pending_generation: int | None = None
 
 
 def format_reset_timestamp(timestamp: int | None) -> str:
@@ -2988,8 +2993,10 @@ def resolve_pending_codex_group_rows(metadata: dict, sessions: list[Session]) ->
     by_key = {session.native_key: session for session in sessions}
     changed = False
     for group in metadata.get("groups", {}).values():
-        if not group.get("tmux"):
-            continue
+        # REWORK (VAMP-reviewer HIGH-1, bbb2616): a group's "tmux" key is legacy debris from the
+        # removed per-group override control -- no code path writes it anymore, and every
+        # Codex launch is unconditionally tmux now, so a stale `tmux: false` here must never skip
+        # binding a genuinely live tmux-launched pending row to its transcript.
         for row in group.get("rows", []):
             if row.get("provider") != "Codex" or not row.get("codex_pending_since"):
                 continue
@@ -4898,9 +4905,13 @@ def standalone_tmux_status(
     there is no tmux session to check. Pass a tmux_live_session_names()
     snapshot as `live_names` when calling this for more than one session per
     refresh.
+
+    REWORK (VAMP-reviewer HIGH-1, bbb2616): tmux_enabled comes from SESSION's own provider now,
+    never a legacy `overrides["tmux"]` override -- Claude/Codex are unconditionally tmux, and a
+    stale `false` used to report a genuinely live tmux session as not-tmux/stopped, also making
+    the standalone stop path refuse to stop it.
     """
-    explicit = overrides.get("tmux")
-    tmux_enabled = explicit if explicit is not None else True
+    tmux_enabled = session.provider in ("Claude", "Codex")
     if not tmux_enabled:
         return False, None, None
     name = (overrides.get("flags") or {}).get("--name") or overrides.get("name") or session.title
@@ -6738,7 +6749,7 @@ class ManageGroupDialog(QDialog):
             self.table.setCellWidget(index, self.TRANSCRIPTS_COLUMN, checkbox)
 
             status = group_row_status(
-                row, match, self.hub.effective_tmux(group.get("tmux")), live_names
+                row, match, self.hub.effective_tmux(row.get("provider", "Claude")), live_names
             )
             self.table.setItem(index, self.STATUS_COLUMN, QTableWidgetItem(status))
         if select_override_keys:
@@ -8315,17 +8326,18 @@ class SessionHub(QMainWindow):
         group = self.metadata.get("groups", {}).get(cwd) or {}
         return group.get("env") or {}, group.get("flags") or {}
 
-    def effective_tmux(self, explicit: bool | None) -> bool:
-        """Resolve a legacy per-session/per-group tmux override.
+    def effective_tmux(self, provider: str) -> bool:
+        """The single canonical tmux authority for a row/session of PROVIDER.
 
-        `explicit` is whatever a "tmux" key currently holds, read only to
-        correctly report the live state of an already-running legacy
-        (pre-mandatory-tmux) process. None means no legacy key exists, so
-        tmux is used - it is mandatory for every Claude/Codex launch now.
+        REWORK (VAMP-reviewer HIGH-1, bbb2616): this used to resolve a legacy per-session/
+        per-group "tmux" metadata key, preserving an old `False` as if it still meant something.
+        It never did for a mixed-provider group -- `launch()` has always decided tmux-or-not per
+        ROW by provider, never by that group-level flag, and no code path writes the key anymore
+        (the control that used to was removed). Ignore it entirely: Claude/Codex are
+        unconditionally tmux now, Antigravity never is, and a stale `tmux: false` left over from
+        before mandatory tmux must never resurface as a decision.
         """
-        if explicit is None:
-            return True
-        return explicit
+        return provider in ("Claude", "Codex")
 
     def effective_model(self, session_key: str | None, provider: str = "Claude") -> str | None:
         """The model a session would (re)launch with, if any is set.
@@ -8531,11 +8543,12 @@ class SessionHub(QMainWindow):
         running: list[tuple[str, str, dict, Session | None, str]] = []
         claimed: set[str] = set()
         for cwd, group in self.metadata.get("groups", {}).items():
-            tmux_enabled = self.effective_tmux(group.get("tmux"))
-            if not tmux_enabled:
-                continue
             display_name = group.get("display_name") or Path(cwd).name or cwd
             for row in group.get("rows", []):
+                # REWORK (VAMP-reviewer HIGH-1, bbb2616): per-ROW now, not per-group -- a stale
+                # group-level "tmux" flag used to skip the WHOLE group (every row, any provider)
+                # from ever appearing here. tmux is decided by provider alone, same as launch().
+                tmux_enabled = self.effective_tmux(row.get("provider", "Claude"))
                 match = (
                     None
                     if id(row) in codex_losers
@@ -9114,6 +9127,14 @@ class SessionHub(QMainWindow):
         if entry.paint_verified:
             return  # task-2172 fold-in (row504): dedupe -- already confirmed painted, don't re-arm
         generation_now = entry.controller.generation
+        if entry.paint_verify_pending_generation == generation_now:
+            # REWORK (VAMP-reviewer HIGH-2, bbb2616): a check for this exact attach generation is
+            # already reserved -- either the initial delayed check hasn't fired yet, or it fired
+            # `None` and is sitting in its bounded retry. Either way, a second promotion/re-entry
+            # (ready-cache-hit racing the preload-finishes-while-selected path, or a re-select
+            # before the timer fires) must not install a second QTimer for the same generation.
+            return
+        entry.paint_verify_pending_generation = generation_now
         # task-2156: a valid XID + successful resize is not proof anything ever actually painted
         # (the observed bug) -- verify once, a short bounded delay later (real render + tmux
         # attach latency needs a beat), never on a recurring timer.
@@ -9134,10 +9155,17 @@ class SessionHub(QMainWindow):
         finish_attach can race the X server; a still-uncheckable `None` after that retry is
         FAIL-CLOSED exactly like a confirmed `False` -- an unproven pane is not a painted one."""
         if entry.tmux_name is None or generation != entry.controller.generation:
-            return  # superseded by a newer attach on this slot -- this verdict is stale, ignore
+            # superseded by a newer attach on this slot -- this verdict is stale, ignore. Only
+            # clear the pending reservation if it still names THIS stale generation (a newer
+            # attach's own _schedule_paint_verify already overwrote it to its own generation
+            # otherwise, and that live reservation must not be clobbered).
+            if entry.paint_verify_pending_generation == generation:
+                entry.paint_verify_pending_generation = None
+            return
         painted = entry.controller.verify_painted()
         if painted is True:
             entry.paint_verified = True
+            entry.paint_verify_pending_generation = None
             return
         if painted is None and retries_left > 0:
             QTimer.singleShot(
@@ -9199,6 +9227,7 @@ class SessionHub(QMainWindow):
         entry.meta = None
         entry.state = "empty"
         entry.paint_verified = False
+        entry.paint_verify_pending_generation = None
         if entry in self._preload_queue:
             self._preload_queue.remove(entry)
         if self._preload_in_flight is entry:
@@ -9227,6 +9256,7 @@ class SessionHub(QMainWindow):
         entry.meta = (cwd, session_id, saved_name)
         entry.state = "assigned"
         entry.paint_verified = False
+        entry.paint_verify_pending_generation = None
         return entry
 
     def _reconcile_terminal_cache(
@@ -10372,16 +10402,19 @@ class SessionHub(QMainWindow):
                 None,
             )
         if group_row is not None:
-            use_tmux = self.effective_tmux(self.metadata["groups"][group_cwd].get("tmux"))
             tmux_name = group_row["name"]
         else:
             overrides = (self.metadata.get("sessions") or {}).get(session.key, {})
-            use_tmux = self.effective_tmux(overrides.get("tmux"))
             tmux_name = (
                 (overrides.get("flags") or {}).get("--name")
                 or overrides.get("name")
                 or session.title
             )
+        # REWORK (VAMP-reviewer HIGH-1, bbb2616): the SOURCE session's own provider decides tmux,
+        # never a legacy group/session-override "tmux" flag -- a stale `false` there used to skip
+        # stopping a session that (being Claude/Codex) is unconditionally tmux-launched now,
+        # leaking the tmux session past this Continue.
+        use_tmux = self.effective_tmux(session.provider)
 
         logical_key = session.key
         members = list(session.linked_keys or (session.native_key,))
@@ -11228,10 +11261,11 @@ def sessions_json_cli() -> int:
     claimed: set[str] = set()
     groups = {}
     for cwd, group in metadata.get("groups", {}).items():
-        explicit = group.get("tmux")
-        tmux_enabled = explicit if explicit is not None else True
         rows_out = []
         for row in group.get("rows", []):
+            # REWORK (VAMP-reviewer HIGH-1, bbb2616): per-row provider, not a legacy group-level
+            # "tmux" flag -- see refresh_running_tab's identical fix, same reasoning.
+            tmux_enabled = row.get("provider") in ("Claude", "Codex")
             match = (
                 None
                 if id(row) in codex_losers
@@ -11273,7 +11307,9 @@ def sessions_json_cli() -> int:
             )
         groups[cwd] = {
             "display_name": group.get("display_name") or Path(cwd).name or cwd,
-            "tmux": tmux_enabled,
+            # Informational aggregate only (no code reads this field back as authority) -- whether
+            # ANY row in this group is a provider that always tmux-launches.
+            "tmux": any(row.get("provider") in ("Claude", "Codex") for row in group.get("rows", [])),
             "rows": rows_out,
         }
 
