@@ -10469,15 +10469,53 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
         """task-2166 EXIT precedence control: a real Qt widget gaining focus (the user
         deliberately selecting it) must hand X11 focus back to Session Hub's own window --
         modeled at the same boundary this code operates at (a raw window id), matching how the
-        Xvfb integration test proves it against real X11."""
+        Xvfb integration test proves it against real X11. task-2170: this is now the SETTLED
+        case -- the event loop is pumped once (draining the deferred rearm) between attach and
+        the later focus change, modeling a genuinely later, separate user interaction."""
         window = self._window_with_one_running_session()
         item = window.running_table.item(0, 0)
         _calls, embedder = self._wire_fake_embedding(window)
         with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
             window._activate_running_row(item)
+        QApplication.processEvents()  # drains the deferred _arm_embed_focus_watch
         embedder.focus_calls.clear()
         window._on_qt_focus_changed(None, window.running_table)
         self.assertEqual(embedder.focus_calls, [int(window.winId())])
+
+    def test_qt_focus_changed_immediately_after_attach_does_not_release(self):
+        """task-2170: the positive regression -- a focusChanged arriving in the SAME event-loop
+        turn the attach's own focus() grab completed (before the deferred rearm has run) must be
+        ignored, not released. This is exactly what a window-manager focus bounce-back
+        immediately following our XSetInputFocus call looks like, and is indistinguishable at
+        this signal from the click/activation that started the attach itself. Fails on row482's
+        landed implementation, which released unconditionally on any `now is not None`."""
+        window = self._window_with_one_running_session()
+        item = window.running_table.item(0, 0)
+        _calls, embedder = self._wire_fake_embedding(window)
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window._activate_running_row(item)
+        # Deliberately NOT pumping the event loop here -- the deferred rearm has not run yet.
+        embedder.focus_calls.clear()
+        window._on_qt_focus_changed(None, window.running_table)
+        self.assertEqual(embedder.focus_calls, [])
+        # Once the event loop actually drains, the watch arms and a later change still releases.
+        QApplication.processEvents()
+        window._on_qt_focus_changed(None, window.running_table)
+        self.assertEqual(embedder.focus_calls, [int(window.winId())])
+
+    def test_qt_focus_changed_immediately_after_reselect_does_not_release(self):
+        """task-2170: same regression as above, for the OTHER real focus()-grabbing path -- the
+        re-select-an-already-attached-row short-circuit in _switch_embedded_terminal."""
+        window = self._window_with_one_running_session()
+        item = window.running_table.item(0, 0)
+        _calls, embedder = self._wire_fake_embedding(window)
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window._activate_running_row(item)
+            QApplication.processEvents()
+            window._activate_running_row(item)  # already attached -- refocus short-circuit
+        embedder.focus_calls.clear()
+        window._on_qt_focus_changed(None, window.running_table)
+        self.assertEqual(embedder.focus_calls, [])
 
     def test_qt_focus_changed_to_none_never_releases(self):
         """Negative control: `now is None` is what OUR OWN focus() grab away from Qt's toplevel
