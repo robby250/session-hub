@@ -7757,10 +7757,19 @@ class SessionHub(QMainWindow):
                 # still owns the exact rollout `match.native_key` names, and that
                 # is what every tmux-facing action below must target -- the saved
                 # name is kept only for the row registry lookup and the label.
-                resolved_name = (
-                    tmux_name_by_native_key.get(match.native_key, row["name"])
-                    if match else row["name"]
-                )
+                if match and match.provider == "Codex":
+                    resolved_name = tmux_name_by_native_key.get(match.native_key)
+                    if resolved_name is None:
+                        # task-2156 REWORK #2 (18be076): missing/ambiguous exact identity must
+                        # NEVER fall back to the saved row name as a guessed live owner -- that
+                        # name can itself be a live tmux session under a completely unrelated
+                        # rollout. Fail closed: this row is never claimed Running here, and no
+                        # sibling target is ever populated for capture/embed/focus/Stop. Scoped to
+                        # Codex, the only provider the census resolves at all -- a Claude/
+                        # Antigravity match always falls back to the saved name below, unaffected.
+                        continue
+                else:
+                    resolved_name = row["name"]
                 if group_row_status(row, match, tmux_enabled, live_names, tmux_name=resolved_name) == "Running":
                     running.append((display_name, cwd, row, match, resolved_name))
 
@@ -9964,8 +9973,17 @@ def sessions_json_cli() -> int:
             if match:
                 claimed.add(match.native_key)
             resolved_name = (
-                tmux_name_by_native_key.get(match.native_key, row["name"]) if match else row["name"]
+                tmux_name_by_native_key.get(match.native_key)
+                if match and match.provider == "Codex" else row["name"]
             )
+            # task-2156 REWORK #2 (18be076): a matched Codex row whose exact native key is
+            # missing/ambiguous must fail closed -- never guess the saved row name is the live
+            # owner, since that name can itself be a live tmux session under an unrelated
+            # rollout. session_activity already treats tmux_name=None safely (only skips the
+            # tmux-liveness half of its check); `status` needs an explicit override since
+            # group_row_status falls back to row["name"] internally when given no tmux_name.
+            # Scoped to Codex, the only provider the census resolves at all.
+            unresolved = match is not None and match.provider == "Codex" and resolved_name is None
             activity_state, activity_detail = (
                 session_activity(
                     match, tmux_enabled=tmux_enabled, tmux_name=resolved_name, live_names=live_names
@@ -9977,8 +9995,9 @@ def sessions_json_cli() -> int:
                     "name": row["name"],
                     "provider": row.get("provider", "Claude"),
                     # Liveness (process/tmux) - separate fact from activity below.
-                    "status": group_row_status(
-                        row, match, tmux_enabled, live_names, tmux_name=resolved_name
+                    "status": (
+                        "Stopped" if unresolved
+                        else group_row_status(row, match, tmux_enabled, live_names, tmux_name=resolved_name)
                     ),
                     "activity": activity_state,
                     "activity_label": activity_label(activity_state)[0],

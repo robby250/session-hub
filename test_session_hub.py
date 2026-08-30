@@ -8598,14 +8598,16 @@ class SessionActivityTests(unittest.TestCase):
             window.close()
 
     def test_refresh_running_tab_ambiguous_owner_never_targets_a_sibling(self):
-        """task-2156 REWORK finding 2 control: TWO live tmux sessions both report an fd on the
-        SAME native rollout key (a duplicate/mid-rename census read, not a distinct sibling like
-        the control above). The row must NOT claim either as its live owner -- it is judged on
-        its own saved name only, which is not itself live, so it must not appear as Running at
-        all. A silently-resolved sibling target (the pre-fix bug) would instead show it Running
-        against whichever tmux name the reverse-map comprehension happened to keep last."""
+        """task-2156 REWORK finding 2 control, tightened per SECOND reviewer REWORK (18be076):
+        TWO live tmux sessions both report an fd on the SAME native rollout key, and the row's
+        OWN SAVED NAME IS ONE OF THOSE TWO AMBIGUOUS LIVE OWNERS ("tmux-dup-x") -- the exact
+        unsafe path the first version of this control missed by using a saved name that was not
+        live at all. Even though `tmux_session_alive(row["name"])` alone would report True, the
+        row must still not be claimed Running: the ambiguous helper drops the key, and the fixed
+        caller must fail closed on that -- never fall back to trusting the saved name as proof of
+        ownership just because it happens to be live under something else."""
         native_key = "Codex:01a00000-0000-0000-0000-0000000000dd"
-        row = {"name": "worker", "provider": "Codex", "session_key": native_key}
+        row = {"name": "tmux-dup-x", "provider": "Codex", "session_key": native_key}
         session_hub.METADATA_PATH.write_text(
             json.dumps({
                 "settings": {}, "sessions": {},
@@ -8640,6 +8642,47 @@ class SessionActivityTests(unittest.TestCase):
             window.refresh_running_tab()
             self.assertEqual(window.running_table.rowCount(), 0)  # not claimed as Running
             window.close()
+
+    def test_sessions_json_cli_ambiguous_owner_reports_stopped_not_a_sibling(self):
+        """task-2156 REWORK finding 2, second call site (sessions_json_cli, the TUI/JSON/CLI
+        path the reviewer named alongside refresh_running_tab). Same ambiguous-owner fixture,
+        saved name equal to one of the two live ambiguous owners -- `status` must read Stopped,
+        never Running against the unproven saved-name-as-sibling target."""
+        native_key = "Codex:01a00000-0000-0000-0000-0000000000ee"
+        row = {"name": "tmux-dup-x", "provider": "Codex", "session_key": native_key}
+        session_hub.METADATA_PATH.write_text(
+            json.dumps({
+                "settings": {}, "sessions": {},
+                "groups": {"/tmp/vamp": {"tmux": True, "rows": [row]}},
+            }),
+            encoding="utf-8",
+        )
+        live_session = session_hub.Session(
+            "Codex", native_key.split(":", 1)[1], "w", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/w.jsonl"),
+        )
+        self._fake_run_with_native_identity({701: native_key, 702: native_key})
+
+        def fake_run(argv, **kwargs):
+            result = MagicMock(returncode=0, stdout="")
+            if argv[1] == "list-sessions":
+                result.stdout = "tmux-dup-x\ntmux-dup-y\n"
+            elif argv[1] == "list-panes":
+                result.stdout = "tmux-dup-x\t%0\t701\t1788000000\ntmux-dup-y\t%1\t702\t1788000000\n"
+            return result
+
+        with (
+            patch.object(session_hub, "codex_sessions", return_value=[live_session]),
+            patch.object(session_hub, "claude_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.shutil, "which", return_value="/usr/bin/tmux"),
+            patch.object(session_hub.subprocess, "run", side_effect=fake_run),
+        ):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                session_hub.sessions_json_cli()
+            payload = json.loads(out.getvalue())
+        status = payload["groups"]["/tmp/vamp"]["rows"][0]["status"]
+        self.assertEqual(status, "Stopped")
 
     def test_status_tick_skips_the_census_when_running_tab_not_current(self):
         """task-2142: the periodic 2s tick must do NOTHING -- not even the cheap
