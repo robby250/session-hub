@@ -223,7 +223,10 @@ STATUS_DIR = DATA_DIR / "status"
 DEFAULT_LAYOUT_SETTINGS = {
     "window_geometry": "AdnQywADAAAAAAXKAAAC0wAACf8AAAV8AAAFygAAAvMAAAn/AAAFfAAAAAAAAAAACgAAAAXKAAAC8wAACf8AAAV8",
     "main_table_columns_v2": "AAAA/wAAAAAAAAABAAAAAQAAAAQBAAAAAAAAAAAAAAAAAAAAAAAABB4AAAAGAQEBAAAAAAABAAAAAAAAAGT/////AAAAhAAAAAAAAAAGAAAAWgAAAAEAAAAAAAAAWgAAAAEAAAAAAAAA3AAAAAEAAAAAAAABQAAAAAEAAAAAAAAAjAAAAAEAAAAAAAAAwgAAAAEAAAABAAAD6AAAAAAAAAAAAAAAAAAAAAAAAAAAAQ==",
-    "running_table_columns_v1": "AAAA/wAAAAAAAAABAAAAAQAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAXsAAAADAAEBAAAAAAAAAAAAAAAAAGT/////AAAAhAAAAAAAAAADAAAAcQAAAAEAAAAAAAAAOwAAAAEAAAAAAAAAzwAAAAEAAAAAAAAD6AAAAAAAAAAAAAAAAAAAAAAAAAAAAQ==",
+    # _v2: task-2191 dropped Running's Status column (three sections to two); the
+    # old _v1 blob is a three-section state that would scramble widths if restored
+    # onto the new two-section header, so it's replaced rather than kept alongside.
+    "running_table_columns_v2": "AAAA/wAAAAAAAAABAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAlMAAAACAAEBAAAAAAAAAAAAAAAAAGT/////AAAAhAAAAAAAAAACAAAAuQAAAAEAAAAAAAABmgAAAAEAAAAAAAAD6AAAAAAAAAAAAAAAAAAAAAAAAAAAAQ==",
     "running_splitter_state_v1": "AAAA/wAAAAEAAAACAAABgQAAAp8B/////wEAAAABAA==",
     "group_dialog_geometry": "AdnQywADAAAAAAPuAAABgwAACRsAAAKwAAAD7gAAAYMAAAkbAAACsAAAAAAAAAAACgAAAAPuAAABgwAACRsAAAKw",
     "group_table_columns_v2": "AAAA/wAAAAAAAAABAAAAAAAAAAUBAAAABwAAAAUAAAABAAAAAgAAAAMAAAAEAAAAAAAAAAYAAAAHAAAABQAAAAEAAAACAAAAAwAAAAQAAAAAAAAABgAAAAAAAAAAAAAFFgAAAAcBAQEAAAAAAAEAAAACAAAAZP////8AAACEAAAAAAAAAAcAAAA4AAAAAQAAAAMAAABYAAAAAQAAAAAAAAEBAAAAAQAAAAAAAACQAAAAAQAAAAAAAABfAAAAAQAAAAMAAABFAAAAAQAAAAAAAAJRAAAAAQAAAAEAAAPoAAAAAAAAAAAAAAAAAAAAAAAAAAAB",
@@ -7748,8 +7751,12 @@ class SessionHub(QMainWindow):
             )
         self.running_table.setColumnWidth(0, 185)
         self.running_table.setColumnWidth(1, 410)
+        # _v2: task-2191 dropped the Status column (three sections to two) -- a
+        # pre-existing three-section blob restored onto the new two-section header
+        # scrambles widths (the same class of bug _v2 fixed for `main_table_columns_v2`
+        # above). Bump the key so only a fresh two-column blob ever round-trips.
         restore_column_widths(
-            self.running_table, self.settings().get("running_table_columns_v1")
+            self.running_table, self.settings().get("running_table_columns_v2")
         )
         # task-2142 row453: single click, Enter and double-click all converge on the same exact
         # embedded-terminal switch -- itemActivated already fires for both Enter and double-click
@@ -7897,7 +7904,7 @@ class SessionHub(QMainWindow):
                 self.saveGeometry().toBase64()
             ).decode("ascii")
             latest["settings"]["main_table_columns_v2"] = column_widths_state(self.table)
-            latest["settings"]["running_table_columns_v1"] = column_widths_state(
+            latest["settings"]["running_table_columns_v2"] = column_widths_state(
                 self.running_table
             )
             splitter_state = (
@@ -8712,8 +8719,17 @@ class SessionHub(QMainWindow):
                     Qt.ItemDataRole.UserRole,
                     (cwd, row["name"], session_id, resolved_name),
                 )
+                age = relative_activity_age(message_ms)
+                name_item.setData(Qt.ItemDataRole.UserRole + 5, age)
+                # task-2191 REWORK (VAMP-reviewer HIGH-1): the activity label and age used to be
+                # readable from the Status item's DisplayRole text; the delegate now paints both
+                # manually, so a screen reader gets neither unless it's put here explicitly. This
+                # is accessibility text only -- grouping/filtering still key off the activity enum
+                # via the group-header rows and UserRole+5 respectively, never this role.
                 name_item.setData(
-                    Qt.ItemDataRole.UserRole + 5, relative_activity_age(message_ms)
+                    Qt.ItemDataRole.AccessibleTextRole,
+                    f"{visible_name}, {provider} · {display_name}, {label or 'Unknown'}"
+                    + (f", {age}" if age else ""),
                 )
                 name_item.setToolTip(
                     bounded_tooltip(f"{provider} · {display_name} · {cwd}")
