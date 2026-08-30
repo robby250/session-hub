@@ -103,6 +103,16 @@ def main(argv: list[str] | None = None) -> int:
     # grab is sufficient for the whole session; there is only ever one widget in this window.
     terminal.grab_focus()
 
+    def reclaim_keyboard_focus(_widget, event) -> bool:
+        """A click inside the real VTE child is terminal intent, independent of Qt/XEmbed."""
+        terminal.grab_focus()
+        window = plug.get_window()
+        if window is not None:
+            window.focus(event.time or Gdk.CURRENT_TIME)
+        return False
+
+    terminal.connect("button-press-event", reclaim_keyboard_focus)
+
     def announce() -> bool:
         window = plug.get_window()
         if window is None:
