@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import html
 import collections
 import concurrent.futures
 import fcntl
@@ -3257,16 +3258,11 @@ def prefix_env_command(
 
 
 def tmux_group_launch_command(name: str, cwd: str, claude_args: list[str]) -> list[str]:
-    """Launch `claude_args` detached inside a tmux session named `name`,
-    then open a terminal already attached to it.
+    """Launch `claude_args` detached inside a tmux session named `name`.
 
-    Requested by the VAMPULSE-orchestrator session: peer sessions drive each
-    other via injected keystrokes, and gnome-terminal's VTE silently
-    discards synthetic XSendEvent keystrokes (confirmed empty-terminal in
-    testing), so any no-focus-impact automation has to go through
-    `tmux send-keys` instead - which only reaches processes actually running
-    inside tmux. The tmux session name must equal the Claude `--name` value
-    exactly: external tooling looks a session up by that name, not by PID.
+    Session Hub's Running tab owns the normal terminal surface. External
+    gnome-terminal attachment is an explicit context-menu fallback through
+    external_tmux_attach_command(), never a launch side effect.
 
     Unlike pid_capture_command, this does NOT capture the launched claude
     process's PID - it isn't a child of the process this command spawns (tmux
@@ -3276,9 +3272,6 @@ def tmux_group_launch_command(name: str, cwd: str, claude_args: list[str]) -> li
     pass - see SessionHub.launch_group_row_via_tmux).
     """
     name = sanitize_tmux_session_name(name)
-    terminal = shutil.which("gnome-terminal")
-    if not terminal:
-        raise RuntimeError("Launching into tmux currently requires gnome-terminal.")
     tmux = shutil.which("tmux")
     if not tmux:
         raise RuntimeError("tmux is not installed.")
@@ -3307,11 +3300,6 @@ def tmux_group_launch_command(name: str, cwd: str, claude_args: list[str]) -> li
     # taking down every row on the socket, not just this one. It only ever bought Claude Code's
     # AskUserQuestion AFK auto-continue timeout (which needs a focus-out to fire); keyboard input,
     # tmux send-keys, identity, status, embedding, and the review transport don't need it.
-    # `--window`: without it, gnome-terminal's D-Bus server folds a launch that lands while another
-    # of its windows is still opening into a TAB of that existing window instead of a new one - hit
-    # by ctrl-click-launching two group rows together (VAMPULSE-orchestrator + a worker), where the
-    # window ended up titled for one row while actually attached to the other's tmux session. The
-    # non-tmux path (terminal_command) already forces this for the same reason.
     # `-t "=$2"`, not `-t "$2"`: tmux's default target resolution accepts an
     # unambiguous PREFIX match (real isolated-tmux control, row447 second
     # rework: with only "foo2" live, `has-session -t foo` exits 0) - the `=`
@@ -3324,14 +3312,12 @@ def tmux_group_launch_command(name: str, cwd: str, claude_args: list[str]) -> li
         '"$1" has-session -t "=$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
         ' "$1" set-option -g set-titles on >/dev/null;'
         ' "$1" set-option -g set-titles-string "#S" >/dev/null;'
-        ' "$1" set-option -g focus-events off >/dev/null;'
-        ' exec "$5" --window -- "$1" attach -t "=$2"',
+        ' "$1" set-option -g focus-events off >/dev/null',
         "session-hub",
         tmux,
         name,
         cwd,
         claude_command,
-        terminal,
     ]
 
 
@@ -4568,6 +4554,29 @@ def activity_label(state: str | None) -> tuple[str, str]:
     every presentation layer so "Working"/"Needs input"/etc. render with one
     spelling and color everywhere, not a per-widget copy that can drift."""
     return ACTIVITY_LABELS.get(state, ("", "#888888"))
+
+
+def relative_activity_age(updated_ms: int, now: float | None = None) -> str:
+    """Compact human age for a transcript's latest agent activity."""
+    if not updated_ms:
+        return ""
+    seconds = max(0, int((now if now is not None else time.time()) - updated_ms / 1000))
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    days = hours // 24
+    return f"{days}d ago"
+
+
+def bounded_tooltip(text: str) -> str:
+    """Rich-text tooltip capped to a readable card width instead of the desktop width."""
+    escaped = html.escape(" ".join(text.split()))
+    return f'<div style="width: 400px; white-space: normal;">{escaped}</div>' if escaped else ""
 
 
 def hook_notify_cli() -> int:
@@ -7389,9 +7398,24 @@ class SessionHub(QMainWindow):
         # row453 REWORK -- orchestrator search REWORK: "filters whichever tab is
         # visible" must also cover switching TO a tab with a query already typed).
         if self._running_tab_visible():
+            running_index = self.main_tabs.indexOf(self.running_page)
+            self.main_tabs.setTabText(running_index, "Running")
+            self.main_tabs.tabBar().setTabTextColor(running_index, QColor())
             self.refresh_running_tab()
         else:
             self.apply_filter()
+
+    def _announce_running_launch(self, name: str) -> None:
+        """Keep launch in-app and point the user at the embedded Running terminal."""
+        running_index = self.main_tabs.indexOf(self.running_page)
+        if running_index >= 0 and self.main_tabs.currentIndex() != running_index:
+            self.main_tabs.setTabText(running_index, "Running  •")
+            self.main_tabs.tabBar().setTabTextColor(running_index, QColor("#5aa9ff"))
+        self.status.setText(f"{name} launched in Running — right-click there to open externally.")
+        # The detached tmux creation happens in the just-spawned child process. Refresh once after
+        # that short handoff so a user already viewing Running sees the new row without waiting
+        # for the normal 2-second status tick. No polling or retry loop.
+        QTimer.singleShot(300, self.refresh_running_tab)
 
     def build_ui(self) -> None:
         root = QWidget()
@@ -7614,9 +7638,22 @@ class SessionHub(QMainWindow):
         self.running_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.running_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.running_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.running_table.setAlternatingRowColors(True)
+        self.running_table.setAlternatingRowColors(False)
+        self.running_table.setWordWrap(True)
+        self.running_table.setShowGrid(False)
+        self.running_table.verticalHeader().setDefaultSectionSize(62)
         self.running_table.verticalHeader().setVisible(False)
-        self.running_table.horizontalHeader().setStretchLastSection(True)
+        self.running_table.horizontalHeader().setStretchLastSection(False)
+        for column in range(3):
+            self.running_table.horizontalHeader().setSectionResizeMode(
+                column, QHeaderView.ResizeMode.Interactive
+            )
+        self.running_table.setColumnWidth(0, 185)
+        self.running_table.setColumnWidth(1, 100)
+        self.running_table.setColumnWidth(2, 310)
+        restore_column_widths(
+            self.running_table, self.settings().get("running_table_columns_v1")
+        )
         # task-2142 row453: single click, Enter and double-click all converge on the same exact
         # embedded-terminal switch -- itemActivated already fires for both Enter and double-click
         # in Qt, so only itemClicked (single click) needs a second connection.
@@ -7683,15 +7720,23 @@ class SessionHub(QMainWindow):
         QApplication.instance().focusChanged.connect(self._on_qt_focus_changed)
         QApplication.instance().installEventFilter(self)
 
-        running_splitter = QSplitter(Qt.Orientation.Horizontal)
-        running_splitter.addWidget(running_list_page)
-        running_splitter.addWidget(running_terminal_page)
-        running_splitter.setStretchFactor(0, 0)
-        running_splitter.setStretchFactor(1, 1)
-        running_splitter.splitterMoved.connect(
+        self.running_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.running_splitter.addWidget(running_list_page)
+        self.running_splitter.addWidget(running_terminal_page)
+        self.running_splitter.setStretchFactor(0, 0)
+        self.running_splitter.setStretchFactor(1, 1)
+        self.running_splitter.splitterMoved.connect(
             lambda *_a: self._on_terminal_container_resize()
         )
-        running_layout.addWidget(running_splitter, 1)
+        running_layout.addWidget(self.running_splitter, 1)
+        encoded_splitter = self.settings().get("running_splitter_state_v1")
+        if encoded_splitter:
+            try:
+                decoded_splitter = QByteArray.fromBase64(encoded_splitter.encode("ascii"))
+                if decoded_splitter.isEmpty() or not self.running_splitter.restoreState(decoded_splitter):
+                    self.settings().pop("running_splitter_state_v1", None)
+            except (AttributeError, TypeError, ValueError):
+                self.settings().pop("running_splitter_state_v1", None)
 
         external_shortcut = QShortcut(QKeySequence("Ctrl+Shift+O"), running_page)
         external_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -7746,6 +7791,12 @@ class SessionHub(QMainWindow):
                 self.saveGeometry().toBase64()
             ).decode("ascii")
             latest["settings"]["main_table_columns_v2"] = column_widths_state(self.table)
+            latest["settings"]["running_table_columns_v1"] = column_widths_state(
+                self.running_table
+            )
+            latest["settings"]["running_splitter_state_v1"] = bytes(
+                self.running_splitter.saveState().toBase64()
+            ).decode("ascii")
             self.metadata = latest
             write_metadata(latest)
         super().closeEvent(event)
@@ -8479,61 +8530,100 @@ class SessionHub(QMainWindow):
         ])
 
         name_counts = collections.Counter(row["name"] for _dn, _cwd, row, _m, _rn in running)
-        self.running_table.setRowCount(len(running))
-        for index, (display_name, cwd, row, match, resolved_name) in enumerate(running):
-            session_id = match.session_id if match else None
-            provider = row.get("provider", "Claude")
-            name_item = QTableWidgetItem(
-                row["name"]
-                if name_counts[row["name"]] <= 1
-                # A visible name collision (same row name, different project) gets a
-                # parenthetical project suffix so the two rows are distinguishable at
-                # a glance - full identity (provider/project/cwd) lives in the tooltip
-                # rather than cluttering every row with it. Label stays the saved
-                # name even when resolved_name differs (task-2156) -- only the
-                # underlying tmux TARGET changes, never what the user sees.
-                else f"{row['name']}  ({display_name})"
-            )
-            name_item.setData(Qt.ItemDataRole.UserRole, (cwd, row["name"], session_id, resolved_name))
-            name_item.setToolTip(f"{provider} · {display_name} · {cwd}")
-            self.running_table.setItem(index, 0, name_item)
-            # Every row here is already confirmed tmux-alive (group_row_status/
-            # standalone_tmux_status above), so session_activity's own liveness
-            # check always passes - it still goes through the one shared verdict
-            # function rather than reading status files directly (see its
-            # docstring), so this can never diverge from the All Sessions/TUI/
-            # JSON verdicts for the same session. Read-only: refresh must never
-            # write status itself (status_pipeline_plan.md's contract) - the
-            # only writer is the hook pipeline (write_session_status).
+        view_rows = []
+        for display_name, cwd, row, match, resolved_name in running:
             state, _detail = (
-                session_activity(match, tmux_enabled=True, tmux_name=resolved_name, live_names=live_names)
+                session_activity(
+                    match, tmux_enabled=True, tmux_name=resolved_name, live_names=live_names
+                )
                 if match else ("unknown", "")
             )
-            self.running_table.setItem(index, 1, self._status_column_item(state))
-            # Last message is the newest assistant text in the session's own transcript (task-
-            # 2164) -- never session_activity's status detail, and never pane/terminal text: a
-            # row with no matched live session (match is None) shows an empty preview rather
-            # than falling back to anything else.
-            last_message = _transcript_last_assistant_text(match.path, match.provider) if match else ""
-            self.running_table.setItem(index, 2, self._detail_column_item(last_message))
+            last_message = (
+                _transcript_last_assistant_text(match.path, match.provider) if match else ""
+            )
+            view_rows.append(
+                (state, display_name, cwd, row, match, resolved_name, last_message)
+            )
+
+        state_order = ("needs_input", "working", "done", "idle", "unknown")
+        buckets = {
+            state: [record for record in view_rows if record[0] == state]
+            for state in state_order
+        }
+        active_groups = [(state, buckets[state]) for state in state_order if buckets[state]]
+        self.running_table.clearSpans()
+        self.running_table.setRowCount(len(view_rows) + len(active_groups))
+        table_row = 0
+        for state, records in active_groups:
+            label, color = activity_label(state)
+            header_item = QTableWidgetItem(f"{(label or 'Other').upper()}  ·  {len(records)}")
+            header_item.setData(Qt.ItemDataRole.UserRole + 4, "activity_header")
+            header_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            header_item.setForeground(QColor(color))
+            header_item.setBackground(QColor("#25272d"))
+            self.running_table.setItem(table_row, 0, header_item)
+            self.running_table.setSpan(table_row, 0, 1, 3)
+            self.running_table.setRowHeight(table_row, 28)
+            table_row += 1
+            records.sort(
+                key=lambda record: record[4].updated_ms if record[4] else 0,
+                reverse=True,
+            )
+            for _state, display_name, cwd, row, match, resolved_name, last_message in records:
+                index = table_row
+                table_row += 1
+                session_id = match.session_id if match else None
+                provider = row.get("provider", "Claude")
+                visible_name = (
+                    row["name"]
+                    if name_counts[row["name"]] <= 1
+                    else f"{row['name']}  ({display_name})"
+                )
+                name_item = QTableWidgetItem(
+                    f"{visible_name}\n{provider} · {display_name}"
+                )
+                name_item.setData(
+                    Qt.ItemDataRole.UserRole,
+                    (cwd, row["name"], session_id, resolved_name),
+                )
+                name_item.setToolTip(
+                    bounded_tooltip(f"{provider} · {display_name} · {cwd}")
+                )
+                name_item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                )
+                tint = QColor(color)
+                tint.setAlpha(32)
+                name_item.setBackground(tint)
+                self.running_table.setItem(index, 0, name_item)
+                age = relative_activity_age(match.updated_ms if match else 0)
+                self.running_table.setItem(
+                    index, 1, self._status_column_item(state, age)
+                )
+                self.running_table.setItem(
+                    index, 2, self._detail_column_item(last_message)
+                )
+                self.running_table.setRowHeight(index, 62)
         # Reapply whatever query is currently typed (task-2142 row453 REWORK -- orchestrator
         # search REWORK): this repopulates every 2s via _on_running_status_tick, and a search
         # must keep filtering the live rows rather than reverting to unfiltered on the next tick.
         self._apply_running_filter(self.search.text().strip().lower())
 
-    def _status_column_item(self, state: str) -> QTableWidgetItem:
+    def _status_column_item(self, state: str, age: str = "") -> QTableWidgetItem:
         label, color = activity_label(state)
-        item = QTableWidgetItem(label)
+        item = QTableWidgetItem((label or "Unknown") + (f"\n{age}" if age else ""))
         item.setForeground(QColor(color))
+        item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         return item
 
     @staticmethod
     def _detail_column_item(detail: str) -> QTableWidgetItem:
         detail = " ".join(detail.split())
-        snippet = detail if len(detail) <= 80 else detail[:79] + "…"
-        item = QTableWidgetItem(snippet)
+        snippet = detail if len(detail) <= 180 else detail[:179] + "…"
+        item = QTableWidgetItem(snippet or "No agent message yet")
+        item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         if detail:
-            item.setToolTip(detail)
+            item.setToolTip(bounded_tooltip(detail))
         return item
 
     def stop_selected_running(self) -> None:
@@ -8542,7 +8632,10 @@ class SessionHub(QMainWindow):
             QMessageBox.information(self, "Session Hub", "Select a running session first.")
             return
         item = self.running_table.item(row, 0)
-        cwd, name, _session_id, tmux_name = item.data(Qt.ItemDataRole.UserRole)
+        data = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not isinstance(data, (tuple, list)) or len(data) != 4:
+            return
+        cwd, name, _session_id, tmux_name = data
         confirm = QMessageBox.question(
             self,
             "Stop session",
@@ -8643,8 +8736,18 @@ class SessionHub(QMainWindow):
         item = self.running_table.item(row, 0)
         if not item:
             return
-        cwd, name, session_id, tmux_name = item.data(Qt.ItemDataRole.UserRole)
-        self._focus_or_resume_session(cwd, name, session_id, tmux_name=tmux_name)
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, (tuple, list)) or len(data) != 4:
+            return
+        _cwd, _name, _session_id, tmux_name = data
+        if window_titled(tmux_name):
+            threading.Thread(
+                target=focus_window_by_title, args=(tmux_name,), daemon=True
+            ).start()
+            return
+        ok, detail = self._attach_external_tmux(tmux_name)
+        if not ok:
+            QMessageBox.critical(self, "Could not open session", detail)
 
     def open_selected_running_externally(self) -> None:
         """Ctrl+Shift+O: `reveal_running_row` for the currently selected row."""
@@ -8661,7 +8764,10 @@ class SessionHub(QMainWindow):
         name_item = self.running_table.item(row, 0)
         if not name_item:
             return
-        cwd, name, session_id, tmux_name = name_item.data(Qt.ItemDataRole.UserRole)
+        data = name_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, (tuple, list)) or len(data) != 4:
+            return
+        cwd, name, session_id, tmux_name = data
         # The embed target is always the ACTUAL live tmux session (task-2156) -- embedding never
         # cares about the saved row name, only `name` is carried through for the fallback path.
         self._select_running_terminal(cwd, tmux_name, session_id, saved_name=name)
@@ -9129,6 +9235,10 @@ class SessionHub(QMainWindow):
         item = self.running_table.itemAt(point)
         if item is None:
             return
+        name_item = self.running_table.item(item.row(), 0)
+        data = name_item.data(Qt.ItemDataRole.UserRole) if name_item else None
+        if not isinstance(data, (tuple, list)) or len(data) != 4:
+            return
         row = item.row()
         self.running_table.setCurrentCell(row, 0)
         menu = QMenu(self)
@@ -9156,11 +9266,28 @@ class SessionHub(QMainWindow):
         text, AND the hidden identity fields (cwd/exact tmux name/session id) carried in
         column 0's UserRole data -- entirely from what's already rendered/cached, never a new
         discovery or capture pass (task-2142 row453 REWORK -- orchestrator search REWORK)."""
+        current_header: int | None = None
+        current_header_has_visible_child = False
+
+        def finish_header() -> None:
+            if current_header is not None:
+                self.running_table.setRowHidden(
+                    current_header, bool(query) and not current_header_has_visible_child
+                )
+
         for row in range(self.running_table.rowCount()):
             name_item = self.running_table.item(row, 0)
             if not name_item:
                 continue
+            if name_item.data(Qt.ItemDataRole.UserRole + 4) == "activity_header":
+                finish_header()
+                current_header = row
+                current_header_has_visible_child = False
+                continue
             data = name_item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(data, (tuple, list)) or len(data) not in (3, 4):
+                self.running_table.setRowHidden(row, bool(query))
+                continue
             # 4-tuple since task-2156 (adds the resolved actual tmux name); tolerate the older
             # 3-tuple shape too so a hand-built test/UserRole item without it still filters.
             cwd, name, session_id, tmux_name = data if len(data) == 4 else (*data, None)
@@ -9172,7 +9299,10 @@ class SessionHub(QMainWindow):
                     detail_item.text() if detail_item else "", cwd, name, session_id, tmux_name,
                 ) if part
             ).lower()
-            self.running_table.setRowHidden(row, bool(query) and query not in haystack)
+            hidden = bool(query) and query not in haystack
+            self.running_table.setRowHidden(row, hidden)
+            current_header_has_visible_child = current_header_has_visible_child or not hidden
+        finish_header()
 
     def _apply_all_sessions_filter(self, query: str) -> None:
         """Text-filters the ordinary grouped rows; a non-empty query additionally surfaces
@@ -9728,11 +9858,19 @@ class SessionHub(QMainWindow):
                 # that later `tmux send-keys`/respawn/interactive commands inherit.
                 reconcile_tmux_desktop_env(self.desktop_clipboard_env_overrides())
                 command = tmux_group_launch_command(name, cwd, claude_args)
+                if session_id:
+                    # A resumed conversation inherits its old transcript and status file. Until
+                    # the user submits a new turn, that historical task_started/working marker
+                    # must not make a freshly launched idle process appear busy.
+                    write_session_status(session_id, "idle")
                 self.spawn(
                     command, session_key, cwd=cwd, focus=focus, strip_env=strip_env
                 )
+                self._announce_running_launch(name)
                 return
             pidfile = new_pid_capture_file() if provider == "Claude" else None
+            if session_id:
+                write_session_status(session_id, "idle")
             self.spawn(
                 self.terminal_command(
                     provider, session_id, cwd, source_cwd, model, flags, pidfile,
