@@ -7420,11 +7420,15 @@ class SessionHub(QMainWindow):
 
     def _on_main_tab_changed(self, index: int) -> None:
         is_running = index == self.main_tabs.indexOf(self.running_page)
-        self._set_running_terminal_visible(is_running)
-        # task-2169: apply (never persist) the destination tab's own remembered
-        # expand/collapse state before anything else - reading source tab's
-        # preference must never leak onto Running, or vice versa.
-        self._apply_usage_expanded_for_tab(index)
+        if is_running:
+            # Remove the destination's wide usage constraint before restoring the Running
+            # divider; restoring against All Sessions' expanded panel would clamp it rightward.
+            self._apply_usage_expanded_for_tab(index)
+            self._set_running_terminal_visible(True)
+        else:
+            # Preserve the Running divider before the destination usage layout can reshape it.
+            self._set_running_terminal_visible(False)
+            self._apply_usage_expanded_for_tab(index)
         # Refresh immediately on becoming visible instead of leaving the table up to
         # 2s stale after a tab switch -- cheap (one refresh), and it's exactly the
         # moment a capture is now worth paying for. refresh_running_tab() reapplies
