@@ -66,6 +66,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -7793,6 +7794,11 @@ class SessionHub(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(all_sessions_page, "All Sessions")
         tabs.addTab(running_page, "Running")
+        # A hidden tab still contributes its page's minimumSizeHint. All Sessions has a wide
+        # action-button row, which otherwise stops the outer divider hundreds of pixels past the
+        # Running table's last column. Ignore that tab-stack hint horizontally; the visible usage
+        # strip remains the real left-pane minimum, so the panel cannot collapse into nothing.
+        tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.main_tabs = tabs
         self.running_page = running_page
         tabs.currentChanged.connect(self._on_main_tab_changed)
