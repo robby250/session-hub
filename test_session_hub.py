@@ -3940,6 +3940,55 @@ class SessionHubTests(unittest.TestCase):
                 )
             self.assertEqual(key, f"Codex:{session_id}")
 
+    def test_tmux_native_key_census_resolves_every_pane_from_one_shared_proc_walk(self):
+        """task-2156: the shared batched identity view. Two live tmux sessions ("owner-a",
+        "owner-b"), each with its own pane pid owning a DIFFERENT Codex rollout -- the census
+        must map each tmux name to ITS OWN native key, never cross-assign (the sibling control:
+        two live Codex sessions sharing a project must never have the census resolve one row to
+        the other's identity)."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            proc_root = root / "proc"
+            sessions_root = root / "sessions"
+            sessions_root.mkdir(parents=True)
+
+            def make_pid(pid: int, session_id: str) -> None:
+                rollout = sessions_root / f"rollout-2026-08-30T00-00-00-{session_id}.jsonl"
+                rollout.write_text("{}\n")
+                process = proc_root / str(pid)
+                (process / "task" / str(pid)).mkdir(parents=True)
+                (process / "task" / str(pid) / "children").write_text("")
+                (process / "fd").mkdir()
+                (process / "fd" / "9").symlink_to(rollout)
+
+            sid_a = "01a00000-0000-0000-0000-000000000aaa"
+            sid_b = "01a00000-0000-0000-0000-000000000bbb"
+            make_pid(101, sid_a)
+            make_pid(102, sid_b)
+            # A third live pane whose process owns no Codex rollout at all (a Claude/Antigravity
+            # row, or a Codex process that hasn't opened its rollout fd yet) -- must be silently
+            # excluded from the census, never a spurious/blank mapping.
+            (proc_root / "103" / "task" / "103").mkdir(parents=True)
+            (proc_root / "103" / "task" / "103" / "children").write_text("")
+            (proc_root / "103" / "fd").mkdir()
+
+            census = session_hub.tmux_native_key_census(
+                {"owner-a": "101", "owner-b": "102", "no-codex-row": "103"},
+                proc_root=proc_root, sessions_root=sessions_root,
+            )
+            self.assertEqual(census, {
+                "owner-a": f"Codex:{sid_a}",
+                "owner-b": f"Codex:{sid_b}",
+            })
+
+    def test_tmux_native_key_census_ignores_a_malformed_pid(self):
+        """A pane_pid_by_name entry that isn't a valid integer (defensive -- tmux_pane_pid
+        parsing upstream already guards this, but the census must not raise either way)."""
+        census = session_hub.tmux_native_key_census(
+            {"weird": "not-a-pid"}, proc_root=Path("/nonexistent"), sessions_root=Path("/nonexistent"),
+        )
+        self.assertEqual(census, {})
+
     def test_pending_link_uses_exact_tmux_codex_identity(self):
         worker = session_hub.Session(
             "Codex", "worker", "worker", "/tmp/vamp", "/tmp/vamp", 300,
@@ -8117,7 +8166,9 @@ class SessionActivityTests(unittest.TestCase):
                     )
                     with patch.object(window, "_focus_or_resume_session") as focus_mock:
                         added[0].trigger()
-                        focus_mock.assert_called_once_with(cwd, "vamp-shared", session_id)
+                        focus_mock.assert_called_once_with(
+                            cwd, "vamp-shared", session_id, tmux_name="vamp-shared"
+                        )
             finally:
                 window.close()
 
@@ -8271,7 +8322,7 @@ class SessionActivityTests(unittest.TestCase):
                 result.stdout = "\n".join(row["name"] for row in rows) + "\n"
             elif argv[1] == "list-panes":
                 result.stdout = "".join(
-                    f"{row['name']}\t%{i}\t1788000000\n" for i, row in enumerate(rows)
+                    f"{row['name']}\t%{i}\t{9000 + i}\t1788000000\n" for i, row in enumerate(rows)
                 )
             return result
 
@@ -8331,7 +8382,7 @@ class SessionActivityTests(unittest.TestCase):
             if argv[1] == "list-sessions":
                 result.stdout = "VAMP-0\n"
             elif argv[1] == "list-panes":
-                result.stdout = "VAMP-0\t%0\t1788000000\n"
+                result.stdout = "VAMP-0\t%0\t9000\t1788000000\n"
             elif argv[1] == "capture-pane":
                 result.stdout = "● first meaningful message\n"
             return result
@@ -8356,6 +8407,185 @@ class SessionActivityTests(unittest.TestCase):
         self.assertEqual(capture_calls, [])
         self.assertEqual(first_message, second_message)
         self.assertIn("first meaningful message", first_message)
+
+    def _fake_run_with_native_identity(self, pid_to_native_key: dict[int, str]):
+        """A fake `subprocess.run` for refresh_running_tab's tmux calls, PLUS a real /proc tree
+        (task-2156) so `tmux_native_key_census`'s bounded walk resolves exactly the pids named in
+        `pid_to_native_key` -- everything else (a pane pid with no entry) resolves to nothing, the
+        same as a real Claude/Antigravity pane or a Codex process with no rollout fd open yet."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        proc_root = Path(temp.name) / "proc"
+        sessions_root = Path(temp.name) / "sessions"
+        sessions_root.mkdir(parents=True)
+        for pid, native_key in pid_to_native_key.items():
+            session_id = native_key.split(":", 1)[1]
+            rollout = sessions_root / f"rollout-2026-08-30T00-00-00-{session_id}.jsonl"
+            rollout.write_text("{}\n")
+            process = proc_root / str(pid)
+            (process / "task" / str(pid)).mkdir(parents=True)
+            (process / "task" / str(pid) / "children").write_text("")
+            (process / "fd").mkdir()
+            (process / "fd" / "9").symlink_to(rollout)
+        self.enterContext(patch.object(session_hub, "PROC_ROOT", proc_root))
+        self.enterContext(patch.object(session_hub, "CODEX_SESSIONS", sessions_root))
+        return proc_root, sessions_root
+
+    def test_refresh_running_tab_reconciles_a_row_to_its_actual_live_tmux_name(self):
+        """task-2156 EXIT: a saved group row's name ("VAMPULSE-orchestrator") and the tmux
+        session that actually owns its rollout ("VAMPULSE-game-gpt-5_6-sol") have diverged
+        (external restart under a new tmux name) -- the row must still read Running, targeting
+        the ACTUAL live tmux name for every tmux-facing action, while the LABEL stays the saved
+        name."""
+        native_key = "Codex:01a05167-6282-72e2-9943-d723ff5019d9"
+        row = {"name": "VAMPULSE-orchestrator", "provider": "Codex", "session_key": native_key}
+        session_hub.METADATA_PATH.write_text(
+            json.dumps({
+                "settings": {}, "sessions": {},
+                "groups": {"/tmp/vamp": {"tmux": True, "rows": [row]}},
+            }),
+            encoding="utf-8",
+        )
+        live_session = session_hub.Session(
+            "Codex", "01a05167-6282-72e2-9943-d723ff5019d9", "t", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/orch.jsonl"),
+        )
+        self._fake_run_with_native_identity({4242: native_key})
+
+        def fake_run(argv, **kwargs):
+            result = MagicMock(returncode=0, stdout="")
+            if argv[1] == "list-sessions":
+                # The SAVED name is NOT live -- only the actual tmux name is.
+                result.stdout = "VAMPULSE-game-gpt-5_6-sol\n"
+            elif argv[1] == "list-panes":
+                result.stdout = "VAMPULSE-game-gpt-5_6-sol\t%0\t4242\t1788000000\n"
+            return result
+
+        with (
+            patch.object(session_hub, "codex_sessions", return_value=[live_session]),
+            patch.object(session_hub, "claude_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.shutil, "which", return_value="/usr/bin/tmux"),
+            patch.object(session_hub.subprocess, "run", side_effect=fake_run),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            window.refresh_running_tab()
+            self.assertEqual(window.running_table.rowCount(), 1)  # Running, not Stopped/missing
+            item = window.running_table.item(0, 0)
+            self.assertEqual(item.text(), "VAMPULSE-orchestrator")  # label stays the saved name
+            cwd, saved_name, session_id, tmux_name = item.data(session_hub.Qt.ItemDataRole.UserRole)
+            self.assertEqual(saved_name, "VAMPULSE-orchestrator")
+            self.assertEqual(tmux_name, "VAMPULSE-game-gpt-5_6-sol")  # target is the ACTUAL owner
+            window.close()
+
+    def test_refresh_running_tab_sibling_control_never_targets_the_wrong_live_session(self):
+        """task-2156 sibling control: two live Codex tmux sessions share a cwd/title family; the
+        census must resolve each SAVED row to the tmux session that ACTUALLY owns ITS rollout,
+        never the other one's."""
+        key_a = "Codex:01a00000-0000-0000-0000-00000000000a"
+        key_b = "Codex:01a00000-0000-0000-0000-00000000000b"
+        rows = [
+            {"name": "worker-a", "provider": "Codex", "session_key": key_a},
+            {"name": "worker-b", "provider": "Codex", "session_key": key_b},
+        ]
+        session_hub.METADATA_PATH.write_text(
+            json.dumps({
+                "settings": {}, "sessions": {},
+                "groups": {"/tmp/vamp": {"tmux": True, "rows": rows}},
+            }),
+            encoding="utf-8",
+        )
+        sessions = [
+            session_hub.Session(
+                "Codex", key_a.split(":", 1)[1], "a", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/a.jsonl"),
+            ),
+            session_hub.Session(
+                "Codex", key_b.split(":", 1)[1], "b", "/tmp/vamp", "/tmp/vamp", 100,
+                Path("/tmp/b.jsonl"),
+            ),
+        ]
+        # Live tmux names are SWAPPED relative to the saved rows -- "tmux-owns-a" actually owns
+        # key_a's rollout, "tmux-owns-b" owns key_b's; a same-cwd sibling guess (by name/title
+        # instead of the exact rollout) would get this backwards.
+        self._fake_run_with_native_identity({111: key_a, 222: key_b})
+
+        def fake_run(argv, **kwargs):
+            result = MagicMock(returncode=0, stdout="")
+            if argv[1] == "list-sessions":
+                result.stdout = "tmux-owns-a\ntmux-owns-b\n"
+            elif argv[1] == "list-panes":
+                result.stdout = "tmux-owns-a\t%0\t111\t1788000000\ntmux-owns-b\t%1\t222\t1788000000\n"
+            return result
+
+        with (
+            patch.object(session_hub, "codex_sessions", return_value=sessions),
+            patch.object(session_hub, "claude_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.shutil, "which", return_value="/usr/bin/tmux"),
+            patch.object(session_hub.subprocess, "run", side_effect=fake_run),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            window.refresh_running_tab()
+            self.assertEqual(window.running_table.rowCount(), 2)
+            targets = {
+                item_data[1]: item_data[3]  # saved_name -> resolved tmux_name
+                for row_idx in range(2)
+                for item_data in [window.running_table.item(row_idx, 0).data(session_hub.Qt.ItemDataRole.UserRole)]
+            }
+            self.assertEqual(targets["worker-a"], "tmux-owns-a")
+            self.assertEqual(targets["worker-b"], "tmux-owns-b")
+            window.close()
+
+    def test_refresh_running_tab_replacement_control_never_caches_a_stale_owner(self):
+        """task-2156 replacement control: the session moves to a DIFFERENT live tmux session
+        between two refreshes (e.g. restarted again under yet another name) -- the second refresh
+        must resolve the NEW owner, never keep serving the first refresh's answer."""
+        native_key = "Codex:01a00000-0000-0000-0000-0000000000cc"
+        row = {"name": "worker", "provider": "Codex", "session_key": native_key}
+        session_hub.METADATA_PATH.write_text(
+            json.dumps({
+                "settings": {}, "sessions": {},
+                "groups": {"/tmp/vamp": {"tmux": True, "rows": [row]}},
+            }),
+            encoding="utf-8",
+        )
+        live_session = session_hub.Session(
+            "Codex", native_key.split(":", 1)[1], "w", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/w.jsonl"),
+        )
+        self._fake_run_with_native_identity({501: native_key, 502: native_key})
+
+        state = {"owner": "tmux-first-owner", "pid": 501}
+
+        def fake_run(argv, **kwargs):
+            result = MagicMock(returncode=0, stdout="")
+            if argv[1] == "list-sessions":
+                result.stdout = f"{state['owner']}\n"
+            elif argv[1] == "list-panes":
+                result.stdout = f"{state['owner']}\t%0\t{state['pid']}\t1788000000\n"
+            return result
+
+        with (
+            patch.object(session_hub, "codex_sessions", return_value=[live_session]),
+            patch.object(session_hub, "claude_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.shutil, "which", return_value="/usr/bin/tmux"),
+            patch.object(session_hub.subprocess, "run", side_effect=fake_run),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            window.refresh_running_tab()
+            first_target = window.running_table.item(0, 0).data(session_hub.Qt.ItemDataRole.UserRole)[3]
+            self.assertEqual(first_target, "tmux-first-owner")
+
+            state["owner"], state["pid"] = "tmux-second-owner", 502
+            window.refresh_running_tab()
+            second_target = window.running_table.item(0, 0).data(session_hub.Qt.ItemDataRole.UserRole)[3]
+            self.assertEqual(second_target, "tmux-second-owner")
+            window.close()
 
     def test_status_tick_skips_the_census_when_running_tab_not_current(self):
         """task-2142: the periodic 2s tick must do NOTHING -- not even the cheap
@@ -8603,15 +8833,30 @@ class _FakeWinIdContainer:
 class _FakeEmbedder:
     """Records every `resize()` call (target child window id, width, height) instead of touching
     a real X server -- the "assert exact geometry every time" control for
-    EmbeddedTerminalControllerTests/RunningTabEmbeddedTerminalTests (task-2142 row453 REWORK)."""
+    EmbeddedTerminalControllerTests/RunningTabEmbeddedTerminalTests (task-2142 row453 REWORK).
 
-    def __init__(self, fail=False):
+    `painted` (task-2156) is the injected verdict `sample_non_background_pixels`/`verify_painted`
+    returns -- True/False/None, same three-way contract as the real Xlib-backed one."""
+
+    def __init__(self, fail=False, painted=None, map_fails=False):
         self.calls = []
         self._fail = fail
+        self.painted = painted
+        self.paint_sample_calls = []
+        self.map_calls = []
+        self._map_fails = map_fails
 
     def resize(self, child_winid, width, height):
         self.calls.append((child_winid, width, height))
         return not self._fail
+
+    def map_child(self, child_winid):
+        self.map_calls.append(child_winid)
+        return not self._map_fails
+
+    def sample_non_background_pixels(self, child_winid):
+        self.paint_sample_calls.append(child_winid)
+        return self.painted
 
 
 class EmbedPrecheckTests(unittest.TestCase):
@@ -8861,6 +9106,24 @@ class EmbeddedTerminalControllerTests(unittest.TestCase):
         self.assertIn("size", detail)
         self.assertIsNone(ctl.process)
 
+    def test_successful_attach_explicitly_maps_the_child_window(self):
+        """task-2156: THE fix for the observed blank-embed bug -- a valid XID and a successful
+        resize alone leave the child window unmapped (confirmed against a real Xvfb display; see
+        map_child's docstring), so a successful attach must always issue this map."""
+        embedder = _FakeEmbedder()
+        ctl, _calls, _embedder, _container = self._controller(embedder=embedder)
+        ok, _detail = ctl.attach("a")
+        self.assertTrue(ok)
+        self.assertEqual(embedder.map_calls, [555])
+
+    def test_map_child_failure_fails_closed(self):
+        embedder = _FakeEmbedder(map_fails=True)
+        ctl, _calls, _embedder, _container = self._controller(embedder=embedder)
+        ok, detail = ctl.attach("a")
+        self.assertFalse(ok)
+        self.assertIn("map", detail)
+        self.assertIsNone(ctl.process)  # failed attach detaches, same as a resize failure
+
     def test_detach_terminates_the_helper_only_never_tmux(self):
         ctl, _calls, _embedder, _container = self._controller()
         ctl.attach("a")
@@ -9088,6 +9351,25 @@ class EmbeddedTerminalControllerTests(unittest.TestCase):
         self.assertIsNone(ctl.current_name)
         self.assertEqual(embedder.calls, [])
 
+    def test_verify_painted_delegates_to_embedder_for_the_current_child(self):
+        """task-2156: a valid XID + successful resize is not proof of a real render -- callers
+        must consult the embedder's own pixel sample of the exact attached child window."""
+        ctl, _calls, embedder, _container = self._controller(embedder=_FakeEmbedder(painted=True))
+        ctl.attach("a")
+        self.assertTrue(ctl.verify_painted())
+        self.assertEqual(embedder.paint_sample_calls, [555])  # the reported child winid
+
+    def test_verify_painted_reports_confirmed_blank(self):
+        ctl, _calls, _embedder, _container = self._controller(embedder=_FakeEmbedder(painted=False))
+        ctl.attach("a")
+        self.assertFalse(ctl.verify_painted())
+
+    def test_verify_painted_none_before_any_attach(self):
+        """No current child to sample at all -- distinct from a confirmed-blank False, since a
+        caller must never treat "nothing attached yet" as "confirmed never painted"."""
+        ctl, _calls, _embedder, _container = self._controller()
+        self.assertIsNone(ctl.verify_painted())
+
 
 class MetadataShrinkGuardTests(unittest.TestCase):
     """task-2142 row453 incident, 2026-08-30: write_metadata must refuse to silently replace a
@@ -9217,8 +9499,8 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
         # _await_embed_xid normally waits on a QSocketNotifier over the helper's REAL stdout fd,
         # which a fake process has none of -- complete it synchronously instead, exercising the
         # exact same _finish_embed_attach the real notifier callback calls.
-        window._await_embed_xid = lambda cwd, name, session_id: window._finish_embed_attach(
-            cwd, name, session_id, xid_line
+        window._await_embed_xid = lambda cwd, name, session_id, saved_name=None: window._finish_embed_attach(
+            cwd, name, session_id, xid_line, saved_name=saved_name
         )
         return calls, embedder
 
@@ -9250,7 +9532,9 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
             window._running_terminal_stack.currentWidget(), window.running_terminal_failure
         )
         self.assertIn("X11", window.running_terminal_failure.text())
-        focus_mock.assert_called_once_with("/tmp/vampembed", "vamp-embed", "id-embed1")
+        focus_mock.assert_called_once_with(
+            "/tmp/vampembed", "vamp-embed", "id-embed1", tmux_name="vamp-embed"
+        )
 
     def test_unexpected_helper_exit_shows_in_panel_and_falls_back_externally(self):
         """VAMP-reviewer REWORK finding (task2142-row453): child-exit detection showed the
@@ -9267,7 +9551,9 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
             window._running_terminal_stack.currentWidget(), window.running_terminal_failure
         )
         self.assertIn("exited", window.running_terminal_failure.text())
-        focus_mock.assert_called_once_with("/tmp/vampembed", "vamp-embed", "id-embed1")
+        focus_mock.assert_called_once_with(
+            "/tmp/vampembed", "vamp-embed", "id-embed1", tmux_name="vamp-embed"
+        )
 
     def test_no_dedicated_poll_timer_liveness_rides_the_existing_2s_status_tick(self):
         """VAMP-reviewer REWORK finding: a prior version added its own 1s QTimer despite the
@@ -9525,8 +9811,12 @@ class EmbeddedTerminalXvfbSmokeTest(unittest.TestCase):
             raise unittest.SkipTest("Xvfb did not become ready in time")
 
         cls.tmux_session = "row453-xvfb-smoke"
+        # Continuously prints, rather than "sleep 60" (task-2156): a real, deterministic-to-arrive
+        # non-background render to sample -- an idle shell's cursor block alone isn't a reliable
+        # enough signal to assert on (blink phase, theme).
         subprocess.run(
-            ["tmux", "new-session", "-d", "-s", cls.tmux_session, "sleep 60"],
+            ["tmux", "new-session", "-d", "-s", cls.tmux_session,
+             "bash", "-c", "while true; do echo XVFB_SMOKE_CONTENT; sleep 0.2; done"],
             check=True, env=cls.env,
         )
 
@@ -9566,12 +9856,57 @@ class EmbeddedTerminalXvfbSmokeTest(unittest.TestCase):
         self.assertEqual(children[0].id, child_id)
 
         embedder = session_hub._EmbedWindowResizer(display_factory=lambda: self.disp)
-        for width, height in [(640, 480), (900, 500), (1024, 768)]:
+        # Bounded within the Xvfb screen's own 800x600 (setUpClass) -- exceeding the ROOT
+        # window's bounds re-triggers the exact same GetImage BadMatch the parent-bounds fix
+        # below guards against, one level further up the ancestor chain.
+        for width, height in [(640, 480), (700, 500), (780, 560)]:
+            # The real container (running_terminal_container) is always resized to at least the
+            # child's new size BEFORE/alongside the child fill -- a child left larger than its
+            # parent triggers GetImage BadMatch below (X requires the sampled rectangle to lie
+            # within the parent's bounds too), which is a real X constraint the production
+            # container/child pairing never violates, so the fixture must not either.
+            socket_win.configure(width=width, height=height)
             self.assertTrue(embedder.resize(child_id, width, height))
             self.disp.sync()
             geom = self.disp.create_resource_object("window", child_id).get_geometry()
             self.assertEqual((geom.width, geom.height), (width, height))
         self.assertEqual(len(socket_win.query_tree().children), 1)  # still exactly one child
+
+        # task-2156, proof method #5: a valid XID and exact geometry (proven above) is NOT proof
+        # anything ever actually painted -- confirmed live against this exact Xvfb setup: the
+        # child's map_state stays IsUnmapped indefinitely without this explicit map (real
+        # Gtk.Plug/no-Gtk.Socket embedding never receives whatever GTK3 is internally waiting
+        # for), which is THE root cause of the observed blank-embed bug -- see map_child's
+        # docstring. EmbeddedTerminalController.finish_attach calls this same map_child in
+        # production; this proves the primitive itself against real X11/GTK, not a fake.
+        self.assertTrue(embedder.map_child(child_id))
+        self.disp.sync()
+
+        # Poll for real non-uniform pixel content; the constantly-printing tmux pane
+        # (setUpClass) guarantees it eventually renders, so a timeout here is a genuine
+        # failure, not a flaky race.
+        deadline = time.monotonic() + 10.0
+        painted = None
+        while time.monotonic() < deadline:
+            painted = embedder.sample_non_background_pixels(child_id)
+            if painted:
+                break
+            time.sleep(0.2)
+        self.assertTrue(painted, "the embedded VTE child never rendered visible content")
+
+    def test_a_window_nothing_ever_drew_to_samples_as_not_painted(self):
+        """Negative control for the assertion above (task-2156): sample_non_background_pixels
+        must not be vacuously true. A bare X window with no client ever attached/drawing to it
+        -- the exact "XID exists, nothing painted" shape of the observed bug -- must read False,
+        proving the positive assertion is checking real content, not just window presence."""
+        root = self.disp.screen().root
+        blank_win = root.create_window(0, 0, 320, 240, 0, self.disp.screen().root_depth)
+        blank_win.map()
+        self.disp.sync()
+        self.addCleanup(blank_win.destroy)
+
+        embedder = session_hub._EmbedWindowResizer(display_factory=lambda: self.disp)
+        self.assertFalse(embedder.sample_non_background_pixels(blank_win.id))
 
 
 if __name__ == "__main__":

@@ -1263,6 +1263,60 @@ class _EmbedWindowResizer:
             return False
         return True
 
+    def map_child(self, child_winid: int) -> bool:
+        """Explicitly XMapWindow the embedded child (task-2156) -- this IS the fix for the
+        observed blank-embed bug, not a formality. `Gtk.Plug.new(socket_id)` reparents its
+        window under `socket_id` and reports a valid XID via `get_window()` (both already
+        proven by the pre-existing geometry smoke test), but a raw X11 socket side with no
+        `Gtk.Socket`/window-manager cooperation never receives whatever signal GTK3's Plug
+        implementation is waiting for before it maps itself -- confirmed by direct
+        observation: the child's `map_state` stays IsUnmapped indefinitely (proven against a
+        real Xvfb display; a `_XEMBED`/`XEMBED_EMBEDDED_NOTIFY` ClientMessage to the child did
+        NOT unstick it), while one explicit `MapWindow` request for that exact window ID,
+        issued from the embedder side, maps it immediately and content renders straight away.
+        Any client may request a window's mapping at the X protocol level -- this is not a
+        permissions workaround, just supplying the map GTK itself never performs here."""
+        try:
+            disp = self._disp()
+            child = disp.create_resource_object("window", child_winid)
+            child.map()
+            disp.sync()
+        except Exception:
+            return False
+        return True
+
+    def sample_non_background_pixels(self, child_winid: int) -> bool | None:
+        """True if the child window's CURRENT content is not a single uniform color -- a real
+        VTE render, not a blank/never-painted surface (task-2156). False if uniform. None if no
+        sample could be taken at all (window gone, X error) -- distinct from False so a caller
+        never treats "could not check" as "confirmed blank" and wrongly forces the external
+        fallback in an environment where sampling itself just isn't possible.
+
+        A valid XID plus a successful resize (what the existing Xvfb smoke test proved before
+        task-2156) is NOT proof of this: Gtk.Plug can report both while the socket-embedded
+        Vte.Terminal has never actually painted a frame, which is exactly the observed bug
+        (task-2156's brief, failure #2) -- reading the window's own pixels back is the only
+        proof that content is genuinely visible.
+        """
+        try:
+            from Xlib import X
+
+            disp = self._disp()
+            child = disp.create_resource_object("window", child_winid)
+            geom = child.get_geometry()
+            width, height = geom.width, geom.height
+            if width <= 0 or height <= 0:
+                return None
+            image = child.get_image(0, 0, width, height, X.ZPixmap, 0xFFFFFFFF)
+        except Exception:
+            return None
+        data = image.data
+        if not data:
+            return None
+        stride = 4
+        first = data[:stride]
+        return any(data[i:i + stride] != first for i in range(0, len(data) - stride + 1, stride))
+
 
 def _default_read_xid_line(process: subprocess.Popen, timeout: float) -> str | None:
     """Blocking-with-timeout read of the helper's one `XID=<id>` stdout line (task-2142 row453
@@ -1274,6 +1328,9 @@ def _default_read_xid_line(process: subprocess.Popen, timeout: float) -> str | N
     if not ready:
         return None
     return process.stdout.readline()
+
+
+_EMBED_PAINT_VERIFY_DELAY_MS = 1200  # one bounded singleShot after attach, see _verify_embed_painted
 
 
 class EmbeddedTerminalController:
@@ -1391,6 +1448,12 @@ class EmbeddedTerminalController:
         if not self._embedder.resize(child_winid, size.width(), size.height()):
             self.detach()
             return False, "failed to size the embedded terminal's window"
+        # task-2156: THE fix for the observed blank-embed bug -- see map_child's docstring. A
+        # valid XID and a successful resize (both proven above) are not enough; without this,
+        # the child window stays unmapped and nothing ever paints.
+        if not self._embedder.map_child(child_winid):
+            self.detach()
+            return False, "failed to map the embedded terminal's window"
         self.current_name = name
         self._child_winid = child_winid
         return True, "attached"
@@ -1407,6 +1470,15 @@ class EmbeddedTerminalController:
         line = self._read_xid_line(self.process, 3.0)
         ok, detail = self.finish_attach(line)
         return bool(ok), detail
+
+    def verify_painted(self) -> bool | None:
+        """True/False/None per `_EmbedWindowResizer.sample_non_background_pixels`, for whatever
+        child window the current attach reported -- None (cannot check) if there is no current
+        attach at all. Called once, a short bounded delay after a successful `finish_attach`
+        (see SessionHub._verify_embed_painted), never on a recurring timer."""
+        if self._child_winid is None:
+            return None
+        return self._embedder.sample_non_background_pixels(self._child_winid)
 
     def resize_to_container(self) -> None:
         """Re-fill the container on every resize (window resize, splitter drag) -- must be
@@ -3116,6 +3188,24 @@ def tmux_group_launch_command(name: str, cwd: str, claude_args: list[str]) -> li
     ]
 
 
+def external_tmux_attach_command(name: str) -> list[str]:
+    """argv to open a NEW terminal window that attaches to a tmux session already confirmed
+    ALIVE under `name` -- never creates one (task-2156). Unlike tmux_group_launch_command's
+    `has-session || new-session` script, this has no create branch: it exists for the case where
+    a row's saved name and its actual live tmux session have diverged (external restart under a
+    new name), so `launch_group_row`/`resume_session_by_name` (which key by the SAVED name) would
+    find nothing under that stale name and spawn a DUPLICATE session instead of finding this one.
+    """
+    name = sanitize_tmux_session_name(name)
+    terminal = shutil.which("gnome-terminal")
+    if not terminal:
+        raise RuntimeError("Opening a terminal currently requires gnome-terminal.")
+    tmux = shutil.which("tmux")
+    if not tmux:
+        raise RuntimeError("tmux is not installed.")
+    return [terminal, "--window", "--", tmux, "attach", "-t", tmux_exact_target(name)]
+
+
 def read_pid_capture_file(pidfile: Path, timeout: float = 2.0) -> int | None:
     deadline = time.monotonic() + timeout
     pid: int | None = None
@@ -3227,8 +3317,8 @@ def tmux_live_session_names() -> frozenset[str]:
     return frozenset(line for line in result.stdout.splitlines() if line)
 
 
-def tmux_pane_activity_snapshot() -> dict[str, tuple[str, str]]:
-    """One bounded `tmux list-panes -a` call: {session_name: (pane_id, window_activity)}.
+def tmux_pane_activity_snapshot() -> dict[str, tuple[str, str, str]]:
+    """One bounded `tmux list-panes -a` call: {session_name: (pane_id, pane_pid, window_activity)}.
 
     `window_activity` is tmux's own last-output timestamp for the pane's window --
     free (already tracked by the tmux server for every pane, no opt-in option
@@ -3236,13 +3326,19 @@ def tmux_pane_activity_snapshot() -> dict[str, tuple[str, str]]:
     content changed since last look without ever calling capture-pane. task-2142's
     "capture only changed panes" requirement is built on this: a session whose
     window_activity is unchanged needs no fresh capture at all.
+
+    `pane_pid` (task-2156) rides this SAME call rather than a second `list-panes -a`
+    spawn: it is the starting point for `tmux_native_key_census`'s bounded /proc
+    walk, which resolves each tmux session's ACTUAL Codex identity without a second
+    tmux subprocess per refresh (see the O(1)-subprocess-calls guard test).
     """
     tmux = shutil.which("tmux")
     if not tmux:
         return {}
     try:
         result = subprocess.run(
-            [tmux, "list-panes", "-a", "-F", "#{session_name}\t#{pane_id}\t#{window_activity}"],
+            [tmux, "list-panes", "-a", "-F",
+             "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{window_activity}"],
             capture_output=True,
             text=True,
             timeout=2,
@@ -3251,17 +3347,17 @@ def tmux_pane_activity_snapshot() -> dict[str, tuple[str, str]]:
         return {}
     if result.returncode != 0:
         return {}
-    snapshot: dict[str, tuple[str, str]] = {}
+    snapshot: dict[str, tuple[str, str, str]] = {}
     for line in result.stdout.splitlines():
         parts = line.split("\t")
-        if len(parts) != 3:
+        if len(parts) != 4:
             continue
-        name, pane_id, activity = parts
+        name, pane_id, pane_pid, activity = parts
         # A tmux session can have several windows/panes; the group-row/standalone
         # launch paths always create exactly one, but if more than one somehow
         # exists for a name, keep the FIRST (list-panes' own window/pane order),
         # not the last -- deterministic rather than whichever happened to sort last.
-        snapshot.setdefault(name, (pane_id, activity))
+        snapshot.setdefault(name, (pane_id, pane_pid, activity))
     return snapshot
 
 
@@ -3346,49 +3442,23 @@ def tmux_session_alive(name: str, live_names: frozenset[str] | None = None) -> b
     return result.returncode == 0
 
 
-def codex_tmux_native_key(
-    name: str,
-    *,
-    proc_root: Path | None = None,
-    sessions_root: Path | None = None,
+_CODEX_SESSION_ID_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$"
+)
+
+
+def _codex_native_key_from_pids(
+    start_pids: list[int], proc_root: Path, sessions_root: Path
 ) -> str | None:
-    """Return the exact Codex transcript key open in tmux session `name`.
-
-    The rollout file descriptor is authoritative for both a fresh `codex`
-    process (whose argv has no session id) and `codex resume`. Descendant
-    traversal also covers tmux panes that launch through a shell wrapper.
-
-    `name` is canonicalized (see rename_tmux_session) so an unsafe stored
-    name still resolves to the real tmux session's panes.
+    """Shared /proc-walk core of `codex_tmux_native_key` and
+    `tmux_native_key_census`: from a set of starting pids (a tmux pane's own pid,
+    or every pane pid in a batched census), walk descendants and return the first
+    open Codex rollout key found, or None. Pure filesystem reads -- no subprocess -
+    so a caller resolving many tmux sessions at once (the census) pays this once
+    per pid it is given, never a `tmux`/`list-panes` spawn per name.
     """
-    name = sanitize_tmux_session_name(name)
-    tmux = shutil.which("tmux")
-    if not tmux:
-        return None
-    try:
-        panes = subprocess.run(
-            [tmux, "list-panes", "-t", tmux_exact_target(name), "-F", "#{pane_pid}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if panes.returncode != 0:
-        return None
-
-    proc_root = proc_root or PROC_ROOT
-    sessions_root = (sessions_root or CODEX_SESSIONS).resolve()
-    pending = []
-    for value in panes.stdout.split():
-        try:
-            pending.append(int(value))
-        except ValueError:
-            continue
+    pending = list(start_pids)
     seen: set[int] = set()
-    session_id_re = re.compile(
-        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$"
-    )
     while pending:
         pid = pending.pop()
         if pid in seen:
@@ -3410,10 +3480,92 @@ def codex_tmux_native_key(
                 target.relative_to(sessions_root)
             except (OSError, ValueError):
                 continue
-            match = session_id_re.search(target.name)
+            match = _CODEX_SESSION_ID_RE.search(target.name)
             if match:
                 return f"Codex:{match.group(1)}"
     return None
+
+
+def codex_tmux_native_key(
+    name: str,
+    *,
+    proc_root: Path | None = None,
+    sessions_root: Path | None = None,
+) -> str | None:
+    """Return the exact Codex transcript key open in tmux session `name`.
+
+    The rollout file descriptor is authoritative for both a fresh `codex`
+    process (whose argv has no session id) and `codex resume`. Descendant
+    traversal also covers tmux panes that launch through a shell wrapper.
+
+    `name` is canonicalized (see rename_tmux_session) so an unsafe stored
+    name still resolves to the real tmux session's panes.
+
+    One-name lookup only -- a caller resolving many names in the same refresh
+    (refresh_running_tab) uses `tmux_native_key_census` instead, which shares
+    ONE `tmux list-panes -a` snapshot across every row rather than spawning
+    this function's own `list-panes -t <name>` once per row.
+    """
+    name = sanitize_tmux_session_name(name)
+    tmux = shutil.which("tmux")
+    if not tmux:
+        return None
+    try:
+        panes = subprocess.run(
+            [tmux, "list-panes", "-t", tmux_exact_target(name), "-F", "#{pane_pid}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if panes.returncode != 0:
+        return None
+    pending = []
+    for value in panes.stdout.split():
+        try:
+            pending.append(int(value))
+        except ValueError:
+            continue
+    return _codex_native_key_from_pids(
+        pending, proc_root or PROC_ROOT, (sessions_root or CODEX_SESSIONS).resolve()
+    )
+
+
+def tmux_native_key_census(
+    pane_pid_by_name: dict[str, str],
+    *,
+    proc_root: Path | None = None,
+    sessions_root: Path | None = None,
+) -> dict[str, str]:
+    """{tmux_session_name: native_key} for every live tmux session in
+    `pane_pid_by_name` (as returned by `tmux_pane_activity_snapshot`) whose pane
+    process resolves to an open Codex rollout -- the ONE shared batched identity
+    view task-2156 asks for: a single /proc traversal per pane, zero additional
+    `tmux`/`list-panes` subprocess spawns (the pids already came from the same
+    `list-panes -a` call `tmux_pane_activity_snapshot` made for the pane-activity
+    census), so resolving N rows' actual tmux owner costs the same one tmux
+    subprocess the refresh was already making.
+
+    This is the reconciliation the brief requires: a saved group row's
+    `session_key` names a Codex native key, but the row's own `row["name"]` can
+    drift from the tmux session that ACTUALLY has that rollout open (external
+    restart under a new tmux name) -- looking the native key up here, against
+    live pane ownership, is what lets a caller find the real owner instead of
+    trusting the stale saved name.
+    """
+    proc_root = proc_root or PROC_ROOT
+    sessions_root = (sessions_root or CODEX_SESSIONS).resolve()
+    census: dict[str, str] = {}
+    for name, pid_str in pane_pid_by_name.items():
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        native_key = _codex_native_key_from_pids([pid], proc_root, sessions_root)
+        if native_key:
+            census[name] = native_key
+    return census
 
 
 def stop_tmux_session(name: str) -> None:
@@ -4077,6 +4229,8 @@ def group_row_status(
     match: "Session | None",
     tmux_enabled: bool,
     live_names: frozenset[str] | None = None,
+    *,
+    tmux_name: str | None = None,
 ) -> str:
     """"Running" or "Stopped" for one group row - the only two states shown anywhere.
 
@@ -4085,9 +4239,16 @@ def group_row_status(
     which only ever works for Claude - a known, pre-existing limitation this
     doesn't attempt to fix. Pass a tmux_live_session_names() snapshot as
     `live_names` when calling this for more than one row per refresh.
+
+    `tmux_name` (task-2156), when given, overrides `row["name"]` as the tmux
+    session to check liveness against -- the row's saved name and its actual
+    live tmux session can diverge (external restart under a new name), and a
+    caller that already resolved the real owner (see tmux_native_key_census)
+    must check THAT name, not the possibly-stale saved one, or a live session
+    reads Stopped just because its tmux name changed out from under it.
     """
     if tmux_enabled:
-        return "Running" if tmux_session_alive(row["name"], live_names) else "Stopped"
+        return "Running" if tmux_session_alive(tmux_name or row["name"], live_names) else "Stopped"
     return "Running" if match and session_is_tracked_alive(match) else "Stopped"
 
 
@@ -7551,7 +7712,19 @@ class SessionHub(QMainWindow):
         # `tmux has-session` (was up to 2 subprocesses per row).
         live_names = tmux_live_session_names()
 
-        running: list[tuple[str, str, dict, Session | None]] = []
+        # task-2156: ONE shared batched identity view, computed before the group-row
+        # loop below so it can decide EACH row's actual tmux target, not just its
+        # saved name. pane_snapshot's pane_pid column feeds tmux_native_key_census's
+        # /proc walk -- no second tmux subprocess beyond the existing list-panes -a.
+        # Recomputed fresh every refresh (never cached across calls), so a rollout
+        # that moves to a different live tmux session is re-resolved on the very
+        # next tick and no stale owner can survive into it (replacement control).
+        pane_snapshot = tmux_pane_activity_snapshot()
+        pane_pid_by_name = {name: pid for name, (_pane_id, pid, _activity) in pane_snapshot.items()}
+        native_key_by_tmux_name = tmux_native_key_census(pane_pid_by_name)
+        tmux_name_by_native_key = {key: name for name, key in native_key_by_tmux_name.items()}
+
+        running: list[tuple[str, str, dict, Session | None, str]] = []
         claimed: set[str] = set()
         for cwd, group in self.metadata.get("groups", {}).items():
             tmux_enabled = self.effective_tmux(group.get("tmux"))
@@ -7562,8 +7735,17 @@ class SessionHub(QMainWindow):
                 match = find_group_member_session(row, cwd, live, frozenset(claimed))
                 if match:
                     claimed.add(match.native_key)
-                if group_row_status(row, match, tmux_enabled, live_names) == "Running":
-                    running.append((display_name, cwd, row, match))
+                # The row's ACTUAL live tmux session, not necessarily its saved
+                # row["name"]: an externally restarted/renamed Codex tmux session
+                # still owns the exact rollout `match.native_key` names, and that
+                # is what every tmux-facing action below must target -- the saved
+                # name is kept only for the row registry lookup and the label.
+                resolved_name = (
+                    tmux_name_by_native_key.get(match.native_key, row["name"])
+                    if match else row["name"]
+                )
+                if group_row_status(row, match, tmux_enabled, live_names, tmux_name=resolved_name) == "Running":
+                    running.append((display_name, cwd, row, match, resolved_name))
 
         session_overrides = self.metadata.get("sessions", {}) or {}
         for session in self.sessions:
@@ -7575,30 +7757,32 @@ class SessionHub(QMainWindow):
             if tmux_enabled and status == "Running":
                 running.append((
                     session.title, session.cwd,
-                    {"name": name, "provider": session.provider}, session,
+                    {"name": name, "provider": session.provider}, session, name,
                 ))
 
         # task-2142: Last-message census. One list-panes call for every row's
         # window_activity; only names whose activity changed since the cached value
         # get captured, and every changed name is captured in ONE batched tmux
-        # invocation (capture_changed_panes), not one spawn per row.
-        pane_snapshot = tmux_pane_activity_snapshot()
+        # invocation (capture_changed_panes), not one spawn per row. Keyed by the
+        # row's RESOLVED tmux name (task-2156) so this reads the pane the session
+        # actually lives in, and so a name change between refreshes is a natural
+        # cache miss rather than silently mixing another session's cached text.
         changed_pane_ids: dict[str, str] = {}
-        for _dn, _cwd, row, _m in running:
-            entry = pane_snapshot.get(row["name"])
+        for _dn, _cwd, _row, _m, resolved_name in running:
+            entry = pane_snapshot.get(resolved_name)
             if not entry:
                 continue
-            pane_id, activity = entry
-            if self._pane_activity_cache.get(row["name"]) != activity:
-                changed_pane_ids[row["name"]] = pane_id
+            pane_id, _pid, activity = entry
+            if self._pane_activity_cache.get(resolved_name) != activity:
+                changed_pane_ids[resolved_name] = pane_id
         captured = capture_changed_panes(changed_pane_ids)
         for name, raw_text in captured.items():
             self._pane_block_cache[name] = extract_last_meaningful_block(raw_text)
-            self._pane_activity_cache[name] = pane_snapshot[name][1]
+            self._pane_activity_cache[name] = pane_snapshot[name][2]
 
-        name_counts = collections.Counter(row["name"] for _dn, _cwd, row, _m in running)
+        name_counts = collections.Counter(row["name"] for _dn, _cwd, row, _m, _rn in running)
         self.running_table.setRowCount(len(running))
-        for index, (display_name, cwd, row, match) in enumerate(running):
+        for index, (display_name, cwd, row, match, resolved_name) in enumerate(running):
             session_id = match.session_id if match else None
             provider = row.get("provider", "Claude")
             name_item = QTableWidgetItem(
@@ -7607,10 +7791,12 @@ class SessionHub(QMainWindow):
                 # A visible name collision (same row name, different project) gets a
                 # parenthetical project suffix so the two rows are distinguishable at
                 # a glance - full identity (provider/project/cwd) lives in the tooltip
-                # rather than cluttering every row with it.
+                # rather than cluttering every row with it. Label stays the saved
+                # name even when resolved_name differs (task-2156) -- only the
+                # underlying tmux TARGET changes, never what the user sees.
                 else f"{row['name']}  ({display_name})"
             )
-            name_item.setData(Qt.ItemDataRole.UserRole, (cwd, row["name"], session_id))
+            name_item.setData(Qt.ItemDataRole.UserRole, (cwd, row["name"], session_id, resolved_name))
             name_item.setToolTip(f"{provider} · {display_name} · {cwd}")
             self.running_table.setItem(index, 0, name_item)
             # Every row here is already confirmed tmux-alive (group_row_status/
@@ -7622,14 +7808,14 @@ class SessionHub(QMainWindow):
             # write status itself (status_pipeline_plan.md's contract) - the
             # only writer is the hook pipeline (write_session_status).
             state, _detail = (
-                session_activity(match, tmux_enabled=True, tmux_name=row["name"], live_names=live_names)
+                session_activity(match, tmux_enabled=True, tmux_name=resolved_name, live_names=live_names)
                 if match else ("unknown", "")
             )
             self.running_table.setItem(index, 1, self._status_column_item(state))
             # Last message is the latest meaningful terminal-output block (the pane
             # census above), never session_activity's status detail -- the brief's
             # explicit distinction (task-2142).
-            last_message = self._pane_block_cache.get(row["name"], "")
+            last_message = self._pane_block_cache.get(resolved_name, "")
             self.running_table.setItem(index, 2, self._detail_column_item(last_message))
         # Reapply whatever query is currently typed (task-2142 row453 REWORK -- orchestrator
         # search REWORK): this repopulates every 2s via _on_running_status_tick, and a search
@@ -7657,7 +7843,7 @@ class SessionHub(QMainWindow):
             QMessageBox.information(self, "Session Hub", "Select a running session first.")
             return
         item = self.running_table.item(row, 0)
-        cwd, name, _session_id = item.data(Qt.ItemDataRole.UserRole)
+        cwd, name, _session_id, tmux_name = item.data(Qt.ItemDataRole.UserRole)
         confirm = QMessageBox.question(
             self,
             "Stop session",
@@ -7665,16 +7851,29 @@ class SessionHub(QMainWindow):
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
-        stop_tmux_session(name)
+        # tmux_name (task-2156), not the saved `name`: the row's ACTUAL live tmux session, which
+        # can differ from its saved row name after an external restart -- stopping `name` here
+        # would silently no-op (nothing tmux-alive under that name) and leave the real session
+        # running headless forever.
+        stop_tmux_session(tmux_name)
         self.refresh_running_tab()
 
-    def _focus_or_resume_session(self, cwd: str, name: str, session_id: str | None) -> None:
+    def _focus_or_resume_session(
+        self, cwd: str, name: str, session_id: str | None, *, tmux_name: str | None = None,
+    ) -> None:
         """Bring a running row's terminal to the front, or open/resume it if
         no terminal window exists yet. The one focus authority behind both
         the Running double-click and Recent-activity activation
         (task-2135) - reusing it, rather than a second implementation, is
         what keeps them from ever disagreeing about what a given identity
         resolves to.
+
+        `tmux_name` (task-2156) is the row's ACTUAL live tmux session when it differs from the
+        saved `name` (external restart under a new name) -- window/focus targeting and the
+        direct-attach branch below use it; `name` remains what it always was: the saved row
+        identity `launch_group_row`/`resume_session_by_name` look up in the registry. Defaults to
+        `name` for every caller that never resolved one (standalone sessions, callers unaware of
+        task-2156), so this stays a no-op change for them.
 
         wmctrl -a already unminimizes as well as raising, so a window that's
         merely minimized in the taskbar is covered for free. wmctrl can only
@@ -7685,13 +7884,31 @@ class SessionHub(QMainWindow):
         calls the "All Sessions" double-click already uses successfully -
         has-session gates their tmux attach, so this only ever opens a
         terminal onto the existing session, never a second copy of it.
+
+        EXCEPT when tmux_name diverges from name: launch_group_row/resume_session_by_name key by
+        the SAVED name and would `has-session -t "=<name>" || new-session -d -s "<name>" ...` --
+        finding nothing under the stale saved name and spawning a DUPLICATE tmux session next to
+        the real one still running under tmux_name. Attach directly to tmux_name instead; never
+        silently rename or kill either session (the brief's explicit constraint).
         """
+        tmux_name = tmux_name or name
         if session_id:
             status = read_session_status(session_id)
             if status and status.get("state") == "done":
                 write_session_status(session_id, "idle", status.get("detail", ""))
-        if window_titled(name):
-            threading.Thread(target=focus_window_by_title, args=(name,), daemon=True).start()
+        if window_titled(tmux_name):
+            threading.Thread(
+                target=focus_window_by_title, args=(tmux_name,), daemon=True
+            ).start()
+            return
+        if tmux_name != name and tmux_session_alive(tmux_name):
+            ok, detail = self._attach_external_tmux(tmux_name)
+            if not ok:
+                QMessageBox.critical(self, "Could not open session", detail)
+                return
+            threading.Thread(
+                target=focus_window_by_title, args=(tmux_name,), daemon=True
+            ).start()
             return
         if self.metadata.get("groups", {}).get(cwd):
             result = self.launch_group_row(cwd, name)
@@ -7706,7 +7923,18 @@ class SessionHub(QMainWindow):
         # left entirely up to GNOME, which is not reliable enough to count
         # on with several other windows open. Same wmctrl activation used
         # above for an already-open window, just given time to appear first.
-        threading.Thread(target=focus_window_by_title, args=(name,), daemon=True).start()
+        threading.Thread(target=focus_window_by_title, args=(tmux_name,), daemon=True).start()
+
+    def _attach_external_tmux(self, tmux_name: str) -> tuple[bool, str]:
+        """Open a NEW terminal window attached directly to a tmux session already confirmed
+        alive under `tmux_name` -- never via launch_group_row/resume_session_by_name (see
+        `_focus_or_resume_session`'s docstring for why that risks a duplicate spawn)."""
+        try:
+            command = external_tmux_attach_command(tmux_name)
+        except RuntimeError as exc:
+            return False, str(exc)
+        subprocess.Popen(command, start_new_session=True)
+        return True, "attached"
 
     def reveal_running_row(self, row: int, _column: int = 0) -> None:
         """Open externally: bring a Running row's own terminal window to the front (or open one),
@@ -7716,8 +7944,8 @@ class SessionHub(QMainWindow):
         item = self.running_table.item(row, 0)
         if not item:
             return
-        cwd, name, session_id = item.data(Qt.ItemDataRole.UserRole)
-        self._focus_or_resume_session(cwd, name, session_id)
+        cwd, name, session_id, tmux_name = item.data(Qt.ItemDataRole.UserRole)
+        self._focus_or_resume_session(cwd, name, session_id, tmux_name=tmux_name)
 
     def open_selected_running_externally(self) -> None:
         """Ctrl+Shift+O: `reveal_running_row` for the currently selected row."""
@@ -7734,20 +7962,26 @@ class SessionHub(QMainWindow):
         name_item = self.running_table.item(row, 0)
         if not name_item:
             return
-        cwd, name, session_id = name_item.data(Qt.ItemDataRole.UserRole)
-        self._switch_embedded_terminal(cwd, name, session_id)
+        cwd, name, session_id, tmux_name = name_item.data(Qt.ItemDataRole.UserRole)
+        # The embed target is always the ACTUAL live tmux session (task-2156) -- embedding never
+        # cares about the saved row name, only `name` is carried through for the fallback path.
+        self._switch_embedded_terminal(cwd, tmux_name, session_id, saved_name=name)
 
-    def _switch_embedded_terminal(self, cwd: str, name: str, session_id: str | None) -> None:
+    def _switch_embedded_terminal(
+        self, cwd: str, name: str, session_id: str | None, *, saved_name: str | None = None,
+    ) -> None:
         if (self._embedded_terminal.current_name == name
                 and self._embedded_terminal.poll_alive()):
             return  # already attached to this exact session -- no needless restart
         ok, detail = self._embedded_terminal.begin_attach(name)
         if not ok:
-            self._show_embed_failure(cwd, name, session_id, detail)
+            self._show_embed_failure(cwd, name, session_id, detail, saved_name=saved_name)
             return
-        self._await_embed_xid(cwd, name, session_id)
+        self._await_embed_xid(cwd, name, session_id, saved_name=saved_name)
 
-    def _await_embed_xid(self, cwd: str, name: str, session_id: str | None) -> None:
+    def _await_embed_xid(
+        self, cwd: str, name: str, session_id: str | None, *, saved_name: str | None = None,
+    ) -> None:
         """Waits for the helper's one `XID=` stdout line EVENT-DRIVEN via QSocketNotifier, with a
         bounded 3s singleShot (never periodic/recurring) timeout fallback -- never a blocking read
         on the GUI thread (task-2142 row453 REWORK -- orchestrator audit, 2026-08-30)."""
@@ -7766,7 +8000,7 @@ class SessionHub(QMainWindow):
             notifier.deleteLater()
             timeout_timer.stop()
             timeout_timer.deleteLater()
-            self._finish_embed_attach(cwd, name, session_id, line, generation)
+            self._finish_embed_attach(cwd, name, session_id, line, generation, saved_name=saved_name)
 
         notifier.activated.connect(lambda _fd: finish(process.stdout.readline()))
         timeout_timer.timeout.connect(lambda: finish(None))
@@ -7777,7 +8011,8 @@ class SessionHub(QMainWindow):
         self._embed_await_timer = timeout_timer
 
     def _finish_embed_attach(self, cwd: str, name: str, session_id: str | None,
-                              line: str | None, generation: int | None = None) -> None:
+                              line: str | None, generation: int | None = None,
+                              *, saved_name: str | None = None) -> None:
         ok, detail = self._embedded_terminal.finish_attach(line, generation)
         if ok is None:
             # A newer attach (a different row clicked before this one's XID/timeout
@@ -7788,18 +8023,51 @@ class SessionHub(QMainWindow):
         if ok:
             # finish_attach() already resized the child to the container's exact current size --
             # no need for a second _on_terminal_container_resize() call here.
-            self._embedded_terminal_meta[name] = (cwd, session_id)
+            self._embedded_terminal_meta[name] = (cwd, session_id, saved_name)
             self._running_terminal_stack.setCurrentWidget(self.running_terminal_container)
+            # task-2156: a valid XID + successful resize is not proof anything ever actually
+            # painted (the observed bug) -- verify once, a short bounded delay later (real render
+            # + tmux attach latency needs a beat), never on a recurring timer.
+            generation_now = self._embedded_terminal.generation
+            QTimer.singleShot(
+                _EMBED_PAINT_VERIFY_DELAY_MS,
+                lambda: self._verify_embed_painted(generation_now),
+            )
         else:
-            self._show_embed_failure(cwd, name, session_id, detail)
+            self._show_embed_failure(cwd, name, session_id, detail, saved_name=saved_name)
 
-    def _show_embed_failure(self, cwd: str, name: str, session_id: str | None, detail: str) -> None:
+    def _verify_embed_painted(self, generation: int) -> None:
+        """Bounded one-shot follow-up to a successful `_finish_embed_attach` (task-2156): a
+        Gtk.Plug/Vte.Terminal that reports a valid XID and resizes cleanly can still never
+        actually paint a frame -- proof method #5's requirement that success mean visibly
+        painted content, not just "the widget exists". A confirmed-blank (`False`) surface
+        selects the failure widget and falls back exactly like any other embed failure; `None`
+        (could not sample -- no X server, window already gone) changes nothing, since it is not
+        evidence of anything either way."""
+        if generation != self._embedded_terminal.generation:
+            return  # superseded by a newer attach -- this verdict is stale, ignore it
+        painted = self._embedded_terminal.verify_painted()
+        if painted is not False:
+            return
+        name = self._embedded_terminal.current_name
+        if name is None:
+            return
+        cwd, session_id, saved_name = self._embedded_terminal_meta.get(name, (None, None, None))
+        self._embedded_terminal.detach()
+        self._show_embed_failure(
+            cwd, name, session_id,
+            "the embedded terminal never rendered visible content",
+            saved_name=saved_name,
+        )
+
+    def _show_embed_failure(self, cwd: str, name: str, session_id: str | None, detail: str,
+                             *, saved_name: str | None = None) -> None:
         self.running_terminal_failure.setText(
             f"Could not embed a terminal for {name!r}: {detail}\n"
             "Falling back to an external terminal window."
         )
         self._running_terminal_stack.setCurrentWidget(self.running_terminal_failure)
-        self._focus_or_resume_session(cwd, name, session_id)
+        self._focus_or_resume_session(cwd, saved_name or name, session_id, tmux_name=name)
 
     def _on_terminal_container_resize(self) -> None:
         """Re-fill the panel on container resize AND splitter drag (task-2142 row453 REWORK) --
@@ -7819,11 +8087,11 @@ class SessionHub(QMainWindow):
         name = self._embedded_terminal.current_name
         if name is None or self._embedded_terminal.poll_alive():
             return
-        cwd, session_id = self._embedded_terminal_meta.get(name, (None, None))
+        cwd, session_id, saved_name = self._embedded_terminal_meta.get(name, (None, None, None))
         self.running_terminal_failure.setText(f"The embedded terminal for {name!r} exited.")
         self._running_terminal_stack.setCurrentWidget(self.running_terminal_failure)
         if cwd is not None:
-            self._focus_or_resume_session(cwd, name, session_id)
+            self._focus_or_resume_session(cwd, saved_name or name, session_id, tmux_name=name)
 
     def running_context_menu(self, point) -> None:
         """Right-click a Running row: the same exact-identity focus/stop
@@ -7863,13 +8131,16 @@ class SessionHub(QMainWindow):
             name_item = self.running_table.item(row, 0)
             if not name_item:
                 continue
-            cwd, name, session_id = name_item.data(Qt.ItemDataRole.UserRole)
+            data = name_item.data(Qt.ItemDataRole.UserRole)
+            # 4-tuple since task-2156 (adds the resolved actual tmux name); tolerate the older
+            # 3-tuple shape too so a hand-built test/UserRole item without it still filters.
+            cwd, name, session_id, tmux_name = data if len(data) == 4 else (*data, None)
             status_item = self.running_table.item(row, 1)
             detail_item = self.running_table.item(row, 2)
             haystack = " ".join(
                 str(part) for part in (
                     name_item.text(), status_item.text() if status_item else "",
-                    detail_item.text() if detail_item else "", cwd, name, session_id,
+                    detail_item.text() if detail_item else "", cwd, name, session_id, tmux_name,
                 ) if part
             ).lower()
             self.running_table.setRowHidden(row, bool(query) and query not in haystack)
@@ -9648,6 +9919,15 @@ def sessions_json_cli() -> int:
     # One tmux snapshot for the whole CLI invocation - shared by every group
     # row and every session below instead of a `tmux has-session` per call.
     live_names = tmux_live_session_names()
+    # task-2156: same shared batched identity view refresh_running_tab uses, so the
+    # TUI/JSON path stops reading a live-but-externally-renamed row as Stopped/
+    # unknown too (the brief names this path explicitly).
+    pane_pid_by_name = {
+        name: pid for name, (_pane_id, pid, _activity) in tmux_pane_activity_snapshot().items()
+    }
+    tmux_name_by_native_key = {
+        key: name for name, key in tmux_native_key_census(pane_pid_by_name).items()
+    }
 
     claimed: set[str] = set()
     groups = {}
@@ -9659,9 +9939,12 @@ def sessions_json_cli() -> int:
             match = find_group_member_session(row, cwd, live, frozenset(claimed))
             if match:
                 claimed.add(match.native_key)
+            resolved_name = (
+                tmux_name_by_native_key.get(match.native_key, row["name"]) if match else row["name"]
+            )
             activity_state, activity_detail = (
                 session_activity(
-                    match, tmux_enabled=tmux_enabled, tmux_name=row["name"], live_names=live_names
+                    match, tmux_enabled=tmux_enabled, tmux_name=resolved_name, live_names=live_names
                 )
                 if match else ("unknown", "")
             )
@@ -9670,7 +9953,9 @@ def sessions_json_cli() -> int:
                     "name": row["name"],
                     "provider": row.get("provider", "Claude"),
                     # Liveness (process/tmux) - separate fact from activity below.
-                    "status": group_row_status(row, match, tmux_enabled, live_names),
+                    "status": group_row_status(
+                        row, match, tmux_enabled, live_names, tmux_name=resolved_name
+                    ),
                     "activity": activity_state,
                     "activity_label": activity_label(activity_state)[0],
                     "activity_detail": activity_detail,
