@@ -1154,12 +1154,15 @@ def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | N
     exact string (never recompute the arithmetic) -- desktop calls it directly and the TUI reads
     the same value back from `--sessions-json`'s "pace" field.
 
-    Usage AT OR BELOW even pace shows no label at all (task-2153 REWORK, reviewer finding on
-    369280c6ba33: 5% used at 10% expected must return None, not "5.0% under pace") -- being behind
-    is not itself noteworthy, and a numeric under-pace figure invited reading it as a problem.
-    On-pace (delta under 0.5 points), missing window data, and a near-zero expected percentage at
-    the exact window start are unchanged: no percentage-point number, only a neutral label (or
-    None). Only genuinely OVER pace prints the delta."""
+    Usage AT OR BELOW even pace shows no label at all (task-2153 REWORK on c06c623de46e: the
+    non-positive check must run BEFORE the on-pace band, or an exact 10%/10% delta-0 match wrongly
+    reads as the on-pace band instead of "at or below pace" -- 5% used at 10% expected and 10%
+    used at 10% expected must both return None, not "5.0% under pace" or a truthy "on pace"
+    string). Being at or behind pace is not itself noteworthy, and both a numeric under-pace
+    figure and an "on pace" label for a non-positive delta invited reading it as meaningful.
+    Strictly-positive on-pace (delta under 0.5 points), missing window data, and a near-zero
+    expected percentage at the exact window start are unchanged: no percentage-point number, only
+    a neutral label (or None). Only genuinely OVER pace prints the delta."""
     if not window.window_minutes or not window.reset_epoch:
         return None
     window_seconds = window.window_minutes * 60
@@ -1169,13 +1172,16 @@ def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | N
     remaining_seconds = max(0.0, window.reset_epoch - now_epoch)
     elapsed_fraction = max(0.0, min(1.0, 1 - remaining_seconds / window_seconds))
     expected_percent = elapsed_fraction * 100
-    delta = window.used_percent - expected_percent
-    if abs(delta) < 0.5:
+    # Rounded to neutralize floating-point dust in elapsed_fraction (e.g. 1 - 9000/10000 lands on
+    # 0.09999999999999998, not 0.1) -- an exact-equal case like 10% used at 10% expected must
+    # compare as delta<=0, not as a tiny positive epsilon that slips into the on-pace band.
+    delta = round(window.used_percent - expected_percent, 6)
+    if delta <= 0:
+        return None
+    if delta < 0.5:
         return f"{expected_percent:.1f}% expected · on pace"
     if expected_percent < 0.05:
         return f"{expected_percent:.1f}% expected · just started"
-    if delta <= 0:
-        return None
     return f"{expected_percent:.1f}% expected · {delta:.1f}% over pace"
 
 

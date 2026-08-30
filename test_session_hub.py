@@ -758,13 +758,15 @@ class SessionHubTests(unittest.TestCase):
         self.assertIsNone(session_hub.usage_pace_text(missing, now=now))
 
     def test_usage_pace_percentage_point_table(self):
-        """task-2153 (REWORK on 369280c6ba33): the reported deviation is the absolute percentage-
-        point difference between used and expected (used - expected), restoring the pre-row453
-        interpretation for OVER pace only -- 10% used at 5% expected is "5% over pace" (the brief's
-        own worked example), 25% used at 20% expected is likewise "5% over pace". Usage at or below
-        even pace returns no label at all (None), per the reviewer's exact 5/10 and 10/10 controls
-        -- 5% used at 10% expected and 10% used at 10% expected must both be None, not a numeric
-        under-pace figure. Missing data and expected=0 at window start are unchanged."""
+        """task-2153 (REWORK on 369280c6ba33, then again on c06c623de46e): the reported deviation
+        is the absolute percentage-point difference between used and expected (used - expected),
+        restoring the pre-row453 interpretation for OVER pace only -- 10% used at 5% expected is
+        "5% over pace" (the brief's own worked example), 25% used at 20% expected is likewise "5%
+        over pace". Usage at or below even pace returns no label at all (None), per the reviewer's
+        exact 5/10 and 10/10 controls -- 5% used at 10% expected and 10% used at 10% expected must
+        both be None: the non-positive check runs BEFORE the on-pace band, so an exact delta-0
+        match is None too, not the on-pace text. Missing data and expected=0 at window start are
+        unchanged."""
         now = datetime(2026, 6, 19, 12, 0)
         reset = now + timedelta(days=5)  # 5 of 7 days remain => 2/7 = 28.5714...% expected
 
@@ -792,14 +794,11 @@ class SessionHubTests(unittest.TestCase):
         self.assertIsNone(session_hub.usage_pace_text(
             self._window_with_used(10, used_percent=5, now=now), now=now))
 
-        # 10% used at 10% expected -> exactly on pace: the on-pace branch fires first (delta=0 is
-        # within the 0.5-point on-pace threshold), so this is the qualitative "on pace" text, not
-        # a bare None -- still "no [numeric] label" in the sense the reviewer's pairing means.
-        on_pace_text = session_hub.usage_pace_text(
-            self._window_with_used(10, used_percent=10, now=now), now=now)
-        self.assertIn("on pace", on_pace_text)
-        self.assertNotIn("under pace", on_pace_text)
-        self.assertNotIn("over pace", on_pace_text)
+        # 10% used at 10% expected -> exactly on pace (delta=0): the non-positive check runs
+        # BEFORE the on-pace band, so this is None, not the qualitative "on pace" text (reviewer
+        # REWORK on c06c623de46e -- the prior on-pace-fires-first reading was itself wrong).
+        self.assertIsNone(session_hub.usage_pace_text(
+            self._window_with_used(10, used_percent=10, now=now), now=now))
 
         # further under pace: no label either, not merely a suppressed number
         half = session_hub.UsageWindow(
