@@ -3294,6 +3294,16 @@ def tmux_group_launch_command(name: str, cwd: str, claude_args: list[str]) -> li
         '"$1" has-session -t "=$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
         ' "$1" set-option -g set-titles on >/dev/null;'
         ' "$1" set-option -g set-titles-string "#S" >/dev/null;'
+        # set-titles-string only reaches an OS window title bar, which the embedded pane has
+        # none of - the in-pane identity the user actually sees is tmux's OWN status line.
+        # status-left defaults to "[#S] " truncated at status-left-length 10, which is exactly
+        # the "VAMP-orch" truncation; status-right defaults to including #{pane_title}, which a
+        # shell/tool inside the pane can set via its own OSC title escape (e.g. to the project
+        # cwd), showing a stale project label instead of the session identity. `#S` is dynamic,
+        # so a rename propagates for free with no literal to keep in sync.
+        ' "$1" set-option -g status-left "#S " >/dev/null;'
+        ' "$1" set-option -g status-left-length 40 >/dev/null;'
+        ' "$1" set-option -g status-right "" >/dev/null;'
         ' "$1" set-option -g focus-events off >/dev/null',
         "session-hub",
         tmux,
