@@ -7461,10 +7461,13 @@ class SessionHub(QMainWindow):
             return
         if visible:
             self._running_terminal_page.show()
-            if not self._running_splitter_visible_state.isEmpty():
-                self.running_splitter.restoreState(self._running_splitter_visible_state)
             self._running_terminal_enabled = True
-            QTimer.singleShot(0, self._on_terminal_container_resize)
+            # Showing a previously hidden splitter child does not assign its final geometry
+            # synchronously. Restoring here lets Qt clamp the divider against that temporary
+            # geometry, shifting it right on every restart/tab return. Preserve the exact saved
+            # bytes and apply them after the layout pass instead.
+            state = QByteArray(self._running_splitter_visible_state)
+            QTimer.singleShot(0, lambda state=state: self._restore_running_splitter_state(state))
             return
         self._running_splitter_visible_state = QByteArray(self.running_splitter.saveState())
         if self._focused_entry is not None:
@@ -7473,8 +7476,22 @@ class SessionHub(QMainWindow):
         self._running_terminal_page.hide()
         self._running_terminal_enabled = False
 
+    def _restore_running_splitter_state(self, state: QByteArray) -> None:
+        """Restore the Running divider after its terminal child has been laid out."""
+        if not self._running_terminal_enabled or state.isEmpty():
+            return
+        self._restoring_running_splitter = True
+        try:
+            self.running_splitter.restoreState(state)
+        finally:
+            self._restoring_running_splitter = False
+        # restoreState may emit splitterMoved. Keep the original persisted bytes instead of
+        # replacing them with a transient/clamped snapshot from that programmatic move.
+        self._running_splitter_visible_state = QByteArray(state)
+        self._on_terminal_container_resize()
+
     def _on_running_splitter_moved(self, *_args) -> None:
-        if self._running_terminal_enabled:
+        if self._running_terminal_enabled and not self._restoring_running_splitter:
             self._running_splitter_visible_state = QByteArray(
                 self.running_splitter.saveState()
             )
@@ -7824,15 +7841,26 @@ class SessionHub(QMainWindow):
         self.running_splitter.setStretchFactor(0, 0)
         self.running_splitter.setStretchFactor(1, 1)
         self.running_splitter.setSizes([520, 760])
+        restored_splitter_state = None
         encoded_splitter = self.settings().get("running_splitter_state_v1")
         if encoded_splitter:
             try:
                 decoded_splitter = QByteArray.fromBase64(encoded_splitter.encode("ascii"))
                 if decoded_splitter.isEmpty() or not self.running_splitter.restoreState(decoded_splitter):
                     self.settings().pop("running_splitter_state_v1", None)
+                else:
+                    # Do not immediately round-trip through saveState(): the splitter has not
+                    # been inserted into the laid-out window yet, so that snapshot can already
+                    # contain a clamped divider position instead of the user's saved position.
+                    restored_splitter_state = QByteArray(decoded_splitter)
             except (AttributeError, TypeError, ValueError):
                 self.settings().pop("running_splitter_state_v1", None)
-        self._running_splitter_visible_state = QByteArray(self.running_splitter.saveState())
+        self._running_splitter_visible_state = (
+            restored_splitter_state
+            if restored_splitter_state is not None
+            else QByteArray(self.running_splitter.saveState())
+        )
+        self._restoring_running_splitter = False
         self._running_terminal_enabled = tabs.currentWidget() is running_page
         self.running_splitter.splitterMoved.connect(self._on_running_splitter_moved)
         layout.addWidget(self.running_splitter, 1)
@@ -8248,6 +8276,12 @@ class SessionHub(QMainWindow):
                         continue
                     bar.setFormat("Unavailable")
                     detail.setText("")
+                    continue
+                # Spark has a tiny model-specific allowance and is not a useful planning
+                # signal here. Keep the expanded Codex panel focused on the ordinary account
+                # windows; the compact bar already selects the ordinary Weekly window exactly.
+                if provider == "Codex" and "spark" in window.name.casefold():
+                    self.set_usage_row_visible(rows[index], False)
                     continue
                 if index in optional_indices:
                     self.set_usage_row_visible(rows[index], True)

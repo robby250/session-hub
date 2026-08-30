@@ -113,6 +113,20 @@ def main(argv: list[str] | None = None) -> int:
 
     terminal.connect("button-press-event", reclaim_keyboard_focus)
 
+    def copy_selection_to_clipboard(selected_terminal) -> None:
+        """Mirror VTE's mouse selection into the desktop CLIPBOARD selection.
+
+        VTE normally owns only X11 PRIMARY after a drag, which supports middle-click paste but
+        leaves Ctrl+V / image-and-text clipboard consumers unchanged. Session Hub's embedded
+        terminal should behave like an app-level selectable transcript, so keep CLIPBOARD in sync
+        whenever the terminal has a non-empty selection. Do not clear the clipboard when the
+        selection disappears; the user's last completed selection remains copyable.
+        """
+        if selected_terminal.get_has_selection():
+            selected_terminal.copy_clipboard_format(Vte.Format.TEXT)
+
+    terminal.connect("selection-changed", copy_selection_to_clipboard)
+
     def announce() -> bool:
         window = plug.get_window()
         if window is None:
