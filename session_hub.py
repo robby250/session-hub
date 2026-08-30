@@ -31,6 +31,9 @@ from terminal_profile import (  # noqa: E402  (see terminal_profile.py -- shared
 )
 from datetime import date, datetime
 from pathlib import Path
+from codex_app_server import (
+    REGISTRY_DIR, app_server_argv, endpoint_for, publish_record, remote_tui_argv,
+)
 
 from PyQt6.QtCore import (
     QByteArray, QEvent, QItemSelectionModel, QObject, QRect, QRunnable, QSocketNotifier,
@@ -7457,6 +7460,8 @@ class SessionHub(QMainWindow):
         self.usage_compact_bars: dict[str, QProgressBar] = {}
         self.thread_pool = QThreadPool.globalInstance()
         self.group_dialogs: dict[str, "ManageGroupDialog"] = {}
+        # task-2194 row518: Session Hub owns Codex App Server processes and records.
+        self._codex_app_servers: dict[str, tuple[subprocess.Popen, Path]] = {}
         # task-2142 row453 REWORK (orchestrator search REWORK): every saved group row's
         # identity, rebuilt once per refresh() straight from already-loaded metadata (no
         # subprocess) -- what apply_filter's All Sessions branch searches to surface a
@@ -10062,6 +10067,12 @@ class SessionHub(QMainWindow):
                     "live status until you clear or replace that `notify` line yourself.",
                 )
         try:
+            if provider == "Codex":
+                self._launch_codex_app_server(
+                    session_id, cwd, source_cwd, model, session_key, tmux_name,
+                    reasoning_effort, initial_prompt, focus,
+                )
+                return
             if provider in ("Claude", "Codex"):
                 # tmux_name, not flag_overrides["--name"]: resuming a group
                 # row (session_id set) never passes --name at all - Claude
@@ -10156,6 +10167,40 @@ class SessionHub(QMainWindow):
             )
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(self, "Could not launch session", str(error))
+
+    def _launch_codex_app_server(
+        self, session_id, cwd, source_cwd, model, session_key, tmux_name,
+        reasoning_effort, initial_prompt, focus,
+    ) -> None:
+        """Launch one private app-server and a remote Codex TUI (row518).
+
+        The server is started with Popen(cwd=...), then its owner record is atomically
+        published only after the process exists.  The TUI receives the exact saved thread
+        id, so this path cannot silently fork a replacement identity.
+        """
+        row_id = session_key or tmux_name or session_id
+        if not row_id:
+            raise RuntimeError("Codex App Server launch requires a stable row identity")
+        REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
+        endpoint = endpoint_for(row_id)
+        record_path = REGISTRY_DIR / f"{endpoint.stem}.json"
+        server = subprocess.Popen(app_server_argv(endpoint, cwd), cwd=source_cwd or cwd)
+        self._codex_app_servers[row_id] = (server, record_path)
+        try:
+            publish_record(record_path, row_id=row_id, endpoint=endpoint,
+                           thread_id=session_id or "", process=server)
+            terminal = shutil.which("gnome-terminal") or shutil.which("x-terminal-emulator")
+            if not terminal:
+                raise RuntimeError("No supported terminal emulator was found.")
+            args = remote_tui_argv(endpoint, session_id or "", cwd)
+            command = [terminal, "--window", "--", *args] if Path(terminal).name == "gnome-terminal" else [terminal, "-e", shlex.join(args)]
+            self.spawn(command, session_key, cwd=cwd, focus=focus)
+        except Exception:
+            server.terminate()
+            record_path.unlink(missing_ok=True)
+            endpoint.unlink(missing_ok=True)
+            self._codex_app_servers.pop(row_id, None)
+            raise
 
     def _selected_search_member(self) -> tuple[str, str, str | None] | None:
         """(cwd, name, session_id) if the currently-selected All Sessions row is a search-
