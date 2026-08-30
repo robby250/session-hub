@@ -113,6 +113,27 @@ def main(argv: list[str] | None = None) -> int:
 
     terminal.connect("button-press-event", reclaim_keyboard_focus)
 
+    def paste_text_shortcut(_widget, event) -> bool:
+        """Own Ctrl+Shift+V at the terminal boundary instead of forwarding Ctrl+V.
+
+        A bare Vte.Terminal is not wrapped in gnome-terminal's accelerator setup. Depending on
+        the fresh GTK/VTE startup state, Ctrl+Shift+V can therefore fall through to the child PTY;
+        Codex then receives Ctrl+V and invokes its image-paste action. Consume the complete chord
+        here and ask VTE to paste the desktop CLIPBOARD as terminal text. This handler is installed
+        for every helper process, so relaunches and desktop restarts cannot lose the binding.
+        """
+        modifiers = event.state
+        required = Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
+        if (
+            modifiers & required == required
+            and Gdk.keyval_to_lower(event.keyval) == Gdk.KEY_v
+        ):
+            terminal.paste_clipboard()
+            return True
+        return False
+
+    terminal.connect("key-press-event", paste_text_shortcut)
+
     def copy_selection_to_clipboard(selected_terminal) -> None:
         """Mirror VTE's mouse selection into the desktop CLIPBOARD selection.
 
