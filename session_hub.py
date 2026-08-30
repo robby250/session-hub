@@ -1273,6 +1273,26 @@ class _EmbedWindowResizer:
             return False
         return True
 
+    def set_input_focus(self, child_winid: int) -> bool:
+        """task-2166: give `child_winid` real X11 keyboard input focus, explicitly and once --
+        never tied to the pointer. Before this, the embedded terminal received keys ONLY while
+        the pointer hovered it: with no window manager and no explicit XSetInputFocus anywhere
+        in this embed, the X server's global input-focus mode defaults to PointerRoot, which
+        delivers FocusIn/FocusOut (and therefore keyboard delivery) purely by pointer position --
+        the exact bug. `RevertToParent` (not PointerRoot) means a later unmap/destroy of
+        `child_winid` reverts focus to its parent rather than snapping back to pointer-follows
+        behavior."""
+        try:
+            from Xlib import X
+
+            disp = self._disp()
+            child = disp.create_resource_object("window", child_winid)
+            disp.set_input_focus(child, X.RevertToParent, X.CurrentTime)
+            disp.sync()
+        except Exception:
+            return False
+        return True
+
     def map_child(self, child_winid: int) -> bool:
         """Explicitly XMapWindow the embedded child (task-2156) -- this IS the fix for the
         observed blank-embed bug, not a formality. `Gtk.Plug.new(socket_id)` reparents its
@@ -1378,6 +1398,7 @@ class EmbeddedTerminalController:
         self.current_name: str | None = None
         self._child_winid: int | None = None
         self._pending_name: str | None = None
+        self._holds_focus = False
         # Bumped the moment a replacement attach COMMITS to displacing the previous one --
         # at the detach() call in begin_attach, before the new popen() even runs (task-2142
         # row453 REWORK -- reviewer rework round 2: bumping only after popen() succeeded left
@@ -1467,6 +1488,7 @@ class EmbeddedTerminalController:
             return False, "failed to map the embedded terminal's window"
         self.current_name = name
         self._child_winid = child_winid
+        self.focus()
         return True, "attached"
 
     def attach(self, name: str) -> tuple[bool, str]:
@@ -1491,6 +1513,30 @@ class EmbeddedTerminalController:
             return None
         return self._embedder.sample_non_background_pixels(self._child_winid)
 
+    def focus(self) -> bool:
+        """task-2166: explicitly grab real X11 keyboard focus for the current embed, once --
+        called right after a successful attach, and again whenever the user re-selects an
+        already-attached row (see SessionHub._switch_embedded_terminal's no-op short-circuit).
+        Never on a recurring timer; see set_input_focus."""
+        if self._child_winid is None:
+            return False
+        ok = self._embedder.set_input_focus(self._child_winid)
+        if ok:
+            self._holds_focus = True
+        return ok
+
+    def release_focus(self, window_id: int) -> None:
+        """Hand X11 keyboard focus back to `window_id` (Session Hub's own top-level window) --
+        but ONLY if the embed is the one currently holding it, so this never clobbers focus that
+        genuinely belongs to something else (e.g. no embed has ever attached yet). Called once
+        per real Qt focus change (see SessionHub._on_qt_focus_changed), never speculatively or on
+        a timer -- that bounded, event-driven handoff is what lets a click on another Qt widget
+        win permanently instead of the embed re-stealing focus back."""
+        if not self._holds_focus:
+            return
+        self._embedder.set_input_focus(window_id)
+        self._holds_focus = False
+
     def resize_to_container(self) -> None:
         """Re-fill the container on every resize (window resize, splitter drag) -- must be
         called by the owning widget's resizeEvent/splitterMoved; Gtk.Plug does not track the
@@ -1512,6 +1558,7 @@ class EmbeddedTerminalController:
         self.process = None
         self.current_name = None
         self._child_winid = None
+        self._holds_focus = False
 
     def poll_alive(self) -> bool:
         """True if a client is currently attached and still running. Clears state -- without
@@ -1525,6 +1572,7 @@ class EmbeddedTerminalController:
             self.process = None
             self.current_name = None
             self._child_winid = None
+            self._holds_focus = False
             return False
         return True
 
@@ -7073,6 +7121,13 @@ class SessionHub(QMainWindow):
         self._running_terminal_stack = running_terminal_stack
         self._embedded_terminal = EmbeddedTerminalController(self.running_terminal_container)
         self._embedded_terminal_meta: dict[str, tuple[str, str | None]] = {}
+        # task-2166: the other half of the explicit focus handoff -- release() only ever fires
+        # from `focus()` grabbing the embed's X window directly (never from Qt's own toplevel, so
+        # this cannot see itself and immediately hand focus back). Any REAL Qt widget gaining
+        # focus (a click, Tab navigation, a dialog opening) is exactly "the user deliberately
+        # selected another widget"; `release_focus` itself no-ops unless the embed currently holds
+        # X focus, so this costs nothing on every other focus change in the app.
+        QApplication.instance().focusChanged.connect(self._on_qt_focus_changed)
 
         running_splitter = QSplitter(Qt.Orientation.Horizontal)
         running_splitter.addWidget(running_list_page)
@@ -8022,12 +8077,27 @@ class SessionHub(QMainWindow):
         # cares about the saved row name, only `name` is carried through for the fallback path.
         self._switch_embedded_terminal(cwd, tmux_name, session_id, saved_name=name)
 
+    def _on_qt_focus_changed(self, _old, now) -> None:
+        """task-2166: Qt's own toplevel window loses real X11 input focus for as long as the
+        embed holds it (see EmbeddedTerminalController.focus/set_input_focus), so a click on a
+        genuinely different Qt widget cannot reach Qt at all until X focus is handed back to
+        Session Hub's own window -- `now is not None` is exactly that "the user deliberately
+        selected another widget" moment. Skipped when `now is None`: that transition is what
+        `focus()` grabbing the embed's window away from Qt's own toplevel itself produces, not a
+        user action, and releasing then would just fight our own grab."""
+        if now is not None:
+            self._embedded_terminal.release_focus(int(self.winId()))
+
     def _switch_embedded_terminal(
         self, cwd: str, name: str, session_id: str | None, *, saved_name: str | None = None,
     ) -> None:
         if (self._embedded_terminal.current_name == name
                 and self._embedded_terminal.poll_alive()):
-            return  # already attached to this exact session -- no needless restart
+            # Already attached -- no needless restart, but re-selecting/re-clicking an
+            # already-embedded row is itself a real "select/click it" gesture (task-2166 EXIT)
+            # and must re-grab keyboard focus the same as a fresh attach does.
+            self._embedded_terminal.focus()
+            return
         ok, detail = self._embedded_terminal.begin_attach(name)
         if not ok:
             self._show_embed_failure(cwd, name, session_id, detail, saved_name=saved_name)

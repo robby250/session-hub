@@ -89,8 +89,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile-uuid", default=None)
     args = parser.parse_args(argv)
 
-    plug, _terminal = build_plug(args.socket_id, args.tmux_session, args.profile_uuid)
+    plug, terminal = build_plug(args.socket_id, args.tmux_session, args.profile_uuid)
     plug.show_all()
+    # task-2166: GTK's own toplevel-focus flag (has-toplevel-focus) IS set correctly the moment
+    # the embedder gives this window real X11 input focus (see EmbeddedTerminalController.focus /
+    # _EmbedWindowResizer.set_input_focus) -- confirmed directly against a real Xvfb display. What
+    # was actually missing is this: GTK never auto-assigns which CHILD WIDGET owns keyboard focus
+    # within a toplevel it did not create interactively (a real top-level window gets this for
+    # free from normal user click/tab interaction; a Plug embedded straight from show_all() never
+    # does). Without an explicit grab, GTK has nowhere to route a key event even once the toplevel
+    # itself is genuinely focused -- confirmed live: the plug's own "event" signal DOES see every
+    # GDK_KEY_PRESS, but Vte.Terminal's own key-press-event never fires without this call. One
+    # grab is sufficient for the whole session; there is only ever one widget in this window.
+    terminal.grab_focus()
 
     def announce() -> bool:
         window = plug.get_window()
