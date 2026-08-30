@@ -33,8 +33,8 @@ from datetime import date, datetime
 from pathlib import Path
 
 from PyQt6.QtCore import (
-    QByteArray, QEvent, QItemSelectionModel, QObject, QRunnable, QSocketNotifier, QThreadPool,
-    QTimer, QUrl, Qt, pyqtSignal,
+    QByteArray, QEvent, QItemSelectionModel, QObject, QRect, QRunnable, QSocketNotifier,
+    QThreadPool, QTimer, QUrl, Qt, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QAction,
@@ -71,6 +71,9 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedLayout,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -220,7 +223,10 @@ STATUS_DIR = DATA_DIR / "status"
 DEFAULT_LAYOUT_SETTINGS = {
     "window_geometry": "AdnQywADAAAAAAXKAAAC0wAACf8AAAV8AAAFygAAAvMAAAn/AAAFfAAAAAAAAAAACgAAAAXKAAAC8wAACf8AAAV8",
     "main_table_columns_v2": "AAAA/wAAAAAAAAABAAAAAQAAAAQBAAAAAAAAAAAAAAAAAAAAAAAABB4AAAAGAQEBAAAAAAABAAAAAAAAAGT/////AAAAhAAAAAAAAAAGAAAAWgAAAAEAAAAAAAAAWgAAAAEAAAAAAAAA3AAAAAEAAAAAAAABQAAAAAEAAAAAAAAAjAAAAAEAAAAAAAAAwgAAAAEAAAABAAAD6AAAAAAAAAAAAAAAAAAAAAAAAAAAAQ==",
-    "running_table_columns_v1": "AAAA/wAAAAAAAAABAAAAAQAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAXsAAAADAAEBAAAAAAAAAAAAAAAAAGT/////AAAAhAAAAAAAAAADAAAAcQAAAAEAAAAAAAAAOwAAAAEAAAAAAAAAzwAAAAEAAAAAAAAD6AAAAAAAAAAAAAAAAAAAAAAAAAAAAQ==",
+    # _v2: task-2191 dropped Running's Status column (three sections to two); the
+    # old _v1 blob is a three-section state that would scramble widths if restored
+    # onto the new two-section header, so it's replaced rather than kept alongside.
+    "running_table_columns_v2": "AAAA/wAAAAAAAAABAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAlMAAAACAAEBAAAAAAAAAAAAAAAAAGT/////AAAAhAAAAAAAAAACAAAAuQAAAAEAAAAAAAABmgAAAAEAAAAAAAAD6AAAAAAAAAAAAAAAAAAAAAAAAAAAAQ==",
     "running_splitter_state_v1": "AAAA/wAAAAEAAAACAAABgQAAAp8B/////wEAAAABAA==",
     "group_dialog_geometry": "AdnQywADAAAAAAPuAAABgwAACRsAAAKwAAAD7gAAAYMAAAkbAAACsAAAAAAAAAAACgAAAAPuAAABgwAACRsAAAKw",
     "group_table_columns_v2": "AAAA/wAAAAAAAAABAAAAAAAAAAUBAAAABwAAAAUAAAABAAAAAgAAAAMAAAAEAAAAAAAAAAYAAAAHAAAABQAAAAEAAAACAAAAAwAAAAQAAAAAAAAABgAAAAAAAAAAAAAFFgAAAAcBAQEAAAAAAAEAAAACAAAAZP////8AAACEAAAAAAAAAAcAAAA4AAAAAQAAAAMAAABYAAAAAQAAAAAAAAEBAAAAAQAAAAAAAACQAAAAAQAAAAAAAABfAAAAAQAAAAMAAABFAAAAAQAAAAAAAAJRAAAAAQAAAAEAAAPoAAAAAAAAAAAAAAAAAAAAAAAAAAAB",
@@ -4629,6 +4635,47 @@ def bounded_tooltip(text: str) -> str:
     return f'<div style="width: 400px; white-space: normal;">{escaped}</div>' if escaped else ""
 
 
+class RunningNameAgeDelegate(QStyledItemDelegate):
+    """Paints the Running tab's Name cell as a two-line identity stack with a
+    compact relative-age string pinned to the row's upper-right (task-2191) --
+    replaces the dedicated Status column rather than adding one back as a widget.
+    Age comes from UserRole+5, set alongside the item's DisplayRole text; letting
+    Qt's own CE_ItemViewItem draw the background/selection/focus first (via an
+    emptied-text style option) keeps that behavior identical to every other cell
+    instead of reimplementing it.
+    """
+
+    def paint(self, painter, option, index) -> None:
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        age = index.data(Qt.ItemDataRole.UserRole + 5) or ""
+        lines = opt.text.split("\n")
+        opt.text = ""
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+        painter.save()
+        rect = option.rect.adjusted(4, 2, -4, -2)
+        fm = painter.fontMetrics()
+        line_h = fm.height()
+        pen = opt.palette.highlightedText() if opt.state & QStyle.StateFlag.State_Selected else opt.palette.text()
+        painter.setPen(pen.color())
+        top_rect = QRect(rect.left(), rect.top(), rect.width(), line_h)
+        painter.drawText(
+            top_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, lines[0] if lines else ""
+        )
+        if age:
+            age_width = fm.horizontalAdvance(age) + 4
+            age_rect = QRect(rect.right() - age_width, rect.top(), age_width, line_h)
+            painter.setPen(QColor("#9aa0a6"))
+            painter.drawText(age_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, age)
+            painter.setPen(pen.color())
+        if len(lines) > 1:
+            sub_rect = QRect(rect.left(), rect.top() + line_h, rect.width(), line_h)
+            painter.setPen(QColor("#9aa0a6"))
+            painter.drawText(sub_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, lines[1])
+        painter.restore()
+
+
 def hook_notify_cli() -> int:
     """--hook-notify: the command Claude Code itself runs as a hook.
 
@@ -7686,8 +7733,9 @@ class SessionHub(QMainWindow):
         running_list_page = QWidget()
         running_list_layout = QVBoxLayout(running_list_page)
         running_list_layout.setContentsMargins(0, 0, 0, 0)
-        self.running_table = QTableWidget(0, 3)
-        self.running_table.setHorizontalHeaderLabels(["Name", "Status", "Last message"])
+        self.running_table = QTableWidget(0, 2)
+        self.running_table.setHorizontalHeaderLabels(["Name", "Last message"])
+        self.running_table.setItemDelegateForColumn(0, RunningNameAgeDelegate(self.running_table))
         self.running_table.setToolTip(
             "Click, Enter or double-click a row to attach the embedded terminal on the right.\n"
             "Ctrl+Shift+O or right-click → Open externally opens that row's terminal in its "
@@ -7702,15 +7750,18 @@ class SessionHub(QMainWindow):
         self.running_table.verticalHeader().setDefaultSectionSize(62)
         self.running_table.verticalHeader().setVisible(False)
         self.running_table.horizontalHeader().setStretchLastSection(False)
-        for column in range(3):
+        for column in range(2):
             self.running_table.horizontalHeader().setSectionResizeMode(
                 column, QHeaderView.ResizeMode.Interactive
             )
         self.running_table.setColumnWidth(0, 185)
-        self.running_table.setColumnWidth(1, 100)
-        self.running_table.setColumnWidth(2, 310)
+        self.running_table.setColumnWidth(1, 410)
+        # _v2: task-2191 dropped the Status column (three sections to two) -- a
+        # pre-existing three-section blob restored onto the new two-section header
+        # scrambles widths (the same class of bug _v2 fixed for `main_table_columns_v2`
+        # above). Bump the key so only a fresh two-column blob ever round-trips.
         restore_column_widths(
-            self.running_table, self.settings().get("running_table_columns_v1")
+            self.running_table, self.settings().get("running_table_columns_v2")
         )
         # task-2142 row453: single click, Enter and double-click all converge on the same exact
         # embedded-terminal switch -- itemActivated already fires for both Enter and double-click
@@ -7858,7 +7909,7 @@ class SessionHub(QMainWindow):
                 self.saveGeometry().toBase64()
             ).decode("ascii")
             latest["settings"]["main_table_columns_v2"] = column_widths_state(self.table)
-            latest["settings"]["running_table_columns_v1"] = column_widths_state(
+            latest["settings"]["running_table_columns_v2"] = column_widths_state(
                 self.running_table
             )
             splitter_state = (
@@ -8648,7 +8699,7 @@ class SessionHub(QMainWindow):
             header_item.setForeground(QColor(color))
             header_item.setBackground(QColor("#25272d"))
             self.running_table.setItem(table_row, 0, header_item)
-            self.running_table.setSpan(table_row, 0, 1, 3)
+            self.running_table.setSpan(table_row, 0, 1, 2)
             self.running_table.setRowHeight(table_row, 28)
             table_row += 1
             records.sort(
@@ -8673,6 +8724,18 @@ class SessionHub(QMainWindow):
                     Qt.ItemDataRole.UserRole,
                     (cwd, row["name"], session_id, resolved_name),
                 )
+                age = relative_activity_age(message_ms)
+                name_item.setData(Qt.ItemDataRole.UserRole + 5, age)
+                # task-2191 REWORK (VAMP-reviewer HIGH-1): the activity label and age used to be
+                # readable from the Status item's DisplayRole text; the delegate now paints both
+                # manually, so a screen reader gets neither unless it's put here explicitly. This
+                # is accessibility text only -- grouping/filtering still key off the activity enum
+                # via the group-header rows and UserRole+5 respectively, never this role.
+                name_item.setData(
+                    Qt.ItemDataRole.AccessibleTextRole,
+                    f"{visible_name}, {provider} · {display_name}, {label or 'Unknown'}"
+                    + (f", {age}" if age else ""),
+                )
                 name_item.setToolTip(
                     bounded_tooltip(f"{provider} · {display_name} · {cwd}")
                 )
@@ -8683,12 +8746,8 @@ class SessionHub(QMainWindow):
                 tint.setAlpha(32)
                 name_item.setBackground(tint)
                 self.running_table.setItem(index, 0, name_item)
-                age = relative_activity_age(message_ms)
                 self.running_table.setItem(
-                    index, 1, self._status_column_item(state, age)
-                )
-                self.running_table.setItem(
-                    index, 2, self._detail_column_item(last_message)
+                    index, 1, self._detail_column_item(last_message)
                 )
                 self.running_table.setRowHeight(index, 62)
                 if resolved_name == self._selected_tmux_name and selected_row is None:
@@ -8708,13 +8767,6 @@ class SessionHub(QMainWindow):
         # search REWORK): this repopulates every 2s via _on_running_status_tick, and a search
         # must keep filtering the live rows rather than reverting to unfiltered on the next tick.
         self._apply_running_filter(self.search.text().strip().lower())
-
-    def _status_column_item(self, state: str, age: str = "") -> QTableWidgetItem:
-        label, color = activity_label(state)
-        item = QTableWidgetItem((label or "Unknown") + (f"\n{age}" if age else ""))
-        item.setForeground(QColor(color))
-        item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        return item
 
     @staticmethod
     def _detail_column_item(detail: str) -> QTableWidgetItem:
@@ -9388,7 +9440,7 @@ class SessionHub(QMainWindow):
             self._apply_all_sessions_filter(query)
 
     def _apply_running_filter(self, query: str) -> None:
-        """Filters `running_table`'s already-populated rows by name, status, last-message
+        """Filters `running_table`'s already-populated rows by name, relative age, last-message
         text, AND the hidden identity fields (cwd/exact tmux name/session id) carried in
         column 0's UserRole data -- entirely from what's already rendered/cached, never a new
         discovery or capture pass (task-2142 row453 REWORK -- orchestrator search REWORK)."""
@@ -9417,11 +9469,11 @@ class SessionHub(QMainWindow):
             # 4-tuple since task-2156 (adds the resolved actual tmux name); tolerate the older
             # 3-tuple shape too so a hand-built test/UserRole item without it still filters.
             cwd, name, session_id, tmux_name = data if len(data) == 4 else (*data, None)
-            status_item = self.running_table.item(row, 1)
-            detail_item = self.running_table.item(row, 2)
+            detail_item = self.running_table.item(row, 1)
+            age = name_item.data(Qt.ItemDataRole.UserRole + 5) or ""
             haystack = " ".join(
                 str(part) for part in (
-                    name_item.text(), status_item.text() if status_item else "",
+                    name_item.text(), age,
                     detail_item.text() if detail_item else "", cwd, name, session_id, tmux_name,
                 ) if part
             ).lower()
