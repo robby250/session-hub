@@ -4593,7 +4593,7 @@ class SessionHubTests(unittest.TestCase):
         codex_match = session_hub.find_group_member_session(codex_row, "/tmp/vamp", sessions)
         self.assertEqual(codex_match.native_key, "Codex:id-codex")
 
-    def test_find_group_member_session_codex_guess_respects_pending_since_and_exclusions(self):
+    def test_find_group_member_session_pending_codex_never_guesses_same_cwd_transcript(self):
         old_session = session_hub.Session(
             "Codex", "id-old", "t", "/tmp/vamp", "/tmp/vamp", 100, Path("/tmp/a.jsonl"),
         )
@@ -4602,17 +4602,16 @@ class SessionHubTests(unittest.TestCase):
         )
         sessions = [old_session, new_session]
         row = {"provider": "Codex", "codex_pending_since": 200}
-        # Only the session updated after codex_pending_since is a candidate -
-        # the pre-existing unrelated one (updated_ms=100) must not be guessed.
-        match = session_hub.find_group_member_session(row, "/tmp/vamp", sessions)
-        self.assertEqual(match.native_key, "Codex:id-new")
+        # The newer same-cwd transcript is still another row's identity, not proof that
+        # this pending row owns it (the 00:24 Worker4/orchestrator borrowing incident).
+        self.assertIsNone(session_hub.find_group_member_session(row, "/tmp/vamp", sessions))
         # No pending_since stamped yet (row never launched) -> no guess at all.
         self.assertIsNone(
             session_hub.find_group_member_session(
                 {"provider": "Codex"}, "/tmp/vamp", sessions
             )
         )
-        # Already claimed by a sibling row this same pass -> excluded.
+        # A claimed sibling remains unmatched too; exclusion is not an identity signal.
         self.assertIsNone(
             session_hub.find_group_member_session(
                 row, "/tmp/vamp", sessions, frozenset({"Codex:id-new"})
@@ -4625,6 +4624,29 @@ class SessionHubTests(unittest.TestCase):
         )
         self.assertIsNone(
             session_hub.find_group_member_session(row, "/tmp/vamp", sessions + [ambiguous])
+        )
+
+    def test_pending_codex_group_row_without_exact_tmux_rollout_does_not_borrow_sibling(self):
+        """task-2171 00:24 regression: Worker4 has a fresh pending marker but no
+        Worker4 rollout; the orchestrator's same-cwd transcript must remain the
+        orchestrator's row instead of being borrowed by Worker4."""
+        row = {
+            "name": "VAMP-worker4",
+            "provider": "Codex",
+            "codex_pending_since": 200,
+        }
+        orchestrator = session_hub.Session(
+            "Codex", "orchestrator", "orchestrator", "/tmp/vamp", "/tmp/vamp", 300,
+            Path("/tmp/orchestrator.jsonl"),
+        )
+        metadata = {"groups": {"/tmp/vamp": {"rows": [row]}}}
+        with patch("session_hub.codex_tmux_native_key", return_value=None):
+            changed = session_hub.resolve_pending_codex_group_rows(metadata, [orchestrator])
+        self.assertFalse(changed)
+        self.assertNotIn("session_key", row)
+        self.assertEqual(row["codex_pending_since"], 200)
+        self.assertIsNone(
+            session_hub.find_group_member_session(row, "/tmp/vamp", [orchestrator])
         )
 
     def test_find_group_member_session_claude_name_match_respects_exclude_keys(self):
@@ -4879,6 +4901,41 @@ class SessionHubTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(row["session_key"], "Codex:worker")
         self.assertNotIn("codex_pending_since", row)
+
+    def test_pending_codex_group_rows_bind_only_exact_named_tmux_owner(self):
+        """The positive half of task-2171's pending-launch contract: an exact
+        Worker4-named tmux rollout binds Worker4 only; a same-cwd orchestrator
+        sibling is never rewritten or adopted by that row."""
+        worker_row = {
+            "name": "VAMP-worker4",
+            "provider": "Codex",
+            "codex_pending_since": 200,
+        }
+        orchestrator_row = {
+            "name": "VAMPULSE-orchestrator",
+            "provider": "Codex",
+            "session_key": "Codex:orchestrator",
+        }
+        worker = session_hub.Session(
+            "Codex", "worker", "worker", "/tmp/vamp", "/tmp/vamp", 300,
+            Path("/tmp/worker.jsonl"),
+        )
+        orchestrator = session_hub.Session(
+            "Codex", "orchestrator", "orchestrator", "/tmp/vamp", "/tmp/vamp", 400,
+            Path("/tmp/orchestrator.jsonl"),
+        )
+        metadata = {"groups": {"/tmp/vamp": {"rows": [worker_row, orchestrator_row]}}}
+        with patch(
+            "session_hub.codex_tmux_native_key",
+            side_effect=lambda name: "Codex:worker" if name == "VAMP-worker4" else None,
+        ):
+            changed = session_hub.resolve_pending_codex_group_rows(
+                metadata, [worker, orchestrator]
+            )
+        self.assertTrue(changed)
+        self.assertEqual(worker_row["session_key"], "Codex:worker")
+        self.assertNotIn("codex_pending_since", worker_row)
+        self.assertEqual(orchestrator_row["session_key"], "Codex:orchestrator")
 
     def test_discover_sessions_collapses_group_members_into_one_row(self):
         with tempfile.TemporaryDirectory() as temp:

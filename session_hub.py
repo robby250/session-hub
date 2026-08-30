@@ -2824,34 +2824,19 @@ def find_group_member_session(
        already-claimed sibling with the same (often both-blank) agent_name/cwd
        must never resolve to that sibling's session - the absent row stays
        unmatched rather than borrowing another row's live identity.
-    3. Codex only, and only for a row this session itself just launched
-       (`row["codex_pending_since"]`, stamped by launch_group_row): the
-       newest live Codex session in this cwd updated since then, not already
-       claimed by a sibling row this same pass (`exclude_keys`). Codex has no
-       exact identity for a brand-new session the way --name/--resume give
-       Claude one, so this is a scoped guess - same risk class
-       adopt_untracked_sessions already accepts for the analogous
-       no-identifying-flags Claude case, narrowed here to only ever fire for
-       a row this session actually just launched, and only until it matches
-       once (session_key then sticks).
+    3. A Codex row carrying `codex_pending_since` is deliberately unmatched
+       here until `resolve_pending_codex_group_rows` binds it from that row's
+       exact live tmux name.  A same-cwd/newer-than-marker transcript is not
+       identity evidence: another Codex row can receive that turn, which was
+       the 00:24 Worker4/orchestrator borrowing incident (task-2171).
     """
     provider = row.get("provider", "Claude")
     session_key = row.get("session_key")
-    pending_since = row.get("codex_pending_since") if provider == "Codex" else None
-    if pending_since:
-        candidates = [
-            session
-            for session in sessions
-            if session.provider == "Codex"
-            and session.cwd == cwd
-            and session.updated_ms >= pending_since
-            and session.native_key not in exclude_keys
-        ]
-        # A pending launch explicitly asks for a NEW transcript. It must win
-        # over the row's historical session_key; otherwise the old file is
-        # found on disk first forever and the new conversation can never be
-        # adopted. More than one candidate is ambiguous, not "pick newest".
-        return candidates[0] if len(candidates) == 1 else None
+    if provider == "Codex" and row.get("codex_pending_since"):
+        # Pending Codex identity is resolved only by resolve_pending_codex_group_rows,
+        # which asks the exact row-named tmux session for its open rollout fd.  Never
+        # borrow another row's transcript by cwd or timestamp (task-2171, 00:24 incident).
+        return None
     if session_key:
         match = next(
             (
