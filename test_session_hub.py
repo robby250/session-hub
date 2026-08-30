@@ -4,6 +4,7 @@ import io
 import os
 import json
 import select
+import shlex
 import subprocess
 import shutil
 import sys
@@ -1909,7 +1910,7 @@ class SessionHubTests(unittest.TestCase):
                 '"$1" has-session -t "=$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
                 ' "$1" set-option -g set-titles on >/dev/null;'
                 ' "$1" set-option -g set-titles-string "#S" >/dev/null;'
-                ' "$1" set-option -g focus-events on >/dev/null;'
+                ' "$1" set-option -g focus-events off >/dev/null;'
                 ' exec "$5" --window -- "$1" attach -t "=$2"',
                 "session-hub",
                 "/usr/bin/tmux",
@@ -1919,6 +1920,138 @@ class SessionHubTests(unittest.TestCase):
                 "/usr/bin/gnome-terminal",
             ],
         )
+
+    @patch("session_hub.shutil.which")
+    def test_tmux_group_launch_command_forces_focus_events_off_before_attach(self, which):
+        # task-2160: `focus-events on` raced an attaching client's session pointer against tmux's
+        # CSI ?1004 focus-in/out handling and crashed the shared tmux server (upstream #3932/#5022),
+        # taking every row on the socket down with it. Must never be "on" again, and the off-switch
+        # must be ordered before the exec-attach step, not after.
+        which.side_effect = lambda name: {
+            "gnome-terminal": "/usr/bin/gnome-terminal",
+            "tmux": "/usr/bin/tmux",
+        }.get(name)
+        command = session_hub.tmux_group_launch_command(
+            "vamp-sonnet1", "/home/user/VAMPULSE-game",
+            ["claude", "--name", "vamp-sonnet1"],
+        )
+        script = command[2]
+        self.assertNotIn("focus-events on", script)
+        self.assertIn("set-option -g focus-events off", script)
+        self.assertLess(
+            script.index("focus-events off"), script.index("exec "),
+            "focus-events must be forced off before the client attaches",
+        )
+
+    def _disposable_tmux_wrapper(self, tmpdir, socket_name):
+        # setUp() patches session_hub.shutil.which (the same shared shutil module) to report
+        # tmux as absent as a safety net for other tests -- resolve the real binary without it,
+        # and isolate every disposable run behind its own -L socket, never the user's default one.
+        tmux_bin = subprocess.run(
+            ["bash", "-c", "command -v tmux"], capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        wrapper = Path(tmpdir) / "tmux-disposable"
+        wrapper.write_text(
+            f'#!/bin/bash\nexec {shlex.quote(tmux_bin)} -L {shlex.quote(socket_name)} "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        return wrapper, tmux_bin
+
+    def _launch_option_phase(self, session_name, wrapper):
+        command = session_hub.tmux_group_launch_command(
+            session_name, "/tmp", ["claude", "--name", session_name],
+        )
+        script = command[2]
+        return script.split(" exec ")[0]
+
+    @patch("session_hub.shutil.which")
+    def test_tmux_group_launch_leaves_disposable_socket_focus_events_off(self, which):
+        # Proof method step 2: on a disposable tmux socket/config, start with focus-events
+        # enabled, run the launch-option phase (has-session/new-session + the option-setting
+        # prefix, without the final exec-attach), and prove it is off before any client attaches.
+        socket_name = f"vamp-row476-test-{os.getpid()}"
+        session_name = "vamp-row476-fixture"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wrapper, tmux_bin = self._disposable_tmux_wrapper(tmpdir, socket_name)
+            which.side_effect = lambda name: {
+                "gnome-terminal": "/usr/bin/gnome-terminal",
+                "tmux": tmux_bin,
+            }.get(name)
+            try:
+                subprocess.run(
+                    [str(wrapper), "new-session", "-d", "-s", session_name],
+                    check=True, capture_output=True, timeout=5,
+                )
+                subprocess.run(
+                    [str(wrapper), "set-option", "-g", "focus-events", "on"],
+                    check=True, capture_output=True, timeout=5,
+                )
+                launch_option_phase = self._launch_option_phase(session_name, wrapper)
+                subprocess.run(
+                    ["bash", "-c", launch_option_phase, "session-hub",
+                     str(wrapper), session_name, "/tmp", "claude"],
+                    check=True, capture_output=True, timeout=5,
+                )
+                result = subprocess.run(
+                    [str(wrapper), "show-options", "-g", "focus-events"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                self.assertIn("off", result.stdout)
+            finally:
+                subprocess.run([str(wrapper), "kill-server"], capture_output=True, timeout=5)
+
+    @patch("session_hub.shutil.which")
+    def test_tmux_group_launch_race_leaves_disposable_socket_focus_events_off(self, which):
+        # Proof method step 3: race two disposable launch-option phases against the SAME
+        # disposable shared server and prove the final value is off regardless of interleaving --
+        # this is the exact shape of two concurrent group-row launches hitting one tmux server.
+        socket_name = f"vamp-row476-race-{os.getpid()}"
+        session_name = "vamp-row476-race-fixture"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wrapper, tmux_bin = self._disposable_tmux_wrapper(tmpdir, socket_name)
+            which.side_effect = lambda name: {
+                "gnome-terminal": "/usr/bin/gnome-terminal",
+                "tmux": tmux_bin,
+            }.get(name)
+            try:
+                subprocess.run(
+                    [str(wrapper), "new-session", "-d", "-s", session_name],
+                    check=True, capture_output=True, timeout=5,
+                )
+                subprocess.run(
+                    [str(wrapper), "set-option", "-g", "focus-events", "on"],
+                    check=True, capture_output=True, timeout=5,
+                )
+                launch_option_phase = self._launch_option_phase(session_name, wrapper)
+
+                def run_phase():
+                    return subprocess.run(
+                        ["bash", "-c", launch_option_phase, "session-hub",
+                         str(wrapper), session_name, "/tmp", "claude"],
+                        capture_output=True, timeout=5,
+                    )
+
+                results = [None, None]
+
+                def worker(idx):
+                    results[idx] = run_phase()
+
+                threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=10)
+                for r in results:
+                    self.assertIsNotNone(r)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+
+                result = subprocess.run(
+                    [str(wrapper), "show-options", "-g", "focus-events"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                self.assertIn("off", result.stdout)
+            finally:
+                subprocess.run([str(wrapper), "kill-server"], capture_output=True, timeout=5)
 
     def test_rename_group_row_in_renames_row_key_and_bucket(self):
         metadata = {
