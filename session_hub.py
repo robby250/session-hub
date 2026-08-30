@@ -239,6 +239,13 @@ CLIPBOARD_ENV_ALLOWLIST = (
     "DBUS_SESSION_BUS_ADDRESS",
     "XDG_SESSION_TYPE",
 )
+# task-2176: the three names tmux's stock `update-environment` auto-copies from
+# whichever client most recently attached - a headless agent/tool connecting with
+# none of these set makes tmux push explicit unset entries for them right back over
+# a value Session Hub already pinned. Only these three are stripped from auto-update;
+# the other three CLIPBOARD_ENV_ALLOWLIST names were never in tmux's stock list and
+# still get the same explicit pin via reconcile_tmux_desktop_env.
+TMUX_AUTO_UPDATE_STRIP_NAMES = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY")
 # Claude's CLI has no command to enumerate models, but --model accepts these
 # family aliases, which always resolve to the latest model of each family, so
 # they stay valid across model refreshes. "Default" omits --model entirely.
@@ -3422,6 +3429,78 @@ def tmux_live_session_names() -> frozenset[str]:
         # at all" - has-session's per-name equivalent already fails closed.
         return frozenset()
     return frozenset(line for line in result.stdout.splitlines() if line)
+
+
+def tmux_update_environment_names(tmux: str, *, run=None) -> list[str] | None:
+    """Current `update-environment` array, in server order. None (not []) when it
+    can't be read at all (no server yet, tmux vanished, timeout) - the caller must
+    tell that apart from a genuinely empty list and skip the rewrite rather than
+    stomping the option with nothing.
+
+    `run` defaults to None, resolved to subprocess.run INSIDE the body rather than
+    as `run=subprocess.run` in the signature - a default parameter value is bound
+    once at function-definition time, so it would silently keep calling the ORIGINAL
+    subprocess.run even after a test's `patch.object(session_hub.subprocess, "run",
+    ...)` (this file's standard convention) replaces the module attribute (task-2176
+    audit finding: this exact bug let a hermetic-looking test spawn a real tmux
+    subprocess and mutate the user's live default server)."""
+    run = run or subprocess.run
+    try:
+        result = run(
+            [tmux, "show-options", "-g", "-v", "update-environment"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def reconcile_tmux_desktop_env(
+    trusted_env: dict[str, str], *, tmux: str | None = None, run=None,
+) -> None:
+    """task-2176: pin `trusted_env` (desktop_clipboard_env_overrides's output) at the
+    tmux server's global environment AND every currently-live managed session's own
+    environment, so a later headless client attaching with no DISPLAY/XAUTHORITY of
+    its own can't push a stale unset back over a value Session Hub already trusts.
+
+    Only names actually present in `trusted_env` are touched - an allowlisted name
+    Session Hub itself doesn't currently have is left exactly as it was, never
+    invented and never destructively unset (desktop_clipboard_env_overrides already
+    omits absent names for the same reason).
+
+    One-shot: call from startup/refresh and from a fresh tmux session launch, never
+    the Running tab's 2s timer or any per-row polling loop (task-2176 brief
+    Constraints). An already-running agent process's own inherited environment can't
+    be rewritten this way - only the tmux session table future tmux-run commands
+    (send-keys, respawn, an interactive clipboard invocation) will see.
+    """
+    tmux = tmux or shutil.which("tmux")
+    if not tmux or not trusted_env:
+        return
+    run = run or subprocess.run
+    names = tmux_update_environment_names(tmux, run=run)
+    if names is not None:
+        kept = [name for name in names if name not in TMUX_AUTO_UPDATE_STRIP_NAMES]
+        if kept != names:
+            try:
+                run(
+                    [tmux, "set-option", "-g", "update-environment", " ".join(kept)],
+                    capture_output=True, text=True, timeout=2,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    scopes = [["-g"]] + [["-t", name] for name in tmux_live_session_names()]
+    for scope in scopes:
+        for key, value in trusted_env.items():
+            try:
+                run(
+                    [tmux, "set-environment", *scope, key, value],
+                    capture_output=True, text=True, timeout=2,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
 
 def tmux_pane_activity_snapshot() -> dict[str, tuple[str, str, str]]:
@@ -8132,6 +8211,10 @@ class SessionHub(QMainWindow):
         table.setSortingEnabled(True)
 
     def refresh(self) -> None:
+        # task-2176: once per full refresh (startup, Refresh button, F5) - never the
+        # Running tab's 2s timer, which calls refresh_running_tab() directly and never
+        # this method.
+        reconcile_tmux_desktop_env(self.desktop_clipboard_env_overrides())
         self.metadata = read_metadata()
         self.sessions = discover_sessions(self.metadata)
         self._search_member_rows = [
@@ -9233,6 +9316,12 @@ class SessionHub(QMainWindow):
                 if account_config_dir:
                     env_overrides = {**env_overrides, "CLAUDE_CONFIG_DIR": account_config_dir}
                 claude_args = prefix_env_command(claude_args, env_overrides, strip_env)
+                # task-2176: pin the trusted desktop values into the session tmux is
+                # about to create (or already owns, on a re-launch into an existing
+                # name) - row481's env_overrides above only reaches the exec'd Claude/
+                # Codex process itself, not the tmux session's own environment table
+                # that later `tmux send-keys`/respawn/interactive commands inherit.
+                reconcile_tmux_desktop_env(self.desktop_clipboard_env_overrides())
                 command = tmux_group_launch_command(name, cwd, claude_args)
                 self.spawn(
                     command, session_key, cwd=cwd, focus=focus, strip_env=strip_env

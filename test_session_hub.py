@@ -2243,6 +2243,147 @@ class SessionHubTests(unittest.TestCase):
         self.assertNotIn("WAYLAND_DISPLAY", overrides)
         self.assertNotIn("XAUTHORITY", overrides)
 
+    # --- task-2176: tmux clipboard env pin (hermetic, injected `run`) ---
+
+    def test_tmux_update_environment_names_returns_none_on_failure(self):
+        def failing_run(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="tmux", timeout=2)
+
+        self.assertIsNone(
+            session_hub.tmux_update_environment_names("tmux", run=failing_run)
+        )
+
+    def test_tmux_update_environment_names_returns_none_on_nonzero_exit(self):
+        run = MagicMock(return_value=MagicMock(returncode=1, stdout=""))
+        self.assertIsNone(
+            session_hub.tmux_update_environment_names("tmux", run=run)
+        )
+
+    def test_tmux_update_environment_names_parses_one_name_per_line(self):
+        run = MagicMock(
+            return_value=MagicMock(returncode=0, stdout="DISPLAY\nSSH_AUTH_SOCK\n")
+        )
+        self.assertEqual(
+            session_hub.tmux_update_environment_names("tmux", run=run),
+            ["DISPLAY", "SSH_AUTH_SOCK"],
+        )
+
+    def test_reconcile_tmux_desktop_env_noop_without_tmux_binary(self):
+        run = MagicMock()
+        with patch.object(session_hub.shutil, "which", return_value=None):
+            session_hub.reconcile_tmux_desktop_env({"DISPLAY": ":0"}, run=run)
+        run.assert_not_called()
+
+    def test_reconcile_tmux_desktop_env_noop_without_trusted_env(self):
+        run = MagicMock()
+        session_hub.reconcile_tmux_desktop_env({}, tmux="tmux", run=run)
+        run.assert_not_called()
+
+    def test_reconcile_tmux_desktop_env_strips_only_the_three_names_preserves_order_and_custom(
+        self,
+    ):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if argv[1:4] == ["show-options", "-g", "-v"]:
+                return MagicMock(
+                    returncode=0,
+                    stdout="DISPLAY\nMY_CUSTOM\nWAYLAND_DISPLAY\nSSH_AUTH_SOCK\nXAUTHORITY\n",
+                )
+            return MagicMock(returncode=0, stdout="")
+
+        with patch.object(
+            session_hub, "tmux_live_session_names", return_value=frozenset()
+        ):
+            session_hub.reconcile_tmux_desktop_env(
+                {"DISPLAY": ":0"}, tmux="tmux", run=fake_run
+            )
+        set_option_calls = [c for c in calls if c[1:3] == ["set-option", "-g"]]
+        self.assertEqual(len(set_option_calls), 1)
+        self.assertEqual(
+            set_option_calls[0],
+            ["tmux", "set-option", "-g", "update-environment",
+             "MY_CUSTOM SSH_AUTH_SOCK"],
+        )
+
+    def test_reconcile_tmux_desktop_env_skips_set_option_when_nothing_to_strip(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if argv[1:4] == ["show-options", "-g", "-v"]:
+                return MagicMock(returncode=0, stdout="MY_CUSTOM\n")
+            return MagicMock(returncode=0, stdout="")
+
+        with patch.object(
+            session_hub, "tmux_live_session_names", return_value=frozenset()
+        ):
+            session_hub.reconcile_tmux_desktop_env(
+                {"DISPLAY": ":0"}, tmux="tmux", run=fake_run
+            )
+        self.assertFalse(any(c[1:3] == ["set-option", "-g"] for c in calls))
+
+    def test_reconcile_tmux_desktop_env_sets_global_and_each_live_session(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if argv[1:4] == ["show-options", "-g", "-v"]:
+                return MagicMock(returncode=0, stdout="")
+            return MagicMock(returncode=0, stdout="")
+
+        with patch.object(
+            session_hub,
+            "tmux_live_session_names",
+            return_value=frozenset({"vamp-worker1", "vamp-worker2"}),
+        ):
+            session_hub.reconcile_tmux_desktop_env(
+                {"DISPLAY": ":0", "XAUTHORITY": "/home/user/.Xauthority"},
+                tmux="tmux",
+                run=fake_run,
+            )
+        set_env_calls = [c for c in calls if c[1] == "set-environment"]
+        scopes = {
+            ("-g",) if c[2] == "-g" else ("-t", c[3]) for c in set_env_calls
+        }
+        self.assertEqual(
+            scopes,
+            {
+                ("-g",),
+                ("-t", "vamp-worker1"),
+                ("-t", "vamp-worker2"),
+            },
+        )
+        # every scope (global + each live session) gets both trusted names
+        self.assertEqual(len(set_env_calls), 3 * 2)
+        self.assertIn(
+            ["tmux", "set-environment", "-g", "DISPLAY", ":0"], set_env_calls
+        )
+        self.assertIn(
+            ["tmux", "set-environment", "-t", "vamp-worker1", "XAUTHORITY",
+             "/home/user/.Xauthority"],
+            set_env_calls,
+        )
+
+    def test_reconcile_tmux_desktop_env_never_touches_an_absent_allowlist_name(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return MagicMock(returncode=0, stdout="")
+
+        with patch.object(
+            session_hub, "tmux_live_session_names", return_value=frozenset()
+        ):
+            session_hub.reconcile_tmux_desktop_env(
+                {"DISPLAY": ":0"}, tmux="tmux", run=fake_run
+            )
+        set_env_names = {c[3] for c in calls if c[1] == "set-environment"}
+        self.assertEqual(set_env_names, {"DISPLAY"})
+        self.assertNotIn("XAUTHORITY", set_env_names)
+        self.assertNotIn("WAYLAND_DISPLAY", set_env_names)
+
     @patch("session_hub.shutil.which")
     def test_tmux_group_launch_command_matches_name_to_tmux_session(self, which):
         # VAMPULSE-orchestrator's request: the tmux session name and the
@@ -2412,6 +2553,114 @@ class SessionHubTests(unittest.TestCase):
                     capture_output=True, text=True, timeout=5,
                 )
                 self.assertIn("off", result.stdout)
+            finally:
+                subprocess.run([str(wrapper), "kill-server"], capture_output=True, timeout=5)
+
+    @patch("session_hub.shutil.which")
+    def test_reconcile_tmux_desktop_env_real_lifecycle_survives_a_headless_attach(
+        self, which
+    ):
+        # task-2176 proof method: a disposable named tmux socket/server, never the
+        # user's default one, proving reconcile_tmux_desktop_env's full lifecycle
+        # against the real tmux binary.
+        socket_name = f"vamp-row498-real-{os.getpid()}"
+        session_name = "vamp-row498-fixture"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wrapper, _tmux_bin = self._disposable_tmux_wrapper(tmpdir, socket_name)
+            # reconcile_tmux_desktop_env's own tmux_live_session_names() call resolves
+            # "tmux" via shutil.which independently of the tmux= kwarg below - point it
+            # at the same disposable wrapper so it targets this socket, not the
+            # setUp() safety net (which reports tmux absent) or the user's real server.
+            which.side_effect = lambda name: {"tmux": str(wrapper)}.get(name)
+            try:
+                subprocess.run(
+                    [str(wrapper), "new-session", "-d", "-s", session_name],
+                    check=True, capture_output=True, timeout=5,
+                )
+                # 1. seed stock plus one custom update-environment name.
+                subprocess.run(
+                    [str(wrapper), "set-option", "-g", "update-environment",
+                     "DISPLAY XAUTHORITY MY_CUSTOM_VAR SSH_AUTH_SOCK"],
+                    check=True, capture_output=True, timeout=5,
+                )
+
+                # 2. reconcile with synthetic trusted desktop values.
+                session_hub.reconcile_tmux_desktop_env(
+                    {"DISPLAY": ":77", "XAUTHORITY": "/tmp/vamp-row498-fake-xauth"},
+                    tmux=str(wrapper),
+                )
+
+                # 3. only the three clipboard display names left auto-update; every
+                # other stock/custom name is untouched.
+                names = subprocess.run(
+                    [str(wrapper), "show-options", "-g", "-v", "update-environment"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.split()
+                self.assertNotIn("DISPLAY", names)
+                self.assertNotIn("XAUTHORITY", names)
+                self.assertIn("MY_CUSTOM_VAR", names)
+                self.assertIn("SSH_AUTH_SOCK", names)
+
+                def session_env():
+                    out = subprocess.run(
+                        [str(wrapper), "show-environment", "-t", session_name],
+                        capture_output=True, text=True, timeout=5,
+                    ).stdout
+                    return {
+                        line.split("=", 1)[0]: line.split("=", 1)[1]
+                        for line in out.splitlines()
+                        if "=" in line and not line.startswith("-")
+                    }
+
+                before = session_env()
+                self.assertEqual(before.get("DISPLAY"), ":77")
+                self.assertEqual(before.get("XAUTHORITY"), "/tmp/vamp-row498-fake-xauth")
+
+                # 4. a later headless client attaching with DISPLAY/XAUTHORITY absent
+                # from ITS OWN environment must not erase the pinned values -- only a
+                # real pty attach makes tmux actually push update-environment, so this
+                # uses `script` to fake one rather than sequencing events by hand.
+                log = Path(tmpdir) / "attach.log"
+                attach = subprocess.Popen(
+                    ["env", "-i", f"HOME={os.environ['HOME']}",
+                     f"PATH={os.environ['PATH']}", "TERM=xterm",
+                     "script", "-qec",
+                     f"{shlex.quote(str(wrapper))} attach-session -t "
+                     f"{shlex.quote(session_name)}",
+                     str(log)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                try:
+                    time.sleep(2)
+                    subprocess.run(
+                        [str(wrapper), "detach-client", "-s", session_name],
+                        capture_output=True, timeout=5,
+                    )
+                    attach.wait(timeout=5)
+                finally:
+                    if attach.poll() is None:
+                        attach.kill()
+                        attach.wait(timeout=5)
+
+                after = session_env()
+                self.assertEqual(after, before)
+
+                # 5. reconcile a second trusted value; it replaces the first.
+                session_hub.reconcile_tmux_desktop_env(
+                    {"DISPLAY": ":88", "XAUTHORITY": "/tmp/vamp-row498-fake-xauth"},
+                    tmux=str(wrapper),
+                )
+                updated = session_env()
+                self.assertEqual(updated.get("DISPLAY"), ":88")
+
+                # 6. reconcile with one allowlisted value missing -- neither invented
+                # nor destructively unset; the previously pinned DISPLAY survives.
+                session_hub.reconcile_tmux_desktop_env(
+                    {"XAUTHORITY": "/tmp/vamp-row498-fake-xauth"}, tmux=str(wrapper),
+                )
+                final = session_env()
+                self.assertEqual(final.get("DISPLAY"), ":88")
             finally:
                 subprocess.run([str(wrapper), "kill-server"], capture_output=True, timeout=5)
 
@@ -3410,8 +3659,14 @@ class SessionHubTests(unittest.TestCase):
         # Never a blanket MCP disable - only the vampulse server is named.
         self.assertNotIn("mcp_servers.google_sheets.enabled=false", out_of_scope)
 
+    @patch("session_hub.reconcile_tmux_desktop_env")
     @patch("session_hub.shutil.which")
-    def test_launch_with_tmux_builds_tmux_command_and_skips_pid_capture(self, which):
+    def test_launch_with_tmux_builds_tmux_command_and_skips_pid_capture(self, which, _reconcile):
+        # `which` resolves a REAL "/usr/bin/tmux" path below (to exercise real command-
+        # string building), so reconcile_tmux_desktop_env - which, unlike
+        # tmux_group_launch_command, actually SPAWNS a real tmux subprocess - must be
+        # stubbed here or both SessionHub()'s own refresh() and this launch() call would
+        # mutate the user's live default tmux server (task-2176 audit finding).
         which.side_effect = lambda name: {
             "gnome-terminal": "/usr/bin/gnome-terminal",
             "tmux": "/usr/bin/tmux",
@@ -3456,15 +3711,21 @@ class SessionHubTests(unittest.TestCase):
         finally:
             window.close()
 
+    @patch("session_hub.reconcile_tmux_desktop_env")
     @patch("session_hub.shutil.which")
     def test_launch_with_tmux_propagates_desktop_clipboard_env_despite_stale_tmux_server(
-        self, which
+        self, which, _reconcile
     ):
         """task-2165 EXIT: a long-lived tmux server started from a tty (modeled here by the
         server having no clipboard env of its own -- launch() never reads or depends on the
         tmux server's environment at all, only os.environ + prefix_env_command's explicit
         `env NAME=VALUE` prefix on the exec'd command) must still get the Hub's live desktop
-        clipboard values propagated into the exec'd child, exactly the allowlisted names."""
+        clipboard values propagated into the exec'd child, exactly the allowlisted names.
+
+        `which` resolves a real "/usr/bin/tmux" path, so reconcile_tmux_desktop_env (task-2176)
+        is stubbed here - it would otherwise spawn a real tmux subprocess against the user's
+        live default server, unlike tmux_group_launch_command which only builds a command
+        string (task-2176 audit finding)."""
         which.side_effect = lambda name: {
             "gnome-terminal": "/usr/bin/gnome-terminal",
             "tmux": "/usr/bin/tmux",
@@ -3502,11 +3763,17 @@ class SessionHubTests(unittest.TestCase):
         finally:
             window.close()
 
+    @patch("session_hub.reconcile_tmux_desktop_env")
     @patch("session_hub.shutil.which")
-    def test_launch_with_tmux_explicit_env_override_wins_over_desktop_clipboard(self, which):
+    def test_launch_with_tmux_explicit_env_override_wins_over_desktop_clipboard(
+        self, which, _reconcile
+    ):
         """Precedence control: an explicit configured session env override for the SAME name
         the desktop clipboard allowlist would supply must win -- the desktop value is a
-        fallback default, not authoritative."""
+        fallback default, not authoritative.
+
+        `which` resolves a real "/usr/bin/tmux" path, so reconcile_tmux_desktop_env (task-2176)
+        is stubbed here for the same reason as the sibling tmux launch tests above."""
         which.side_effect = lambda name: {
             "gnome-terminal": "/usr/bin/gnome-terminal",
             "tmux": "/usr/bin/tmux",
@@ -10570,6 +10837,24 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def setUp(self):
+        # Same real-I/O safety net as SessionHubTests.setUp (row432 audit, extended
+        # task-2176): this class also constructs a bare SessionHub(), and with no
+        # `which` patch of its own, `shutil.which("tmux")` resolves the REAL binary -
+        # refresh()'s reconcile_tmux_desktop_env would then run for real against the
+        # user's live default tmux server (task-2176 audit finding: this exact gap
+        # let a full-suite run strip DISPLAY/XAUTHORITY from it).
+        real_which = shutil.which
+
+        def _which_no_tmux(name, *args, **kwargs):
+            if name == "tmux":
+                return None
+            return real_which(name, *args, **kwargs)
+
+        which_patcher = patch.object(session_hub.shutil, "which", side_effect=_which_no_tmux)
+        which_patcher.start()
+        self.addCleanup(which_patcher.stop)
+
     def _window_with_one_running_session(self):
         # Same fixture shape as the passing running_context_menu tests above: a tmux GROUP row
         # (not a bare standalone Session) is what refresh_running_tab's group branch recognizes
@@ -10987,6 +11272,20 @@ class SearchFilterTests(unittest.TestCase):
     tab is visible. Running gets a cached-data-only filter over its already-populated rows
     (name/status/last-message plus hidden identity fields); All Sessions additionally surfaces
     matching saved group members as their own directly-activatable rows."""
+
+    def setUp(self):
+        # Same real-I/O safety net as SessionHubTests.setUp (row432 audit, extended
+        # task-2176) - see RunningTabEmbeddedTerminalTests.setUp's docstring for why.
+        real_which = shutil.which
+
+        def _which_no_tmux(name, *args, **kwargs):
+            if name == "tmux":
+                return None
+            return real_which(name, *args, **kwargs)
+
+        which_patcher = patch.object(session_hub.shutil, "which", side_effect=_which_no_tmux)
+        which_patcher.start()
+        self.addCleanup(which_patcher.stop)
 
     def _window(self, metadata=None):
         metadata = metadata or {"sessions": {}, "settings": {}, "groups": {}}
