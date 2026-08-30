@@ -3829,6 +3829,39 @@ def codex_duplicate_row_losers(
     return frozenset(losers)
 
 
+def clear_proven_codex_duplicate_bindings(
+    rows: list[dict], tmux_owner_by_native_key: dict[str, str]
+) -> bool:
+    """Persistently clear stale duplicate bindings once a live owner proves the winner.
+
+    The fail-closed loser set prevents a bad row from controlling another row's terminal, but
+    leaving the poisoned `session_key` in metadata makes the ambiguity return on every restart.
+    Only repair clusters for which the live census resolves one exact owner and one tied row's
+    saved tmux name matches it; an absent or ambiguous owner remains untouched and fail-closed.
+    """
+    by_key: dict[str, list[dict]] = {}
+    for row in rows:
+        if row.get("provider") == "Codex" and row.get("session_key"):
+            by_key.setdefault(row["session_key"], []).append(row)
+    changed = False
+    for key, tied in by_key.items():
+        owner_name = tmux_owner_by_native_key.get(key)
+        if len(tied) < 2 or owner_name is None:
+            continue
+        winners = [
+            row for row in tied
+            if sanitize_tmux_session_name(row.get("name", "") or "") == owner_name
+        ]
+        if len(winners) != 1:
+            continue
+        winner = winners[0]
+        for row in tied:
+            if row is not winner:
+                row.pop("session_key", None)
+                changed = True
+    return changed
+
+
 def stop_tmux_session(name: str) -> None:
     """Kill the tmux session named `name`, if any. A no-op if already gone.
 
@@ -4663,6 +4696,52 @@ def _read_codex_notify() -> list[str] | None:
     return value if isinstance(value, list) else None
 
 
+def codex_config_error() -> str | None:
+    """Return the parse/read error that would prevent Codex from starting."""
+    if not CODEX_CONFIG.is_file():
+        return None
+    try:
+        with CODEX_CONFIG.open("rb") as handle:
+            tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return str(exc)
+    return None
+
+
+def _codex_root_notify_match(text: str) -> "re.Match[str] | None":
+    """Find a one-line root `notify` assignment, never one nested in a table."""
+    first_table = re.search(r"(?m)^\s*\[", text)
+    root_end = first_table.start() if first_table else len(text)
+    return re.search(r"(?m)^notify\s*=.*$", text[:root_end])
+
+
+def _insert_codex_root_setting(text: str, line: str) -> str:
+    """Insert LINE in TOML root scope, immediately before the first table."""
+    first_table = re.search(r"(?m)^\s*\[", text)
+    if first_table is None:
+        stripped = text.rstrip("\n")
+        return (stripped + "\n" if stripped else "") + line + "\n"
+    before = text[:first_table.start()].rstrip("\n")
+    after = text[first_table.start():]
+    return (before + "\n" if before else "") + line + "\n\n" + after
+
+
+def _write_codex_config_text(text: str) -> None:
+    """Validate first, then atomically replace config.toml with TEXT."""
+    tomllib.loads(text)
+    CODEX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    temp = CODEX_CONFIG.with_suffix(".session-hub.tmp")
+    try:
+        temp.write_text(text)
+        temp.chmod((CODEX_CONFIG.stat().st_mode & 0o777) if CODEX_CONFIG.exists() else 0o600)
+        temp.replace(CODEX_CONFIG)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def install_status_hooks_codex() -> bool:
     """Set ~/.codex/config.toml's `notify` key to session-hub's own command.
 
@@ -4676,21 +4755,35 @@ def install_status_hooks_codex() -> bool:
     dependency to round-trip the whole file with.
     """
     ours = codex_notify_command()
+    if codex_config_error() is not None:
+        # A malformed file is not equivalent to an absent notify setting. Never
+        # compound a syntax error by editing a config we cannot interpret.
+        return False
     existing = _read_codex_notify()
     if existing is not None and existing != ours:
         return False
+    if existing == ours:
+        # Preserve the user's formatting. In particular, replacing only the
+        # first line of a valid multiline array leaves its remaining items as
+        # dangling TOML keys -- the exact config corruption this guard prevents.
+        return True
     line = f"notify = {json.dumps(ours)}"
     if not CODEX_CONFIG.is_file():
-        CODEX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-        CODEX_CONFIG.write_text(line + "\n")
+        _write_codex_config_text(line + "\n")
         return True
     text = CODEX_CONFIG.read_text()
-    if re.search(r"(?m)^notify\s*=.*$", text):
-        text = re.sub(r"(?m)^notify\s*=.*$", line, text, count=1)
-    else:
-        text = text.rstrip("\n")
-        text = (text + "\n" if text else "") + line + "\n"
-    CODEX_CONFIG.write_text(text)
+    root_match = _codex_root_notify_match(text)
+    if root_match is not None:
+        # A root key exists but isn't our supported list value. It belongs to
+        # the user; never reinterpret or partly rewrite it.
+        return False
+    # Older Session Hub versions appended this exact line at EOF, which places
+    # it INSIDE the last TOML table. Remove only our exact legacy line, then
+    # reinsert it before the first table where it is truly root.
+    owned_line = re.compile(rf"(?m)^{re.escape(line)}\s*\n?")
+    text = owned_line.sub("", text)
+    text = _insert_codex_root_setting(text, line)
+    _write_codex_config_text(text)
     return True
 
 
@@ -4701,8 +4794,18 @@ def uninstall_status_hooks_codex() -> None:
         return
     if not CODEX_CONFIG.is_file():
         return
-    text = re.sub(r"(?m)^notify\s*=.*\n?", "", CODEX_CONFIG.read_text(), count=1)
-    CODEX_CONFIG.write_text(text)
+    text = CODEX_CONFIG.read_text()
+    match = _codex_root_notify_match(text)
+    expected_line = f"notify = {json.dumps(codex_notify_command())}"
+    if match is None or match.group(0).strip() != expected_line:
+        # Session Hub writes a one-line value. If the user reformatted it as a
+        # multiline array, leave it intact instead of removing only line one.
+        return
+    end = match.end()
+    if end < len(text) and text[end] == "\n":
+        end += 1
+    text = text[:match.start()] + text[end:]
+    _write_codex_config_text(text)
 
 
 def group_row_status(
@@ -6572,7 +6675,7 @@ class ManageGroupDialog(QDialog):
     def row_session(self, row: dict, match: Session | None) -> Session:
         base = match or Session(
             row.get("provider", "Claude"),
-            f"pending:{row['override_key']}",
+            "",
             row["name"], self.cwd, self.cwd, 0,
             Path(self.cwd),
         )
@@ -8303,10 +8406,14 @@ class SessionHub(QMainWindow):
         tmux_name_by_native_key = compute_codex_tmux_owner_census()
         # task-2171: the SAME census also arbitrates duplicate Codex session_key rows across
         # every group in one in-memory pass, so metadata order never decides the winner.
-        codex_losers = codex_duplicate_row_losers(
-            [row for group in self.metadata.get("groups", {}).values() for row in group.get("rows", [])],
-            tmux_name_by_native_key,
-        )
+        all_group_rows = [
+            row
+            for group in self.metadata.get("groups", {}).values()
+            for row in group.get("rows", [])
+        ]
+        if clear_proven_codex_duplicate_bindings(all_group_rows, tmux_name_by_native_key):
+            write_metadata(self.metadata)
+        codex_losers = codex_duplicate_row_losers(all_group_rows, tmux_name_by_native_key)
 
         running: list[tuple[str, str, dict, Session | None, str]] = []
         claimed: set[str] = set()
@@ -8561,14 +8668,25 @@ class SessionHub(QMainWindow):
 
     def eventFilter(self, obj, event) -> bool:
         """task-2170: the deliberate-user-action boundary _on_qt_focus_changed gates release on.
-        A real click or key press that Qt itself dispatches to a widget can only ever originate
-        from OUTSIDE the embedded child: that child is a separate X11 window owned by the
-        Gtk.Plug helper process, so input landing on it is delivered by the X server directly to
-        that process and never reaches this application's event loop at all -- no ancestry check
-        needed. `event.spontaneous()` restricts this to real X11-originated input, not something
-        the app posted to itself. Bumping a monotonic serial (not a bool) is what lets
+        The embedded X11 child normally receives clicks directly, but clicks on its Qt stack,
+        container, or uncovered margin DO reach this event loop. Treating those as outside clicks
+        releases keyboard focus immediately and makes typing pointer-hover-dependent. A click
+        anywhere inside the terminal page therefore re-grabs the selected ready embed and is
+        consumed here; only genuine interactions outside that page advance the release serial.
+        `event.spontaneous()` restricts this to real X11-originated input, not something the app
+        posted to itself. Bumping a monotonic serial (not a bool) is what lets
         _on_qt_focus_changed require a STRICTLY LATER genuine interaction than the embed's own
         last focus() grab -- see _note_embed_focus_grabbed."""
+        if event.spontaneous() and event.type() in (
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonDblClick,
+        ) and self._is_running_terminal_widget(obj):
+            entry = self._entry_for(self._selected_tmux_name or "")
+            if entry is not None and entry.state == "ready" and entry.controller.poll_alive():
+                if entry.controller.focus():
+                    self._focused_entry = entry
+                    self._note_embed_focus_grabbed(self._qt_interaction_serial)
+                    return True
         if event.spontaneous() and event.type() in (
             QEvent.Type.MouseButtonPress,
             QEvent.Type.MouseButtonDblClick,
@@ -8576,6 +8694,15 @@ class SessionHub(QMainWindow):
         ):
             self._qt_interaction_serial += 1
         return super().eventFilter(obj, event)
+
+    def _is_running_terminal_widget(self, obj) -> bool:
+        """Whether OBJ belongs to the Qt surface surrounding the embedded terminal."""
+        widget = obj if isinstance(obj, QWidget) else None
+        while widget is not None:
+            if widget is self._running_terminal_page:
+                return True
+            widget = widget.parentWidget()
+        return False
 
     def _on_qt_focus_changed(self, _old, now) -> None:
         """task-2166: Qt's own toplevel window loses real X11 input focus for as long as the
@@ -9514,6 +9641,16 @@ class SessionHub(QMainWindow):
                 f"The session's original directory does not exist:\n{source_cwd}",
             )
             return
+        if provider == "Codex":
+            config_error = codex_config_error()
+            if config_error is not None:
+                QMessageBox.critical(
+                    self,
+                    "Invalid Codex configuration",
+                    "Codex cannot start because ~/.codex/config.toml is invalid:\n\n"
+                    f"{config_error}\n\nFix that file, then launch or resume again.",
+                )
+                return
         if use_tmux and self.settings().get("status_hooks_enabled", False):
             if provider == "Claude":
                 install_status_hooks(Path(cwd))
