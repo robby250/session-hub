@@ -4246,11 +4246,11 @@ _TRANSCRIPT_MAX_LINE_BYTES = 1_048_576  # a candidate line past this can never b
 # -- dropped rather than parsed or buffered, mirroring _codex_scan_range_for_turn_marker.
 
 _TRANSCRIPT_LAST_TEXT_CACHE_MAX = 256
-# path -> (mtime_ns, size, (dev, ino), text, resume_from) -- same cache shape and the same reasons
+# path -> (mtime_ns, size, (dev, ino), text, resume_from, message_ms) -- same cache shape/reasons
 # as _codex_tail_cache: a GUI refresh can ask about the same live session more than once per pass,
 # and a long-running process must not grow this one entry per historical session forever.
 _transcript_last_text_cache: (
-    "collections.OrderedDict[str, tuple[int, int, tuple[int, int], str, int]]"
+    "collections.OrderedDict[str, tuple[int, int, tuple[int, int], str, int, int]]"
 ) = collections.OrderedDict()
 
 
@@ -4327,10 +4327,40 @@ _TRANSCRIPT_LAST_TEXT_PARSERS = {
 }
 
 
+def _transcript_timestamp_ms(value) -> int:
+    if isinstance(value, (int, float)):
+        return int(value if value >= 1_000_000_000_000 else value * 1000)
+    if not isinstance(value, str) or not value:
+        return 0
+    try:
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
+def _assistant_record_from_line(raw: bytes, provider: str) -> tuple[str, int] | None:
+    """The semantic assistant text plus that exact JSONL record's timestamp."""
+    parser = _TRANSCRIPT_LAST_TEXT_PARSERS.get(provider)
+    text = parser(raw) if parser is not None else None
+    if text is None:
+        return None
+    try:
+        obj = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+    return text, _transcript_timestamp_ms(obj.get("timestamp") if isinstance(obj, dict) else None)
+
+
+_TRANSCRIPT_LAST_RECORD_PARSERS = {
+    provider: (lambda raw, provider=provider: _assistant_record_from_line(raw, provider))
+    for provider in _TRANSCRIPT_LAST_TEXT_PARSERS
+}
+
+
 def _transcript_scan_range_for_last_text(
     path: Path, floor: int, end: int, parse_line,
-) -> tuple[str | None, int]:
-    """Reverse fixed-chunk scan for the text of the LAST (closest-to-EOF) line in [floor, end) of
+) -> tuple[object | None, int]:
+    """Reverse fixed-chunk scan for the parsed value of the LAST line in [floor, end) of
     `path` for which `parse_line(line_bytes)` returns non-None -- walking backward
     _TRANSCRIPT_TAIL_BYTES at a time until a match is found or `floor` is reached. Mirrors
     _codex_scan_range_for_turn_marker's chunk-bounded reverse walk and oversized-line handling
@@ -4404,7 +4434,7 @@ def _transcript_scan_range_for_last_text(
                 return None, resume_from
 
 
-def _transcript_last_assistant_text(path: Path, provider: str) -> str:
+def _transcript_last_assistant_record(path: Path, provider: str) -> tuple[str, int]:
     """The newest assistant text message in `path` per `provider`'s own record shape (see
     _claude_assistant_text_from_line / _codex_assistant_text_from_line), or "" if none exists, the
     file is unreadable, or `provider` has no semantic parser here (e.g. Antigravity -- its
@@ -4416,13 +4446,13 @@ def _transcript_last_assistant_text(path: Path, provider: str) -> str:
     truncated file (same-or-smaller size, or a changed (dev, ino) identity) cold-scans safely.
     Same cache shape and reasoning as _codex_tail_turn_state.
     """
-    parse_line = _TRANSCRIPT_LAST_TEXT_PARSERS.get(provider)
+    parse_line = _TRANSCRIPT_LAST_RECORD_PARSERS.get(provider)
     if parse_line is None:
-        return ""
+        return "", 0
     try:
         stat = path.stat()
     except OSError:
-        return ""
+        return "", 0
     key = str(path)
     identity = (stat.st_dev, stat.st_ino)
     cached = _transcript_last_text_cache.get(key)
@@ -4433,7 +4463,7 @@ def _transcript_last_assistant_text(path: Path, provider: str) -> str:
         and cached[2] == identity
     ):
         _transcript_last_text_cache.move_to_end(key)
-        return cached[3]
+        return cached[3], cached[5]
     if cached is not None and cached[2] == identity and cached[1] < stat.st_size:
         # Strict growth of the confirmed-same file: only the newly appended bytes can contain a
         # qualifying line newer than the cached one -- everything below the previous resume point
@@ -4443,17 +4473,21 @@ def _transcript_last_assistant_text(path: Path, provider: str) -> str:
         found, resume_from = _transcript_scan_range_for_last_text(
             path, cached[4], stat.st_size, parse_line
         )
-        text = found if found is not None else cached[3]
+        text, message_ms = found if found is not None else (cached[3], cached[5])
     else:
         found, resume_from = _transcript_scan_range_for_last_text(path, 0, stat.st_size, parse_line)
-        text = found or ""
+        text, message_ms = found if found is not None else ("", 0)
     _transcript_last_text_cache[key] = (
-        stat.st_mtime_ns, stat.st_size, identity, text, resume_from,
+        stat.st_mtime_ns, stat.st_size, identity, text, resume_from, message_ms,
     )
     _transcript_last_text_cache.move_to_end(key)
     if len(_transcript_last_text_cache) > _TRANSCRIPT_LAST_TEXT_CACHE_MAX:
         _transcript_last_text_cache.popitem(last=False)
-    return text
+    return text, message_ms
+
+
+def _transcript_last_assistant_text(path: Path, provider: str) -> str:
+    return _transcript_last_assistant_record(path, provider)[0]
 
 
 def _codex_activity(session: "Session", status: dict | None) -> tuple[str, str]:
@@ -7386,6 +7420,8 @@ class SessionHub(QMainWindow):
             self._check_embedded_terminal_liveness()
 
     def _on_main_tab_changed(self, index: int) -> None:
+        is_running = index == self.main_tabs.indexOf(self.running_page)
+        self._set_running_terminal_visible(is_running)
         # task-2169: apply (never persist) the destination tab's own remembered
         # expand/collapse state before anything else - reading source tab's
         # preference must never leak onto Running, or vice versa.
@@ -7405,6 +7441,31 @@ class SessionHub(QMainWindow):
             self._restore_selected_terminal_focus()
         else:
             self.apply_filter()
+
+    def _set_running_terminal_visible(self, visible: bool) -> None:
+        """Show the outer terminal pane only for Running without losing its divider width."""
+        if visible == self._running_terminal_enabled:
+            return
+        if visible:
+            self._running_terminal_page.show()
+            if not self._running_splitter_visible_state.isEmpty():
+                self.running_splitter.restoreState(self._running_splitter_visible_state)
+            self._running_terminal_enabled = True
+            QTimer.singleShot(0, self._on_terminal_container_resize)
+            return
+        self._running_splitter_visible_state = QByteArray(self.running_splitter.saveState())
+        if self._focused_entry is not None:
+            self._focused_entry.controller.release_focus(int(self.winId()))
+            self._focused_entry = None
+        self._running_terminal_page.hide()
+        self._running_terminal_enabled = False
+
+    def _on_running_splitter_moved(self, *_args) -> None:
+        if self._running_terminal_enabled:
+            self._running_splitter_visible_state = QByteArray(
+                self.running_splitter.saveState()
+            )
+        self._on_terminal_container_resize()
 
     def _restore_selected_terminal_focus(self) -> None:
         """Reassert the visible embed's X11 focus when the user returns to Running."""
@@ -7497,17 +7558,21 @@ class SessionHub(QMainWindow):
             usage_compact.addWidget(bar)
             self.usage_compact_labels[provider] = label
             self.usage_compact_bars[provider] = bar
-        usage_compact.addStretch(1)
         self.usage_expand_button = QPushButton("Expand")
         self.usage_expand_button.clicked.connect(lambda: self.set_usage_expanded(True))
         usage_compact.addWidget(self.usage_expand_button)
+        usage_compact.addStretch(1)
         # Wrapped in a QWidget (task-2142 row453 REWORK -- orchestrator visual
         # REWORK) so the WHOLE compact strip -- labels, bars, Expand button --
         # can be hidden as one unit once expanded; a bare QHBoxLayout has no
         # setVisible of its own.
         self.usage_compact_row = QWidget()
         self.usage_compact_row.setLayout(usage_compact)
-        layout.addWidget(self.usage_compact_row)
+
+        content_panel = QWidget()
+        content_layout = QVBoxLayout(content_panel)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.addWidget(self.usage_compact_row)
 
         usage_frame = QFrame()
         usage_frame.setFrameShape(QFrame.Shape.StyledPanel)
@@ -7577,7 +7642,7 @@ class SessionHub(QMainWindow):
                 usage_layout.addWidget(detail, row + 1, offset, 1, 2)
                 rows.append((label, bar, detail))
             self.usage_widgets[provider] = rows
-        layout.addWidget(usage_frame)
+        content_layout.addWidget(usage_frame)
 
         self.table = QTableWidget(0, len(SessionHub.SESSION_TABLE_COLUMNS))
         self.table.setHorizontalHeaderLabels(list(SessionHub.SESSION_TABLE_COLUMNS))
@@ -7719,26 +7784,10 @@ class SessionHub(QMainWindow):
         self._embed_focus_grab_serial = 0
         QApplication.instance().installEventFilter(self)
 
-        self.running_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.running_splitter.addWidget(running_list_page)
-        self.running_splitter.addWidget(running_terminal_page)
-        self.running_splitter.setStretchFactor(0, 0)
-        self.running_splitter.setStretchFactor(1, 1)
-        self.running_splitter.splitterMoved.connect(
-            lambda *_a: self._on_terminal_container_resize()
-        )
-        running_layout.addWidget(self.running_splitter, 1)
-        encoded_splitter = self.settings().get("running_splitter_state_v1")
-        if encoded_splitter:
-            try:
-                decoded_splitter = QByteArray.fromBase64(encoded_splitter.encode("ascii"))
-                if decoded_splitter.isEmpty() or not self.running_splitter.restoreState(decoded_splitter):
-                    self.settings().pop("running_splitter_state_v1", None)
-            except (AttributeError, TypeError, ValueError):
-                self.settings().pop("running_splitter_state_v1", None)
+        running_layout.addWidget(running_list_page, 1)
 
-        external_shortcut = QShortcut(QKeySequence("Ctrl+Shift+O"), running_page)
-        external_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        external_shortcut = QShortcut(QKeySequence("Ctrl+Shift+O"), self)
+        external_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
         external_shortcut.activated.connect(self.open_selected_running_externally)
 
         tabs = QTabWidget()
@@ -7747,7 +7796,29 @@ class SessionHub(QMainWindow):
         self.main_tabs = tabs
         self.running_page = running_page
         tabs.currentChanged.connect(self._on_main_tab_changed)
-        layout.addWidget(tabs, 1)
+        content_layout.addWidget(tabs, 1)
+
+        # The terminal is beside the entire tab-side content, not nested below the shared usage
+        # strip. It therefore begins directly under the toolbar and uses all remaining height.
+        self.running_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.running_splitter.addWidget(content_panel)
+        self.running_splitter.addWidget(running_terminal_page)
+        self.running_splitter.setStretchFactor(0, 0)
+        self.running_splitter.setStretchFactor(1, 1)
+        self.running_splitter.setSizes([520, 760])
+        encoded_splitter = self.settings().get("running_splitter_state_v1")
+        if encoded_splitter:
+            try:
+                decoded_splitter = QByteArray.fromBase64(encoded_splitter.encode("ascii"))
+                if decoded_splitter.isEmpty() or not self.running_splitter.restoreState(decoded_splitter):
+                    self.settings().pop("running_splitter_state_v1", None)
+            except (AttributeError, TypeError, ValueError):
+                self.settings().pop("running_splitter_state_v1", None)
+        self._running_splitter_visible_state = QByteArray(self.running_splitter.saveState())
+        self._running_terminal_enabled = True
+        self.running_splitter.splitterMoved.connect(self._on_running_splitter_moved)
+        layout.addWidget(self.running_splitter, 1)
+        self._set_running_terminal_visible(tabs.currentWidget() is running_page)
         self.setCentralWidget(root)
 
         refresh_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F5), self)
@@ -7793,8 +7864,13 @@ class SessionHub(QMainWindow):
             latest["settings"]["running_table_columns_v1"] = column_widths_state(
                 self.running_table
             )
+            splitter_state = (
+                self.running_splitter.saveState()
+                if self._running_terminal_enabled
+                else self._running_splitter_visible_state
+            )
             latest["settings"]["running_splitter_state_v1"] = bytes(
-                self.running_splitter.saveState().toBase64()
+                splitter_state.toBase64()
             ).decode("ascii")
             self.metadata = latest
             write_metadata(latest)
@@ -8537,11 +8613,14 @@ class SessionHub(QMainWindow):
                 )
                 if match else ("unknown", "")
             )
-            last_message = (
-                _transcript_last_assistant_text(match.path, match.provider) if match else ""
+            if state not in ("needs_input", "working", "done", "idle"):
+                state = "unknown"
+            last_message, message_ms = (
+                _transcript_last_assistant_record(match.path, match.provider)
+                if match else ("", 0)
             )
             view_rows.append(
-                (state, display_name, cwd, row, match, resolved_name, last_message)
+                (state, display_name, cwd, row, match, resolved_name, last_message, message_ms)
             )
 
         state_order = ("needs_input", "working", "done", "idle", "unknown")
@@ -8552,6 +8631,8 @@ class SessionHub(QMainWindow):
         active_groups = [(state, buckets[state]) for state in state_order if buckets[state]]
         self.running_table.clearSpans()
         self.running_table.setRowCount(len(view_rows) + len(active_groups))
+        self.running_table.clearSelection()
+        self.running_table.selectionModel().clearCurrentIndex()
         table_row = 0
         for state, records in active_groups:
             label, color = activity_label(state)
@@ -8565,10 +8646,11 @@ class SessionHub(QMainWindow):
             self.running_table.setRowHeight(table_row, 28)
             table_row += 1
             records.sort(
-                key=lambda record: record[4].updated_ms if record[4] else 0,
-                reverse=True,
+                key=lambda record: (-record[7], record[5].casefold()),
             )
-            for _state, display_name, cwd, row, match, resolved_name, last_message in records:
+            for (
+                _state, display_name, cwd, row, match, resolved_name, last_message, message_ms,
+            ) in records:
                 index = table_row
                 table_row += 1
                 session_id = match.session_id if match else None
@@ -8595,7 +8677,7 @@ class SessionHub(QMainWindow):
                 tint.setAlpha(32)
                 name_item.setBackground(tint)
                 self.running_table.setItem(index, 0, name_item)
-                age = relative_activity_age(match.updated_ms if match else 0)
+                age = relative_activity_age(message_ms)
                 self.running_table.setItem(
                     index, 1, self._status_column_item(state, age)
                 )
@@ -8603,6 +8685,8 @@ class SessionHub(QMainWindow):
                     index, 2, self._detail_column_item(last_message)
                 )
                 self.running_table.setRowHeight(index, 62)
+                if resolved_name == self._selected_tmux_name:
+                    self.running_table.setCurrentCell(index, 0)
         # Reapply whatever query is currently typed (task-2142 row453 REWORK -- orchestrator
         # search REWORK): this repopulates every 2s via _on_running_status_tick, and a search
         # must keep filtering the live rows rather than reverting to unfiltered on the next tick.
