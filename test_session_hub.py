@@ -34,6 +34,19 @@ _TEST_XDG_DATA_HOME = tempfile.mkdtemp(prefix="session-hub-test-xdg-")
 os.environ["XDG_DATA_HOME"] = _TEST_XDG_DATA_HOME
 atexit.register(shutil.rmtree, _TEST_XDG_DATA_HOME, ignore_errors=True)
 
+# task-2171: this row adds new tmux_pane_activity_snapshot() call sites (matched_sessions,
+# launch_group_row, resume_group_row) to functions that previously never spawned tmux at all.
+# Ported ahead of row498/task-2176 landing on main (same fix, not yet merged): a bare `tmux`
+# command with no -L/-S prefers the inherited $TMUX env var (set automatically for any process
+# running inside a tmux pane) over TMUX_TMPDIR, so TMUX_TMPDIR alone does NOT isolate a test run
+# from the real default tmux server when the test interpreter itself runs inside tmux - confirmed
+# by a live incident this session. Removing $TMUX here, before any subprocess can see it, is
+# required for a bare tmux command to resolve purely from TMUX_TMPDIR.
+_TEST_TMUX_TMPDIR = tempfile.mkdtemp(prefix="session-hub-test-tmux-")
+os.environ["TMUX_TMPDIR"] = _TEST_TMUX_TMPDIR
+os.environ.pop("TMUX", None)
+atexit.register(shutil.rmtree, _TEST_TMUX_TMPDIR, ignore_errors=True)
+
 from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
 from PyQt6.QtGui import QMouseEvent, QResizeEvent
 from PyQt6.QtWidgets import QApplication, QMenuBar
@@ -4388,6 +4401,61 @@ class SessionHubTests(unittest.TestCase):
             row_b, "/tmp/vamp", [shared_target], frozenset({"Claude:id-shared"}),
         )
         self.assertIsNone(match_b)
+
+    def test_codex_duplicate_row_losers_census_wins_regardless_of_metadata_order(self):
+        """task-2171: the live failure shape. Two saved Codex rows record the identical
+        session_key; the census uniquely maps that key to VAMPULSE-orchestrator's tmux name.
+        The orchestrator row must win regardless of which row sorts first in metadata."""
+        worker4_row = {"name": "VAMP-worker4", "provider": "Codex", "session_key": "Codex:shared"}
+        orchestrator_row = {
+            "name": "VAMPULSE-orchestrator", "provider": "Codex", "session_key": "Codex:shared",
+        }
+        census = {"Codex:shared": "VAMPULSE-orchestrator"}
+        losers = session_hub.codex_duplicate_row_losers([worker4_row, orchestrator_row], census)
+        self.assertEqual(losers, frozenset({id(worker4_row)}))
+        self.assertNotIn(id(orchestrator_row), losers)
+
+    def test_codex_duplicate_row_losers_reversed_metadata_order_is_metamorphic(self):
+        """Same cluster as above, rows listed in the OPPOSITE metadata order -- the winner must
+        be identical (the orchestrator row), never whichever row happens to sort first."""
+        worker4_row = {"name": "VAMP-worker4", "provider": "Codex", "session_key": "Codex:shared"}
+        orchestrator_row = {
+            "name": "VAMPULSE-orchestrator", "provider": "Codex", "session_key": "Codex:shared",
+        }
+        census = {"Codex:shared": "VAMPULSE-orchestrator"}
+        losers = session_hub.codex_duplicate_row_losers([orchestrator_row, worker4_row], census)
+        self.assertEqual(losers, frozenset({id(worker4_row)}))
+        self.assertNotIn(id(orchestrator_row), losers)
+
+    def test_codex_duplicate_row_losers_missing_census_fails_every_tied_row_closed(self):
+        """No census at all (tmux_owner_by_native_key=None) must never fall back to row order,
+        saved-name liveness, cwd, or newest transcript -- every row in the tied cluster loses."""
+        row_a = {"name": "VAMP-worker4", "provider": "Codex", "session_key": "Codex:shared"}
+        row_b = {"name": "VAMPULSE-orchestrator", "provider": "Codex", "session_key": "Codex:shared"}
+        losers = session_hub.codex_duplicate_row_losers([row_a, row_b], None)
+        self.assertEqual(losers, frozenset({id(row_a), id(row_b)}))
+
+    def test_codex_duplicate_row_losers_ambiguous_census_never_guesses_a_winner(self):
+        """The census resolved SOME owner for the key, but neither tied row's saved name equals
+        it (e.g. the real owner isn't even a saved row) -- neither sibling may be guessed."""
+        row_a = {"name": "VAMP-worker4", "provider": "Codex", "session_key": "Codex:shared"}
+        row_b = {"name": "VAMP-worker7", "provider": "Codex", "session_key": "Codex:shared"}
+        census = {"Codex:shared": "some-other-live-tmux-session"}
+        losers = session_hub.codex_duplicate_row_losers([row_a, row_b], census)
+        self.assertEqual(losers, frozenset({id(row_a), id(row_b)}))
+
+    def test_codex_duplicate_row_losers_leaves_non_duplicate_and_non_codex_rows_untouched(self):
+        """A single Codex row with a session_key (no sibling sharing it), and a Claude row
+        sharing a session_key with another Claude row, are both outside this resolver's scope --
+        it must never reject anything find_group_member_session's own exclude_keys logic already
+        handles correctly on its own."""
+        lone_codex_row = {"name": "VAMP-1", "provider": "Codex", "session_key": "Codex:solo"}
+        claude_row_a = {"name": "VAMP-2", "provider": "Claude", "session_key": "Claude:shared"}
+        claude_row_b = {"name": "VAMP-3", "provider": "Claude", "session_key": "Claude:shared"}
+        losers = session_hub.codex_duplicate_row_losers(
+            [lone_codex_row, claude_row_a, claude_row_b], {},
+        )
+        self.assertEqual(losers, frozenset())
 
     def test_codex_tmux_native_key_reads_the_open_rollout_fd(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -9311,6 +9379,127 @@ class SessionActivityTests(unittest.TestCase):
             window.refresh_running_tab()
             self.assertEqual(window.running_table.rowCount(), 0)  # not claimed as Running
             window.close()
+
+    def _duplicate_codex_key_fixture(self, row_order: list[str]):
+        """The task-2171 live shape: `worker4_row` and `orchestrator_row`, both saved with the
+        IDENTICAL session_key, in `row_order` ("worker4-first" or "orchestrator-first"). Only
+        one live Codex tmux session exists and the census uniquely resolves it to
+        VAMPULSE-orchestrator. Returns (worker4_row, orchestrator_row, live_session)."""
+        native_key = "Codex:01a00000-0000-0000-0000-0000000000ee"
+        worker4_row = {"name": "VAMP-worker4", "provider": "Codex", "session_key": native_key}
+        orchestrator_row = {
+            "name": "VAMPULSE-orchestrator", "provider": "Codex", "session_key": native_key,
+        }
+        rows = (
+            [worker4_row, orchestrator_row]
+            if row_order == "worker4-first"
+            else [orchestrator_row, worker4_row]
+        )
+        session_hub.METADATA_PATH.write_text(
+            json.dumps({
+                "settings": {}, "sessions": {},
+                "groups": {"/tmp/vamp": {"tmux": True, "rows": rows}},
+            }),
+            encoding="utf-8",
+        )
+        live_session = session_hub.Session(
+            "Codex", native_key.split(":", 1)[1], "orch", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/orch.jsonl"),
+        )
+        # Only ONE live tmux session, named for the true owner -- the census maps the shared
+        # key to it uniquely regardless of which row sorts first in metadata.
+        self._fake_run_with_native_identity({701: native_key})
+        return worker4_row, orchestrator_row, live_session
+
+    def _run_duplicate_codex_key_refresh(self, row_order: str):
+        worker4_row, orchestrator_row, live_session = self._duplicate_codex_key_fixture(row_order)
+
+        def fake_run(argv, **kwargs):
+            result = MagicMock(returncode=0, stdout="")
+            if argv[1] == "list-sessions":
+                result.stdout = "VAMPULSE-orchestrator\n"
+            elif argv[1] == "list-panes":
+                result.stdout = "VAMPULSE-orchestrator\t%0\t701\t1788000000\n"
+            return result
+
+        with (
+            patch.object(session_hub, "codex_sessions", return_value=[live_session]),
+            patch.object(session_hub, "claude_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.shutil, "which", return_value="/usr/bin/tmux"),
+            patch.object(session_hub.subprocess, "run", side_effect=fake_run),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            window.refresh_running_tab()
+            rows_by_name = {}
+            for r in range(window.running_table.rowCount()):
+                item = window.running_table.item(r, 0)
+                _cwd, saved_name, session_id, _tmux_name = item.data(
+                    session_hub.Qt.ItemDataRole.UserRole
+                )
+                rows_by_name[saved_name] = session_id
+            # A second refresh in the SAME pass must not re-poison the losing sibling's own
+            # session_key -- discover_sessions's group-collapse repair write only ever fires for
+            # a row that actually matched, and worker4_row never matches here.
+            window.refresh_running_tab()
+            metadata_after = json.loads(session_hub.METADATA_PATH.read_text(encoding="utf-8"))
+            window.close()
+        return rows_by_name, worker4_row, orchestrator_row, metadata_after
+
+    def test_refresh_running_tab_codex_duplicate_session_key_census_wins_worker4_first(self):
+        """task-2171 EXIT, live shape, metadata order worker4-then-orchestrator: only the
+        orchestrator row (the census's unique live owner) is Running; worker4 is never claimed
+        and never shown as owning the orchestrator's session/pane/preview."""
+        rows_by_name, worker4_row, orchestrator_row, _metadata = (
+            self._run_duplicate_codex_key_refresh("worker4-first")
+        )
+        self.assertEqual(rows_by_name.get("VAMPULSE-orchestrator"), "01a00000-0000-0000-0000-0000000000ee")
+        self.assertNotIn("VAMP-worker4", rows_by_name)
+
+    def test_refresh_running_tab_codex_duplicate_session_key_census_wins_orchestrator_first(self):
+        """task-2171 metamorphic control: identical fixture, metadata order REVERSED
+        (orchestrator-then-worker4). The winner must be identical to the worker4-first case --
+        the census decides, never metadata order."""
+        rows_by_name, worker4_row, orchestrator_row, metadata_after = (
+            self._run_duplicate_codex_key_refresh("orchestrator-first")
+        )
+        self.assertEqual(rows_by_name.get("VAMPULSE-orchestrator"), "01a00000-0000-0000-0000-0000000000ee")
+        self.assertNotIn("VAMP-worker4", rows_by_name)
+        # Metadata repair never copied the winning key onto the losing sibling.
+        rows_after = metadata_after["groups"]["/tmp/vamp"]["rows"]
+        loser_after = next(r for r in rows_after if r["name"] == "VAMP-worker4")
+        self.assertEqual(loser_after.get("session_key"), "Codex:01a00000-0000-0000-0000-0000000000ee")
+
+    def test_sessions_json_cli_codex_duplicate_session_key_census_wins_regardless_of_order(self):
+        """task-2171: the JSON/TUI path (sessions_json_cli) must resolve the identical duplicate
+        exactly like the GUI Running tab -- the brief names this path explicitly."""
+        worker4_row, orchestrator_row, live_session = self._duplicate_codex_key_fixture(
+            "worker4-first"
+        )
+
+        def fake_run(argv, **kwargs):
+            result = MagicMock(returncode=0, stdout="")
+            if argv[1] == "list-sessions":
+                result.stdout = "VAMPULSE-orchestrator\n"
+            elif argv[1] == "list-panes":
+                result.stdout = "VAMPULSE-orchestrator\t%0\t701\t1788000000\n"
+            return result
+
+        with (
+            patch.object(session_hub, "codex_sessions", return_value=[live_session]),
+            patch.object(session_hub, "claude_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.shutil, "which", return_value="/usr/bin/tmux"),
+            patch.object(session_hub.subprocess, "run", side_effect=fake_run),
+            patch("sys.stdout", new_callable=io.StringIO) as fake_stdout,
+        ):
+            session_hub.sessions_json_cli()
+        payload = json.loads(fake_stdout.getvalue())
+        rows_out = payload["groups"]["/tmp/vamp"]["rows"]
+        by_name = {r["name"]: r for r in rows_out}
+        self.assertEqual(by_name["VAMPULSE-orchestrator"]["status"], "Running")
+        self.assertNotEqual(by_name["VAMP-worker4"]["status"], "Running")
 
     def test_refresh_running_tab_absent_row_never_borrows_a_claimed_siblings_identity(self):
         """task-2164: an absent row (no session_key of its own, so it falls to the name+cwd

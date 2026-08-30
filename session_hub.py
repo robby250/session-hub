@@ -3041,14 +3041,26 @@ def discover_sessions(metadata: dict) -> list[Session]:
     group_hidden = set()
     group_pseudo_sessions = []
     groups_changed = False
-    for cwd, group in metadata.setdefault("groups", {}).items():
+    all_groups = metadata.setdefault("groups", {})
+    # No tmux census here (perf: this pass must add no new tmux subprocess) - a duplicate
+    # Codex session_key cluster therefore always fails closed rather than being arbitrated by
+    # row order (task-2171). The GUI Running tab / JSON path below DO carry a census and pick
+    # the real owner; this pass only needs to stop guessing.
+    codex_losers = codex_duplicate_row_losers(
+        [row for group in all_groups.values() for row in group.get("rows", [])], None
+    )
+    for cwd, group in all_groups.items():
         max_updated = 0
         provider_counts: dict[str, int] = {}
         for row in group.get("rows", []):
             provider_counts[row.get("provider", "Claude")] = (
                 provider_counts.get(row.get("provider", "Claude"), 0) + 1
             )
-            match = find_group_member_session(row, cwd, visible, frozenset(group_hidden))
+            match = (
+                None
+                if id(row) in codex_losers
+                else find_group_member_session(row, cwd, visible, frozenset(group_hidden))
+            )
             if match:
                 group_hidden.add(match.native_key)
                 max_updated = max(max_updated, match.updated_ms)
@@ -3642,6 +3654,67 @@ def tmux_name_by_native_key_failing_closed(census: dict[str, str]) -> dict[str, 
     for name, key in census.items():
         owners_by_key.setdefault(key, []).append(name)
     return {key: owners[0] for key, owners in owners_by_key.items() if len(owners) == 1}
+
+
+def compute_codex_tmux_owner_census() -> dict[str, str]:
+    """One batched {native_key: tmux_name} view of which live tmux session currently owns
+    each open Codex rollout -- ONE `tmux list-panes -a` plus its /proc walk, the same shape
+    refresh_running_tab/sessions_json_cli already computed independently (task-2156). Factored
+    out so codex_duplicate_row_losers's callers share one call site instead of re-deriving the
+    census inline; call once per refresh/CLI/dialog/click pass, never from inside a per-row loop.
+    """
+    pane_pid_by_name = {
+        name: pid for name, (_pane_id, pid, _activity) in tmux_pane_activity_snapshot().items()
+    }
+    return tmux_name_by_native_key_failing_closed(tmux_native_key_census(pane_pid_by_name))
+
+
+def codex_duplicate_row_losers(
+    rows: list[dict], tmux_owner_by_native_key: dict[str, str] | None
+) -> frozenset[int]:
+    """id() of every Codex-provider row in `rows` that must be treated as UNMATCHED because it
+    shares its saved session_key with a sibling row and is not the tmux census's unique live
+    owner of that key.
+
+    task-2171 (live incident): both a `VAMP-worker4`-shaped row and the orchestrator's own row
+    had recorded the orchestrator's rollout key, and plain metadata-list order let whichever row
+    came first claim the live session -- the other rendered blank. The fresh one-to-one
+    native-key-to-live-tmux census (`tmux_owner_by_native_key`, {native_key: tmux_name} from
+    `compute_codex_tmux_owner_census`) is the ownership authority regardless of row order: the
+    row whose own saved name equals the key's resolved live owner wins; every other row sharing
+    that key is a loser. A missing census, or a key the census never resolved a unique live owner
+    for, or no tied row's name matching the resolved owner, fails EVERY row in that cluster
+    closed -- never guessed via row order, saved-name liveness, cwd, or newest transcript (all
+    explicitly forbidden by the brief).
+
+    A row with no session_key, or fewer than two rows sharing one, is untouched -- this only ever
+    narrows an existing exact-match ambiguity, it never rejects a row find_group_member_session
+    would otherwise leave alone.
+    """
+    by_key: dict[str, list[dict]] = {}
+    for row in rows:
+        if row.get("provider") != "Codex":
+            continue
+        key = row.get("session_key")
+        if not key:
+            continue
+        by_key.setdefault(key, []).append(row)
+    owners = tmux_owner_by_native_key or {}
+    losers: set[int] = set()
+    for key, tied in by_key.items():
+        if len(tied) < 2:
+            continue
+        owner_name = owners.get(key)
+        winner = next(
+            (
+                row for row in tied
+                if owner_name is not None
+                and sanitize_tmux_session_name(row.get("name", "") or "") == owner_name
+            ),
+            None,
+        )
+        losers.update(id(row) for row in tied if row is not winner)
+    return frozenset(losers)
 
 
 def stop_tmux_session(name: str) -> None:
@@ -6358,10 +6431,21 @@ class ManageGroupDialog(QDialog):
         # overtaken by a linked continuation in another provider still
         # matches here.
         live = group_row_candidates(self.hub.metadata, self.hub.settings())
+        # One-shot dialog action, not a polled refresh - a fresh census here is fine (task-2171)
+        # and lets group management show the same census-arbitrated owner the Running tab does,
+        # rather than failing every duplicate closed the way the no-census discover_sessions
+        # pass must.
+        codex_losers = codex_duplicate_row_losers(
+            group.get("rows", []), compute_codex_tmux_owner_census()
+        )
         pairs = []
         claimed: set[str] = set()
         for row in group.get("rows", []):
-            match = find_group_member_session(row, self.cwd, live, frozenset(claimed))
+            match = (
+                None
+                if id(row) in codex_losers
+                else find_group_member_session(row, self.cwd, live, frozenset(claimed))
+            )
             if match:
                 claimed.add(match.native_key)
                 row_custom = overrides.get(row["override_key"], {})
@@ -8086,15 +8170,17 @@ class SessionHub(QMainWindow):
 
         # task-2156: ONE shared batched identity view, computed before the group-row
         # loop below so it can decide EACH row's actual tmux target, not just its
-        # saved name. pane_snapshot's pane_pid column feeds tmux_native_key_census's
-        # /proc walk -- no second tmux subprocess beyond the existing list-panes -a.
+        # saved name -- no second tmux subprocess beyond the existing list-panes -a.
         # Recomputed fresh every refresh (never cached across calls), so a rollout
         # that moves to a different live tmux session is re-resolved on the very
         # next tick and no stale owner can survive into it (replacement control).
-        pane_snapshot = tmux_pane_activity_snapshot()
-        pane_pid_by_name = {name: pid for name, (_pane_id, pid, _activity) in pane_snapshot.items()}
-        native_key_by_tmux_name = tmux_native_key_census(pane_pid_by_name)
-        tmux_name_by_native_key = tmux_name_by_native_key_failing_closed(native_key_by_tmux_name)
+        tmux_name_by_native_key = compute_codex_tmux_owner_census()
+        # task-2171: the SAME census also arbitrates duplicate Codex session_key rows across
+        # every group in one in-memory pass, so metadata order never decides the winner.
+        codex_losers = codex_duplicate_row_losers(
+            [row for group in self.metadata.get("groups", {}).values() for row in group.get("rows", [])],
+            tmux_name_by_native_key,
+        )
 
         running: list[tuple[str, str, dict, Session | None, str]] = []
         claimed: set[str] = set()
@@ -8104,7 +8190,11 @@ class SessionHub(QMainWindow):
                 continue
             display_name = group.get("display_name") or Path(cwd).name or cwd
             for row in group.get("rows", []):
-                match = find_group_member_session(row, cwd, live, frozenset(claimed))
+                match = (
+                    None
+                    if id(row) in codex_losers
+                    else find_group_member_session(row, cwd, live, frozenset(claimed))
+                )
                 if match:
                     claimed.add(match.native_key)
                 # The row's ACTUAL live tmux session, not necessarily its saved
@@ -9924,9 +10014,20 @@ class SessionHub(QMainWindow):
         # which used to fall through to "no history" and start a duplicate
         # fresh conversation instead of resuming the real one.
         candidates = group_row_candidates(self.metadata, self.settings())
-        history = find_group_member_session(
-            row, cwd, candidates,
-            linked_session_keys=all_linked_member_keys(self.metadata),
+        # task-2171: a Codex row that shares its saved session_key with a sibling never gets
+        # treated as having history unless the fresh tmux census says THIS row's saved name is
+        # the key's real live owner - otherwise a Launch click on the losing sibling would
+        # silently attach to (and control) the other row's live conversation.
+        codex_losers = codex_duplicate_row_losers(
+            group.get("rows", []), compute_codex_tmux_owner_census()
+        )
+        history = (
+            None
+            if id(row) in codex_losers
+            else find_group_member_session(
+                row, cwd, candidates,
+                linked_session_keys=all_linked_member_keys(self.metadata),
+            )
         )
         if history is not None:
             return self.resume_group_row(cwd, name)
@@ -10009,9 +10110,19 @@ class SessionHub(QMainWindow):
         # a link's current target, which is the "resume opens an older
         # linked rollout" bug this row exists to fix.
         candidates = group_row_candidates(self.metadata, self.settings())
-        live = find_group_member_session(
-            row, cwd, candidates,
-            linked_session_keys=all_linked_member_keys(self.metadata),
+        # task-2171: same census-arbitrated duplicate guard as launch_group_row - a Codex row
+        # that loses a duplicate session_key tie is never resumed onto its sibling's live
+        # conversation, regardless of what a plain exact-key match below would otherwise find.
+        codex_losers = codex_duplicate_row_losers(
+            group.get("rows", []), compute_codex_tmux_owner_census()
+        )
+        live = (
+            None
+            if id(row) in codex_losers
+            else find_group_member_session(
+                row, cwd, candidates,
+                linked_session_keys=all_linked_member_keys(self.metadata),
+            )
         )
         if not live:
             return {"status": "error", "message": f"{name!r} has no history to resume"}
@@ -10399,11 +10510,12 @@ def sessions_json_cli() -> int:
     # task-2156: same shared batched identity view refresh_running_tab uses, so the
     # TUI/JSON path stops reading a live-but-externally-renamed row as Stopped/
     # unknown too (the brief names this path explicitly).
-    pane_pid_by_name = {
-        name: pid for name, (_pane_id, pid, _activity) in tmux_pane_activity_snapshot().items()
-    }
-    tmux_name_by_native_key = tmux_name_by_native_key_failing_closed(
-        tmux_native_key_census(pane_pid_by_name)
+    tmux_name_by_native_key = compute_codex_tmux_owner_census()
+    # task-2171: the SAME census arbitrates duplicate Codex session_key rows across every
+    # group in one in-memory pass, matching refresh_running_tab exactly.
+    codex_losers = codex_duplicate_row_losers(
+        [row for group in metadata.get("groups", {}).values() for row in group.get("rows", [])],
+        tmux_name_by_native_key,
     )
 
     claimed: set[str] = set()
@@ -10413,7 +10525,11 @@ def sessions_json_cli() -> int:
         tmux_enabled = explicit if explicit is not None else settings.get("launch_in_tmux", False)
         rows_out = []
         for row in group.get("rows", []):
-            match = find_group_member_session(row, cwd, live, frozenset(claimed))
+            match = (
+                None
+                if id(row) in codex_losers
+                else find_group_member_session(row, cwd, live, frozenset(claimed))
+            )
             if match:
                 claimed.add(match.native_key)
             resolved_name = (
