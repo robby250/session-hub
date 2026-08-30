@@ -4498,8 +4498,18 @@ def _codex_activity(session: "Session", status: dict | None) -> tuple[str, str]:
     turn with no evidence of a newer one becomes "done", never blank.
     """
     turn = _codex_tail_turn_state(session.path)
-    if turn and turn[0] == "task_started" and turn[1] >= (status or {}).get("ts", 0):
-        return "working", ""
+    if turn and turn[0] == "task_started":
+        # Codex can emit the PREVIOUS turn's delayed agent-turn-complete notification just after
+        # the NEXT turn's task_started record. That newer wall-clock Done still belongs to the
+        # older turn and must not mask durable evidence that a turn is open. Idle is the one safe
+        # exception: Session Hub writes it deliberately on resume/acknowledgement so an old,
+        # unfinished rollout marker cannot resurrect historical work.
+        if not (
+            status
+            and status.get("state") == "idle"
+            and status.get("ts", 0) > turn[1]
+        ):
+            return "working", ""
     if status:
         if (
             turn is not None
@@ -7823,10 +7833,13 @@ class SessionHub(QMainWindow):
             except (AttributeError, TypeError, ValueError):
                 self.settings().pop("running_splitter_state_v1", None)
         self._running_splitter_visible_state = QByteArray(self.running_splitter.saveState())
-        self._running_terminal_enabled = True
+        self._running_terminal_enabled = tabs.currentWidget() is running_page
         self.running_splitter.splitterMoved.connect(self._on_running_splitter_moved)
         layout.addWidget(self.running_splitter, 1)
-        self._set_running_terminal_visible(tabs.currentWidget() is running_page)
+        # Startup is not a user transition: hide the terminal for the default All Sessions tab
+        # without re-saving the splitter before layout/geometry restoration has applied its exact
+        # persisted width. The first real tab switch goes through _set_running_terminal_visible.
+        running_terminal_page.setVisible(self._running_terminal_enabled)
         self.setCentralWidget(root)
 
         refresh_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F5), self)
@@ -8881,11 +8894,34 @@ class SessionHub(QMainWindow):
                 self._focused_entry.controller.release_focus(int(self.winId()))
                 self._focused_entry = None
             return super().eventFilter(obj, event)
+        if (
+            event.spontaneous()
+            and event.type() == QEvent.Type.Enter
+            and self._focused_entry is not None
+            and not self._is_running_terminal_widget(obj)
+        ):
+            # A Qt sibling can become the X11 PointerRoot target merely because the pointer
+            # crossed into it. Reassert the terminal's existing click-owned focus after that
+            # enter event finishes. A genuine outside click clears _focused_entry in the branch
+            # above before this deferred callback can run, so clicks still release focus.
+            entry = self._focused_entry
+            QTimer.singleShot(0, lambda entry=entry: self._reassert_terminal_focus(entry))
         if event.spontaneous() and event.type() in (
             QEvent.Type.KeyPress,
         ):
             self._qt_interaction_serial += 1
         return super().eventFilter(obj, event)
+
+    def _reassert_terminal_focus(self, entry: "_TerminalCacheEntry") -> None:
+        if (
+            self._focused_entry is not entry
+            or not self._running_tab_visible()
+            or not self.isActiveWindow()
+            or entry.state != "ready"
+            or not entry.controller.poll_alive()
+        ):
+            return
+        entry.controller.focus()
 
     def _is_running_terminal_widget(self, obj) -> bool:
         """Whether OBJ belongs to the Qt surface surrounding the embedded terminal."""
