@@ -1,14 +1,7 @@
-"""Direct model/column tests for the TUI panes.
+"""Pure model/adapter controls for the Session Hub TUI panes.
 
-RunningPane must keep Status/Last message (status_pipeline_plan.md's
-contract #5 - a provider-neutral activity verdict on every live-session
-surface). MainPane (All Sessions) does not: task-2114 added Status/Last
-message there too without being asked, corrupting the pane's original
-four-column layout, and task-2136 reverts that scope expansion. These mount
-the real panes in a minimal Textual test App and assert the rendered
-columns/cells rather than just the data dicts, so a column silently added or
-dropped from add_columns/add_row would fail here even if the underlying
-JSON were right.
+Running is a compact scrolling list above one retained terminal adapter; runtime pilot/PTY tests
+remain frozen by row503 and are not run here.
 """
 from __future__ import annotations
 
@@ -20,6 +13,26 @@ from textual.app import App, ComposeResult
 from textual.widgets import TabbedContent
 
 import session_hub_tui
+
+
+class TerminalAdapterControlsTests(unittest.TestCase):
+    def test_tmux_target_is_exact_and_shell_free(self):
+        with patch.object(session_hub_tui.shutil, "which", return_value="/usr/bin/tmux"):
+            self.assertEqual(
+                session_hub_tui.tmux_attach_argv("worker 5"),
+                ["/usr/bin/tmux", "attach", "-t", "=worker 5"],
+            )
+
+    def test_adapter_lifecycle_stops_only_terminal_client(self):
+        widget = Mock()
+        factory = Mock(return_value=widget)
+        with patch.object(session_hub_tui.shutil, "which", return_value="/usr/bin/tmux"):
+            adapter = session_hub_tui.OssTmuxTerminalAdapter("worker", factory)
+        adapter.start()
+        adapter.close()
+        factory.assert_called_once()
+        widget.start.assert_called_once_with()
+        widget.stop.assert_called_once_with()
 
 
 class _PaneHost(App):
@@ -75,7 +88,7 @@ class MainPaneColumnsTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RunningPaneColumnsTests(unittest.IsolatedAsyncioTestCase):
-    async def test_running_pane_has_status_and_last_message_columns(self):
+    async def test_running_pane_has_compact_rows_and_exact_identity(self):
         fake_data = {
             "sessions": [
                 {
@@ -84,6 +97,7 @@ class RunningPaneColumnsTests(unittest.IsolatedAsyncioTestCase):
                     "title": "demo",
                     "key": "Claude:id-2",
                     "tmux_name": "demo-tmux",
+                    "age": "8m ago",
                     "status": "Running",
                     "activity_label": "Needs input",
                     "activity_detail": "approve   the plan?",
@@ -97,13 +111,13 @@ class RunningPaneColumnsTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             pane.apply_sessions(fake_data)
             await pilot.pause()
-            table = pane.query_one("#running")
-            labels = _column_labels(table)
-            self.assertIn("Status", labels)
-            self.assertIn("Last message", labels)
-            row = table.get_row_at(0)
-            self.assertIn("Needs input", row)
-            self.assertIn("approve the plan?", row)
+            self.assertEqual(len(pane.rows), 1)
+            self.assertEqual(pane.rows[0]["key"], "Claude:id-2")
+            self.assertEqual(pane.rows[0]["tmux_name"], "demo-tmux")
+            text = pane._row_text({**pane.rows[0], "detail": "approve the plan?"})
+            self.assertIn("demo-tmux", text)
+            self.assertIn("8m ago", text)
+            self.assertIn("approve the plan?", text)
 
 
 _FAKE_SESSIONS = {
@@ -133,7 +147,7 @@ class SharedGenerationStartupTests(unittest.IsolatedAsyncioTestCase):
             app = session_hub_tui.SessionHubTUI()
             async with app.run_test() as pilot:
                 await pilot.pause()
-                # Shell (columns, an interactive empty table) is already up
+                # Shell (columns, an interactive empty list) is already up
                 # even though the fetch worker is still blocked.
                 main_table = app.query_one(session_hub_tui.MainPane).query_one("#main")
                 self.assertEqual(
@@ -161,9 +175,8 @@ class SharedGenerationStartupTests(unittest.IsolatedAsyncioTestCase):
                     if main_table.row_count:
                         break
                 self.assertEqual(mock_fetch.call_count, 1)
-                running_table = app.query_one(session_hub_tui.RunningPane).query_one("#running")
                 self.assertEqual(main_table.row_count, 1)
-                self.assertEqual(running_table.row_count, 1)
+                self.assertEqual(len(app.query_one(session_hub_tui.RunningPane).rows), 1)
 
     async def test_manual_refresh_error_leaves_prior_generation_intact(self):
         with patch.object(

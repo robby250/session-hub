@@ -11346,6 +11346,8 @@ def sessions_json_cli() -> int:
             rows_out.append(
                 {
                     "name": row["name"],
+                    "key": match.native_key if match else row.get("session_key"),
+                    "tmux_name": resolved_name,
                     "provider": row.get("provider", "Claude"),
                     # Liveness (process/tmux) - separate fact from activity below.
                     "status": (
@@ -11355,6 +11357,7 @@ def sessions_json_cli() -> int:
                     "activity": activity_state,
                     "activity_label": activity_label(activity_state)[0],
                     "activity_detail": activity_detail,
+                    "age": relative_activity_age(match.updated_ms) if match else "",
                 }
             )
         groups[cwd] = {
@@ -11394,6 +11397,7 @@ def sessions_json_cli() -> int:
             "activity": activity_state,
             "activity_label": activity_label(activity_state)[0],
             "activity_detail": activity_detail,
+            "age": relative_activity_age(item.updated_ms),
         }
 
     print(

@@ -12,12 +12,16 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Protocol
 
 from textual import work
 from textual.app import App, ComposeResult
+from textual.events import Resize
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
@@ -27,13 +31,22 @@ from textual.widgets import (
     Header,
     Input,
     Label,
+    ListItem,
+    ListView,
     ProgressBar,
+    Static,
     TabbedContent,
     TabPane,
 )
 
+try:
+    from textual_terminal import Terminal as _OssTerminal
+except ImportError:  # startup reports the pinned install command; tests can inject a fake adapter
+    _OssTerminal = None
+
 SESSION_HUB = Path(__file__).resolve().parent / "session_hub.py"
 PHONE_ROW_HEIGHT = 2
+TEXTUAL_TERMINAL_INSTALL = "pip3 install --user --break-system-packages textual-terminal==0.3.0"
 
 
 def run_cli(args: list[str], *, offscreen: bool = False) -> dict:
@@ -78,6 +91,60 @@ def resume_session(wanted: str) -> dict:
     # Same offscreen-QApplication path as launch_group_row - --resume-session
     # is the standalone counterpart to --launch-group-row.
     return run_cli(["--resume-session", wanted], offscreen=True)
+
+
+class TerminalAdapter(Protocol):
+    """Small lifecycle boundary between RunningPane and the terminal emulator."""
+
+    identity: str
+    widget: object
+
+    def start(self) -> None: ...
+    def resize(self, width: int, height: int) -> None: ...
+    def close(self) -> None: ...
+
+
+def tmux_attach_argv(name: str) -> list[str]:
+    """Build the exact argv passed to textual-terminal's shlex parser.
+
+    textual-terminal 0.3.0 accepts a command string but immediately shlex-splits it and
+    calls execvpe; shlex.join therefore preserves argv boundaries without a shell. The child
+    environment is rebuilt by the OSS adapter (so inherited TMUX is absent), and the exact
+    `=name` target avoids tmux prefix matching.
+    """
+    tmux = shutil.which("tmux")
+    if not tmux:
+        raise RuntimeError("tmux is required for the Running terminal")
+    if not name or name.startswith("="):
+        raise ValueError("empty or malformed tmux session name")
+    return [tmux, "attach", "-t", f"={name}"]
+
+
+class OssTmuxTerminalAdapter:
+    """One retained textual-terminal widget attached to exactly one live tmux session."""
+
+    def __init__(self, name: str, terminal_factory=None) -> None:
+        factory = terminal_factory or _OssTerminal
+        if factory is None:
+            raise RuntimeError(f"Install the terminal adapter first: {TEXTUAL_TERMINAL_INSTALL}")
+        self.identity = name
+        self.argv = tmux_attach_argv(name)
+        # textual-terminal parses this with shlex.split then execvpe (no shell), preserving the
+        # exact argv and rebuilding an environment without the parent's TMUX marker.
+        self.widget = factory(command=shlex.join(self.argv), id="running-terminal")
+
+    def start(self) -> None:
+        self.widget.start()
+
+    def resize(self, width: int, height: int) -> None:
+        # textual-terminal forwards resize events to its PTY; keep this call behind
+        # the adapter so the pane never reaches into the emulator implementation.
+        resize = getattr(self.widget, "resize", None)
+        if resize is not None:
+            resize(width, height)
+
+    def close(self) -> None:
+        self.widget.stop()
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -191,7 +258,6 @@ class GroupScreen(Screen):
 class MainPane(Vertical):
     """All Sessions - mirrors the GUI's main table, full parity, searchable."""
 
-    # DataTable claims Enter itself (RowSelected) - see on_data_table_row_selected.
     BINDINGS = [
         ("/", "focus_search", "Search"),
         ("r", "refresh", "Refresh"),
@@ -289,37 +355,63 @@ class MainPane(Vertical):
 
 
 class RunningPane(Vertical):
-    """Flat list of every currently-running tmux session, across every
-    project - both group rows and independent (non-group) sessions launched
-    with "Launch in tmux" on.
-    """
+    """Compact scrolling activity list above one retained exact-identity terminal."""
 
     # DataTable claims Enter itself (RowSelected) - see on_data_table_row_selected.
     BINDINGS = [
         ("x", "stop", "Stop"),
         ("r", "refresh", "Refresh"),
+        ("ctrl+l", "focus_list", "Focus list"),
     ]
 
-    def __init__(self) -> None:
+    CSS = """
+    # Keep the activity list in the upper third of a phone viewport; overflow scrolls here.
+    # The terminal owns the remaining height and never gets pushed below the screen.
+    #running-list { height: 12; min-height: 5; border: round $panel; }
+    #terminal-host { height: 1fr; min-height: 4; border: round $panel; }
+    #terminal-empty { height: 1fr; content-align: center middle; color: $text-muted; }
+    .running-row { height: 2; padding: 0 1; }
+    .running-group { height: 1; padding: 0 1; color: $text-muted; text-style: bold; }
+    """
+
+    def __init__(self, adapter_factory=OssTmuxTerminalAdapter) -> None:
         super().__init__()
         self.rows: list[dict] = []
+        self._visible_rows: list[dict | None] = []
+        self.selected_key: str | None = None
+        self.adapter_factory = adapter_factory
+        self.adapter: TerminalAdapter | None = None
 
     def compose(self) -> ComposeResult:
-        yield DataTable(id="running")
+        yield ListView(id="running-list")
+        with Vertical(id="terminal-host"):
+            yield Static("Select a running session", id="terminal-empty")
 
     def on_mount(self) -> None:
-        # See MainPane.on_mount - shell first, shared generation applied by
-        # apply_sessions() once SessionHubTUI.fetch_sessions() completes.
-        table = self.query_one("#running", DataTable)
-        table.add_columns("Project", "Name", "Provider", "Status", "Last message")
-        table.cursor_type = "row"
+        self.query_one("#running-list", ListView).focus()
+
+    @staticmethod
+    def _identity(row: dict) -> str:
+        return str(row.get("key") or f"group:{row.get('cwd', '')}:{row.get('name', '')}")
+
+    @staticmethod
+    def _row_text(row: dict) -> str:
+        detail = " ".join(str(row.get("detail", "")).split())
+        if len(detail) > 60:
+            detail = detail[:59] + "…"
+        age = str(row.get("age", ""))
+        first = row["name"] + (f"  {age}" if age else "")
+        second = f"{row['provider']} · {row['display']}"
+        return f"{first}\n{second}" + (f"\n{detail}" if detail else "")
 
     def apply_sessions(self, data: dict) -> None:
         self.rows = [
             {
                 "kind": "group", "cwd": cwd, "name": row["name"], "provider": row["provider"],
+                "key": row.get("key") or row.get("session_key"),
+                "tmux_name": row.get("tmux_name") or row["name"],
                 "display": group["display_name"], "status_label": row.get("activity_label", ""),
-                "detail": row.get("activity_detail", ""),
+                "detail": row.get("activity_detail", ""), "age": row.get("age", ""),
             }
             for cwd, group in data.get("groups", {}).items()
             for row in group["rows"]
@@ -327,35 +419,92 @@ class RunningPane(Vertical):
         ] + [
             {
                 "kind": "standalone", "key": s["key"], "name": s["tmux_name"], "provider": s["provider"],
-                "display": s["title"], "status_label": s.get("activity_label", ""),
-                "detail": s.get("activity_detail", ""),
+                "tmux_name": s["tmux_name"], "display": s["title"], "status_label": s.get("activity_label", ""),
+                "detail": s.get("activity_detail", ""), "age": s.get("age", ""),
             }
             for s in data.get("sessions", [])
             if not s["is_group"] and s["status"] == "Running"
         ]
-        table = self.query_one("#running", DataTable)
-        table.clear(columns=True)
-        table.add_columns("Project", "Name", "Provider", "Status", "Last message")
-        table.cursor_type = "row"
+        list_view = self.query_one("#running-list", ListView)
+        list_view.clear()
+        self._visible_rows = []
+        groups: dict[str, list[dict]] = {}
         for row in self.rows:
-            detail = " ".join(str(row["detail"]).split())
-            table.add_row(
-                row["display"], row["name"], row["provider"], row["status_label"],
-                detail if len(detail) <= 60 else detail[:59] + "…",
-                height=PHONE_ROW_HEIGHT,
-            )
+            groups.setdefault(row.get("status_label") or "Unknown", []).append(row)
+        order = ("Working", "Needs input", "Done", "Idle", "Unknown")
+        for heading in order:
+            heading_rows = groups.pop(heading, [])
+            if not heading_rows:
+                continue
+            list_view.append(ListItem(Label(heading, classes="running-group")))
+            self._visible_rows.append(None)
+            for row in heading_rows:
+                item = ListItem(Label(self._row_text(row), classes="running-row"))
+                item.name = self._identity(row)
+                list_view.append(item)
+                self._visible_rows.append(row)
+        for heading, rows in groups.items():
+            list_view.append(ListItem(Label(heading, classes="running-group")))
+            self._visible_rows.append(None)
+            for row in rows:
+                item = ListItem(Label(self._row_text(row), classes="running-row"))
+                item.name = self._identity(row)
+                list_view.append(item)
+                self._visible_rows.append(row)
+        # Activity labels remain in each compact row; preserve a stable order
+        # while avoiding a second widget hierarchy that could steal height.
+        # (The status is deliberately data, not inferred from transcript text.)
+        keys = {self._identity(row) for row in self.rows}
+        if self.selected_key not in keys:
+            self.selected_key = None
+            self._close_adapter()
+        elif self.selected_key:
+            list_view.index = next(i for i, row in enumerate(self._visible_rows) if row and self._identity(row) == self.selected_key)
+
+    def _close_adapter(self) -> None:
+        if self.adapter is not None:
+            self.adapter.close()
+            self.adapter = None
+        host = self.query_one("#terminal-host", Vertical)
+        host.remove_children()
+        host.mount(Static("Select a running session", id="terminal-empty"))
 
     def selected(self) -> dict | None:
-        table = self.query_one("#running", DataTable)
-        if table.cursor_row is None or not self.rows:
+        list_view = self.query_one("#running-list", ListView)
+        if list_view.index is None or not self._visible_rows:
             return None
-        return self.rows[table.cursor_row]
+        return self._visible_rows[list_view.index]
 
-    def on_data_table_row_selected(self, _event: DataTable.RowSelected) -> None:
+    async def on_list_view_selected(self, _event: ListView.Selected) -> None:
         picked = self.selected()
         if not picked:
             return
-        self.app.exit((picked.get("cwd"), picked["name"]))
+        await self._switch_terminal(picked)
+
+    async def _switch_terminal(self, picked: dict) -> None:
+        identity = self._identity(picked)
+        target = picked.get("tmux_name") or picked["name"]
+        if self.selected_key == identity and self.adapter is not None:
+            return
+        self._close_adapter()
+        self.selected_key = identity
+        try:
+            adapter = self.adapter_factory(target)
+        except (RuntimeError, ValueError) as exc:
+            self.notify(str(exc), severity="error")
+            return
+        host = self.query_one("#terminal-host", Vertical)
+        await host.mount(adapter.widget)
+        self.adapter = adapter
+        adapter.start()
+        adapter.widget.focus()
+
+    def action_focus_list(self) -> None:
+        self.query_one("#running-list", ListView).focus()
+
+    def on_resize(self, event: Resize) -> None:
+        if self.adapter is not None:
+            self.adapter.resize(event.size.width, event.size.height)
 
     @work
     async def action_stop(self) -> None:
@@ -369,6 +518,9 @@ class RunningPane(Vertical):
             await asyncio.to_thread(stop_group_row, picked["cwd"], picked["name"])
         else:
             await asyncio.to_thread(stop_session, picked["key"])
+        if self.selected_key == self._identity(picked):
+            self._close_adapter()
+            self.selected_key = None
         self.app.fetch_sessions()
 
     def action_refresh(self) -> None:
@@ -489,6 +641,13 @@ class SessionHubTUI(App):
 
 
 def main() -> int:
+    if _OssTerminal is None:
+        print(
+            f"Session Hub Running terminal requires the maintained OSS adapter; install with: "
+            f"{TEXTUAL_TERMINAL_INSTALL}",
+            file=sys.stderr,
+        )
+        return 2
     app = SessionHubTUI()
     result = app.run()
     if isinstance(result, tuple) and len(result) == 2:
