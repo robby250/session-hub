@@ -4213,6 +4213,48 @@ class SessionHubTests(unittest.TestCase):
             session_hub.find_group_member_session(row, "/tmp/vamp", sessions + [ambiguous])
         )
 
+    def test_find_group_member_session_claude_name_match_respects_exclude_keys(self):
+        """task-2164 fix: an unnamed/no-session-key row (or one whose agent_name is None,
+        blank, or otherwise coincides) must never resolve to a sibling row's session just
+        because that session was already claimed this pass -- an absent row (e.g. a
+        never-launched "VAMP-worker4") must not borrow an already-claimed live session's
+        (e.g. "VAMPULSE-orchestrator") identity, Running row, or actions."""
+        claimed_session = session_hub.Session(
+            "Claude", "id-orchestrator", "t", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/orch.jsonl"), agent_name=None,
+        )
+        # No session_key -> falls to the step-2 name+cwd match; agent_name/row name both
+        # None, the exact "both blank" collision shape.
+        absent_row = {"provider": "Claude", "name": None}
+        match_unclaimed = session_hub.find_group_member_session(
+            absent_row, "/tmp/vamp", [claimed_session]
+        )
+        self.assertEqual(match_unclaimed.native_key, "Claude:id-orchestrator")
+        match_claimed = session_hub.find_group_member_session(
+            absent_row, "/tmp/vamp", [claimed_session],
+            frozenset({"Claude:id-orchestrator"}),
+        )
+        self.assertIsNone(match_claimed)
+
+    def test_find_group_member_session_exact_session_key_match_respects_exclude_keys(self):
+        """task-2164 REWORK: an exact-session_key match (step 1, not the step-2 name+cwd
+        fallback the test above covers) must ALSO fail closed on exclude_keys -- two rows
+        recording the identical stale session_key (a duplicated/merged row) must not both
+        resolve to, and both render/control, the one live session."""
+        shared_target = session_hub.Session(
+            "Claude", "id-shared", "t", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/shared.jsonl"),
+        )
+        row_a = {"provider": "Claude", "session_key": "Claude:id-shared"}
+        row_b = {"provider": "Claude", "session_key": "Claude:id-shared"}
+        match_a = session_hub.find_group_member_session(row_a, "/tmp/vamp", [shared_target])
+        self.assertEqual(match_a.native_key, "Claude:id-shared")
+        # row_b resolves in the same pass, after row_a already claimed the key.
+        match_b = session_hub.find_group_member_session(
+            row_b, "/tmp/vamp", [shared_target], frozenset({"Claude:id-shared"}),
+        )
+        self.assertIsNone(match_b)
+
     def test_codex_tmux_native_key_reads_the_open_rollout_fd(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -8326,6 +8368,193 @@ class SessionActivityTests(unittest.TestCase):
             state, _ = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
         self.assertEqual(state, "unknown")
 
+    # --- task-2164: semantic transcript last-assistant-text -------------
+    def _transcript(self, lines: list[str]) -> Path:
+        path = self.temp / f"transcript_{len(list(self.temp.glob('transcript_*.jsonl')))}.jsonl"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def test_claude_assistant_text_joins_multiple_nonblank_text_blocks(self):
+        line = json.dumps({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "text", "text": "first block"},
+                {"type": "text", "text": "  "},  # blank -- excluded
+                {"type": "text", "text": "second block"},
+            ]},
+        }).encode()
+        self.assertEqual(
+            session_hub._claude_assistant_text_from_line(line), "first block\n\nsecond block"
+        )
+
+    def test_claude_assistant_text_ignores_thinking_and_tool_use_blocks(self):
+        line = json.dumps({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "thinking", "thinking": "pondering"},
+                {"type": "tool_use", "name": "Bash", "input": {}},
+            ]},
+        }).encode()
+        self.assertIsNone(session_hub._claude_assistant_text_from_line(line))
+
+    def test_claude_assistant_text_ignores_user_tool_result_and_meta_rows(self):
+        tool_result = json.dumps({
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "content": "ok"}]},
+        }).encode()
+        summary = json.dumps({"type": "summary", "summary": "compacted"}).encode()
+        self.assertIsNone(session_hub._claude_assistant_text_from_line(tool_result))
+        self.assertIsNone(session_hub._claude_assistant_text_from_line(summary))
+
+    def test_claude_assistant_text_survives_malformed_and_non_object_json(self):
+        self.assertIsNone(session_hub._claude_assistant_text_from_line(b"{not json"))
+        self.assertIsNone(session_hub._claude_assistant_text_from_line(b"[1, 2, 3]"))
+        self.assertIsNone(session_hub._claude_assistant_text_from_line(b'"just a string"'))
+        self.assertIsNone(session_hub._claude_assistant_text_from_line(b""))
+
+    def test_codex_assistant_text_matches_commentary_and_final_messages_both(self):
+        for kind in ("commentary", "final"):
+            line = json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "message", "role": "assistant", "kind": kind,
+                    "content": [{"type": "output_text", "text": f"{kind} text"}],
+                },
+            }).encode()
+            self.assertEqual(session_hub._codex_assistant_text_from_line(line), f"{kind} text")
+
+    def test_codex_assistant_text_ignores_reasoning_and_function_calls(self):
+        reasoning = json.dumps({
+            "type": "response_item",
+            "payload": {"type": "reasoning", "summary": [{"text": "thinking"}]},
+        }).encode()
+        call = json.dumps({
+            "type": "response_item",
+            "payload": {"type": "function_call", "name": "shell", "arguments": "{}"},
+        }).encode()
+        output = json.dumps({
+            "type": "response_item",
+            "payload": {"type": "function_call_output", "output": "done"},
+        }).encode()
+        self.assertIsNone(session_hub._codex_assistant_text_from_line(reasoning))
+        self.assertIsNone(session_hub._codex_assistant_text_from_line(call))
+        self.assertIsNone(session_hub._codex_assistant_text_from_line(output))
+
+    def test_codex_assistant_text_ignores_event_msg_token_count_and_user_role(self):
+        event = json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}).encode()
+        tokens = json.dumps({
+            "type": "response_item", "payload": {"type": "token_count", "total": 42},
+        }).encode()
+        user_msg = json.dumps({
+            "type": "response_item",
+            "payload": {
+                "type": "message", "role": "user",
+                "content": [{"type": "output_text", "text": "not the assistant"}],
+            },
+        }).encode()
+        self.assertIsNone(session_hub._codex_assistant_text_from_line(event))
+        self.assertIsNone(session_hub._codex_assistant_text_from_line(tokens))
+        self.assertIsNone(session_hub._codex_assistant_text_from_line(user_msg))
+
+    def test_codex_assistant_text_survives_malformed_and_non_object_json(self):
+        self.assertIsNone(session_hub._codex_assistant_text_from_line(b"{not json"))
+        self.assertIsNone(session_hub._codex_assistant_text_from_line(b"[1, 2, 3]"))
+        self.assertIsNone(session_hub._codex_assistant_text_from_line(b""))
+
+    def test_transcript_last_assistant_text_finds_the_newest_qualifying_line(self):
+        session_hub._transcript_last_text_cache.clear()
+        path = self._transcript([
+            json.dumps({
+                "type": "assistant", "message": {"content": [{"type": "text", "text": "old"}]},
+            }),
+            json.dumps({"type": "user", "message": {"content": [{"type": "tool_result"}]}}),
+            json.dumps({
+                "type": "assistant", "message": {"content": [{"type": "text", "text": "newest"}]},
+            }),
+        ])
+        self.assertEqual(session_hub._transcript_last_assistant_text(path, "Claude"), "newest")
+
+    def test_transcript_last_assistant_text_torn_final_line_keeps_the_last_complete_one(self):
+        session_hub._transcript_last_text_cache.clear()
+        path = self._transcript([
+            json.dumps({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "last complete"}]},
+            }),
+        ])
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write('{"type": "assistant", "message": {"content": [{"type": "te')  # torn
+        self.assertEqual(
+            session_hub._transcript_last_assistant_text(path, "Claude"), "last complete"
+        )
+
+    def test_transcript_last_assistant_text_unchanged_file_does_zero_transcript_io(self):
+        session_hub._transcript_last_text_cache.clear()
+        path = self._transcript([
+            json.dumps({
+                "type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]},
+            }),
+        ])
+        first = session_hub._transcript_last_assistant_text(path, "Claude")
+        with patch.object(session_hub, "_transcript_scan_range_for_last_text") as scan:
+            second = session_hub._transcript_last_assistant_text(path, "Claude")
+        scan.assert_not_called()
+        self.assertEqual(first, second)
+        self.assertEqual(first, "hi")
+
+    def test_transcript_last_assistant_text_grown_file_scans_only_the_new_bytes(self):
+        session_hub._transcript_last_text_cache.clear()
+        path = self._transcript([
+            json.dumps({
+                "type": "assistant", "message": {"content": [{"type": "text", "text": "first"}]},
+            }),
+        ])
+        session_hub._transcript_last_assistant_text(path, "Claude")
+        size_before = path.stat().st_size
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "type": "assistant", "message": {"content": [{"type": "text", "text": "second"}]},
+            }) + "\n")
+        with patch.object(
+            session_hub, "_transcript_scan_range_for_last_text",
+            wraps=session_hub._transcript_scan_range_for_last_text,
+        ) as scan:
+            text = session_hub._transcript_last_assistant_text(path, "Claude")
+        self.assertEqual(text, "second")
+        floor = scan.call_args.args[1]
+        self.assertGreater(floor, 0)  # resumed from the previous scan, not byte 0
+        self.assertLessEqual(floor, size_before)
+
+    def test_transcript_last_assistant_text_replaced_file_cold_scans(self):
+        session_hub._transcript_last_text_cache.clear()
+        path = self._transcript([
+            json.dumps({
+                "type": "assistant", "message": {"content": [{"type": "text", "text": "aaaaa"}]},
+            }),
+        ])
+        self.assertEqual(session_hub._transcript_last_assistant_text(path, "Claude"), "aaaaa")
+        path.unlink()  # a genuinely different inode, even if the new content is the same size
+        path.write_text(
+            json.dumps({
+                "type": "assistant", "message": {"content": [{"type": "text", "text": "bbbbb"}]},
+            }) + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(session_hub._transcript_last_assistant_text(path, "Claude"), "bbbbb")
+
+    def test_transcript_last_assistant_text_unknown_provider_and_missing_file_are_empty(self):
+        session_hub._transcript_last_text_cache.clear()
+        path = self._transcript([
+            json.dumps({
+                "type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]},
+            }),
+        ])
+        self.assertEqual(session_hub._transcript_last_assistant_text(path, "Antigravity"), "")
+        self.assertEqual(
+            session_hub._transcript_last_assistant_text(Path("/tmp/does-not-exist.jsonl"), "Claude"),
+            "",
+        )
+
     # --- group session ids never surface a real activity state ----------
     def test_group_pseudo_session_activity_is_always_unknown(self):
         # No hook ever writes a status file keyed by a "group:..." pseudo id
@@ -8592,12 +8821,13 @@ class SessionActivityTests(unittest.TestCase):
         tmux_session_alive independently - 2 subprocess spawns per row, times
         N rows. refresh_running_tab must take one tmux_live_session_names()
         snapshot per refresh and every row reuses it (see the `live_names`
-        param threaded through group_row_status/session_activity).
+        param threaded through group_row_status/session_activity), plus one
+        bounded census (tmux_pane_activity_snapshot, one list-panes -a call)
+        for identity -- two tmux calls total for 5 rows, never 2*N.
 
-        task-2142 adds a second bounded census (tmux_pane_activity_snapshot,
-        one list-panes -a call) and, on a cold cache where every row's pane
-        looks changed, ONE batched capture_changed_panes call covering all N
-        panes -- three tmux calls total for 5 rows, never 3*N."""
+        task-2164: Last message is now read from each row's own transcript
+        file, never tmux -- no third (capture-pane) call exists at all
+        regardless of row count."""
         rows = [
             {"name": f"VAMP-{i}", "provider": "Claude", "session_key": f"Claude:id-{i}"}
             for i in range(5)
@@ -8653,18 +8883,24 @@ class SessionActivityTests(unittest.TestCase):
             window.close()
 
         tmux_calls = [c for c in calls if c and c[0] == "/usr/bin/tmux"]
-        self.assertEqual(len(tmux_calls), 3)
+        self.assertEqual(len(tmux_calls), 2)
         self.assertEqual(tmux_calls[0][1], "list-sessions")
         self.assertEqual(tmux_calls[1][1], "list-panes")
-        # The third call is capture_changed_panes' single batched invocation, not
-        # 5 separate ones -- one "capture-pane" per pane inside it, chained by
-        # literal ';' argv tokens, still exactly one subprocess.run().
-        self.assertEqual(tmux_calls[2][1], "capture-pane")
-        self.assertEqual(tmux_calls[2].count("capture-pane"), 5)
+        self.assertFalse(any("capture-pane" in c for c in tmux_calls))
 
-    def test_refresh_running_tab_second_call_captures_nothing_when_unchanged(self):
-        """A second refresh with identical window_activity values must add no
-        capture-pane call at all -- the cached block is reused untouched."""
+    def test_refresh_running_tab_reads_last_message_from_the_transcript_not_tmux(self):
+        """task-2164: Last message comes from the row's OWN transcript file (semantic newest
+        assistant text), never a tmux capture-pane call -- across two refreshes, one with the
+        transcript unchanged and one with a new assistant message appended."""
+        transcript = Path(tempfile.mkdtemp()) / "s0.jsonl"
+        self.addCleanup(shutil.rmtree, transcript.parent, ignore_errors=True)
+        transcript.write_text(
+            json.dumps({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "first reply"}]},
+            }) + "\n",
+            encoding="utf-8",
+        )
         rows = [{"name": "VAMP-0", "provider": "Claude", "session_key": "Claude:id-0"}]
         session_hub.METADATA_PATH.write_text(
             json.dumps({
@@ -8676,7 +8912,7 @@ class SessionActivityTests(unittest.TestCase):
         )
         sessions = [
             session_hub.Session(
-                "Claude", "id-0", "s0", "/tmp/vamp", "/tmp/vamp", 100, Path("/tmp/s0.jsonl"),
+                "Claude", "id-0", "s0", "/tmp/vamp", "/tmp/vamp", 100, transcript,
             )
         ]
         calls: list[list[str]] = []
@@ -8690,8 +8926,6 @@ class SessionActivityTests(unittest.TestCase):
                 result.stdout = "VAMP-0\n"
             elif argv[1] == "list-panes":
                 result.stdout = "VAMP-0\t%0\t9000\t1788000000\n"
-            elif argv[1] == "capture-pane":
-                result.stdout = "● first meaningful message\n"
             return result
 
         with (
@@ -8704,16 +8938,20 @@ class SessionActivityTests(unittest.TestCase):
         ):
             window = session_hub.SessionHub()
             window.refresh_running_tab()
-            first_message = window._pane_block_cache.get("VAMP-0")
-            calls.clear()
+            first_message = window.running_table.item(0, 2).text()
+
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "second reply"}]},
+                }) + "\n")
             window.refresh_running_tab()
-            second_message = window._pane_block_cache.get("VAMP-0")
+            second_message = window.running_table.item(0, 2).text()
             window.close()
 
-        capture_calls = [c for c in calls if c and c[0] == "/usr/bin/tmux" and "capture-pane" in c]
-        self.assertEqual(capture_calls, [])
-        self.assertEqual(first_message, second_message)
-        self.assertIn("first meaningful message", first_message)
+        self.assertEqual(first_message, "first reply")
+        self.assertEqual(second_message, "second reply")
+        self.assertFalse(any(c and c[0] == "/usr/bin/tmux" and "capture-pane" in c for c in calls))
 
     def _fake_run_with_native_identity(self, pid_to_native_key: dict[int, str]):
         """A fake `subprocess.run` for refresh_running_tab's tmux calls, PLUS a real /proc tree
@@ -8938,6 +9176,113 @@ class SessionActivityTests(unittest.TestCase):
             window = session_hub.SessionHub()
             window.refresh_running_tab()
             self.assertEqual(window.running_table.rowCount(), 0)  # not claimed as Running
+            window.close()
+
+    def test_refresh_running_tab_absent_row_never_borrows_a_claimed_siblings_identity(self):
+        """task-2164: an absent row (no session_key of its own, so it falls to the name+cwd
+        bootstrap match) must never resolve to another row's ALREADY-CLAIMED live session just
+        because its saved name happens to equal that session's parsed agent_name (a stale/reused
+        --name tag) -- the exact "VAM-worker4 borrows VAMPULSE-orchestrator's pane/preview/focus/
+        Stop target" shape the brief names. Both rows' own tmux sessions are genuinely live, so
+        this isolates the IDENTITY dedup, not tmux liveness."""
+        orchestrator_row = {
+            "name": "VAMPULSE-orchestrator", "provider": "Claude", "session_key": "Claude:id-orch",
+        }
+        worker4_row = {"name": "VAMP-worker4", "provider": "Claude"}
+        session_hub.METADATA_PATH.write_text(
+            json.dumps({
+                "settings": {}, "sessions": {},
+                "groups": {"/tmp/vamp": {"tmux": True, "rows": [orchestrator_row, worker4_row]}},
+            }),
+            encoding="utf-8",
+        )
+        # ONE live session, claimed by the orchestrator row via session_key -- its parsed
+        # agent_name happens to equal worker4's row name, the exact ambiguity step 2's
+        # name+cwd match must not resolve through once this session is already claimed.
+        live_session = session_hub.Session(
+            "Claude", "id-orch", "t", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/orch.jsonl"), agent_name="VAMP-worker4",
+        )
+
+        def fake_run(argv, **kwargs):
+            result = MagicMock(returncode=0, stdout="")
+            if argv[1] == "list-sessions":
+                result.stdout = "VAMPULSE-orchestrator\nVAMP-worker4\n"
+            elif argv[1] == "list-panes":
+                result.stdout = (
+                    "VAMPULSE-orchestrator\t%0\t9000\t1788000000\n"
+                    "VAMP-worker4\t%1\t9001\t1788000000\n"
+                )
+            return result
+
+        with (
+            patch.object(session_hub, "claude_sessions", return_value=[live_session]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.shutil, "which", return_value="/usr/bin/tmux"),
+            patch.object(session_hub.subprocess, "run", side_effect=fake_run),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            window.refresh_running_tab()
+            rows_by_name = {}
+            for r in range(window.running_table.rowCount()):
+                item = window.running_table.item(r, 0)
+                _cwd, saved_name, session_id, _tmux_name = item.data(
+                    session_hub.Qt.ItemDataRole.UserRole
+                )
+                rows_by_name[saved_name] = (session_id, window.running_table.item(r, 2).text())
+            window.close()
+
+        self.assertEqual(rows_by_name["VAMPULSE-orchestrator"][0], "id-orch")
+        # worker4 never got the orchestrator's session id or its transcript preview.
+        session_id, last_message = rows_by_name["VAMP-worker4"]
+        self.assertIsNone(session_id)
+        self.assertEqual(last_message, "")
+
+    def test_refresh_running_tab_standalone_session_already_claimed_by_a_group_row_is_not_duplicated(
+        self,
+    ):
+        """task-2164: a live session already claimed by a group row must never ALSO render as
+        its own standalone Running row -- self.sessions'/discover_sessions' own group-hiding
+        resolves against a different (pre-tmux-census) snapshot than the fresh `claimed` set
+        refresh_running_tab computes, so the two can disagree; the standalone loop must defer to
+        the fresh one and never render the same native key twice."""
+        row = {"name": "VAMP-0", "provider": "Claude", "session_key": "Claude:id-0"}
+        session_hub.METADATA_PATH.write_text(
+            json.dumps({
+                "settings": {}, "sessions": {},
+                "groups": {"/tmp/vamp": {"tmux": True, "rows": [row]}},
+            }),
+            encoding="utf-8",
+        )
+        claimed_session = session_hub.Session(
+            "Claude", "id-0", "t", "/tmp/vamp", "/tmp/vamp", 100, Path("/tmp/s0.jsonl"),
+        )
+
+        def fake_run(argv, **kwargs):
+            result = MagicMock(returncode=0, stdout="")
+            if argv[1] == "list-sessions":
+                result.stdout = "VAMP-0\n"
+            elif argv[1] == "list-panes":
+                result.stdout = "VAMP-0\t%0\t9000\t1788000000\n"
+            return result
+
+        with (
+            patch.object(session_hub, "claude_sessions", return_value=[claimed_session]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.shutil, "which", return_value="/usr/bin/tmux"),
+            patch.object(session_hub.subprocess, "run", side_effect=fake_run),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            # Force disagreement: self.sessions (discover_sessions' own resolution) still shows
+            # the session as a bare standalone entry, as if ITS OWN group-hiding pass had not
+            # claimed it -- exactly the cross-pass mismatch this fix defends against.
+            window.sessions = [claimed_session]
+            window.refresh_running_tab()
+            self.assertEqual(window.running_table.rowCount(), 1)  # not 2
             window.close()
 
     def test_sessions_json_cli_ambiguous_owner_reports_stopped_not_a_sibling(self):

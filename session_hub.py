@@ -2770,7 +2770,11 @@ def find_group_member_session(
        Not cwd-gated: an exact session_key match (or linked_keys membership) is
        already unambiguous identity, and a long-running agent's own cwd can
        legitimately drift (cd into a worktree, a subdirectory, etc.) without
-       that meaning the row now belongs to a different session.
+       that meaning the row now belongs to a different session. Still
+       `exclude_keys`-gated (task-2164 rework): two rows sharing the identical
+       stale session_key must not both resolve to - and both render/control -
+       the one live session; whichever sibling this pass claims it first wins,
+       the other falls through unmatched.
     1b. If step 1 found nothing AND `session_key` is itself a member of some
        link (`linked_session_keys`, from every metadata["links"] members
        list), the row's identity is under link management, not a fresh
@@ -2782,7 +2786,11 @@ def find_group_member_session(
     2. `--name` (Session.agent_name, parsed from the transcript's own agent-name
        record - see _scan_claude_file) plus cwd - the bootstrap match, used before
        any session_key has been recorded (a row's first launch). Claude-only:
-       Codex has no equivalent flag to tag a name onto a fresh launch.
+       Codex has no equivalent flag to tag a name onto a fresh launch. Still
+       `exclude_keys`-gated (task-2164 fix): an unnamed/no-session-key row and an
+       already-claimed sibling with the same (often both-blank) agent_name/cwd
+       must never resolve to that sibling's session - the absent row stays
+       unmatched rather than borrowing another row's live identity.
     3. Codex only, and only for a row this session itself just launched
        (`row["codex_pending_since"]`, stamped by launch_group_row): the
        newest live Codex session in this cwd updated since then, not already
@@ -2827,6 +2835,13 @@ def find_group_member_session(
             None,
         )
         if match:
+            # task-2164 rework: an exact session_key match is still a
+            # sibling row's claim if that native key was already resolved
+            # earlier this same pass (exclude_keys) - two rows recording
+            # the identical stale session_key (a duplicated/merged row)
+            # must not both render/control the one live session.
+            if match.native_key in exclude_keys:
+                return None
             return match
         if session_key in linked_session_keys:
             return None
@@ -2838,6 +2853,7 @@ def find_group_member_session(
                 if session.provider == "Claude"
                 and session.cwd == cwd
                 and session.agent_name == row.get("name")
+                and session.native_key not in exclude_keys
             ),
             None,
         )
@@ -3439,41 +3455,6 @@ def tmux_pane_activity_snapshot() -> dict[str, tuple[str, str, str]]:
     return snapshot
 
 
-def capture_changed_panes(pane_ids: dict[str, str]) -> dict[str, str]:
-    """Batch-capture several panes' text in ONE tmux client invocation.
-
-    `pane_ids` maps an arbitrary key (here, the tmux session name) to its %pane-id.
-    tmux's CLI accepts several commands chained by a literal ';' argv token in one
-    invocation; injecting a unique `display-message -p <marker>` between each
-    `capture-pane -p` gives an unambiguous split point in the combined stdout, so N
-    changed panes cost exactly one subprocess spawn -- never N -- matching the
-    brief's "batch all changed pane IDs into one bounded tmux client invocation."
-    """
-    tmux = shutil.which("tmux")
-    if not tmux or not pane_ids:
-        return {}
-    marker = f"@@@SHPANE-{uuid.uuid4().hex}@@@"
-    args = [tmux]
-    for index, pane_id in enumerate(pane_ids.values()):
-        if index > 0:
-            args += [";", "display-message", "-p", marker, ";"]
-        args += ["capture-pane", "-p", "-t", pane_id]
-    try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=3)
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-    if result.returncode != 0:
-        return {}
-    parts = result.stdout.split(marker)
-    keys = list(pane_ids.keys())
-    if len(parts) != len(keys):
-        # A capture that failed mid-batch (a pane vanished between the census and
-        # this call) desynchronizes the split count -- fail closed to no update
-        # rather than mis-attributing one pane's text to another's cache entry.
-        return {}
-    return dict(zip(keys, parts))
-
-
 def tmux_session_alive(name: str, live_names: frozenset[str] | None = None) -> bool:
     """Is a tmux session named `name` currently alive.
 
@@ -4048,6 +4029,226 @@ def _codex_tail_turn_state_delta(
     """
     found, resume_from = _codex_scan_range_for_turn_marker(path, start, end)
     return (found if found is not None else prior), resume_from
+
+
+# task-2164: Running-tab "Last message" is a SEMANTIC preview of the newest assistant text in the
+# session's own transcript, never terminal-pixel scraping (see extract_last_meaningful_block,
+# which stays in place only for OTHER callers -- refresh_running_tab must never call it again).
+_TRANSCRIPT_TAIL_BYTES = 65536  # same bounded-chunk size as the Codex turn-marker scan above --
+# assistant text records are small, so almost every lookup resolves off the first chunk from EOF.
+_TRANSCRIPT_MAX_LINE_BYTES = 1_048_576  # a candidate line past this can never be a real assistant
+# text record (the shape that actually reaches this size is a giant tool-result/image blob line)
+# -- dropped rather than parsed or buffered, mirroring _codex_scan_range_for_turn_marker.
+
+_TRANSCRIPT_LAST_TEXT_CACHE_MAX = 256
+# path -> (mtime_ns, size, (dev, ino), text, resume_from) -- same cache shape and the same reasons
+# as _codex_tail_cache: a GUI refresh can ask about the same live session more than once per pass,
+# and a long-running process must not grow this one entry per historical session forever.
+_transcript_last_text_cache: (
+    "collections.OrderedDict[str, tuple[int, int, tuple[int, int], str, int]]"
+) = collections.OrderedDict()
+
+
+def _claude_assistant_text_from_line(raw: bytes) -> str | None:
+    """The joined text of every non-blank `type == "text"` block in one Claude transcript line's
+    `message.content[]`, or None if this line is not a top-level `type == "assistant"` record, is
+    malformed/non-object JSON, or has no qualifying block (thinking/tool_use blocks, and any other
+    non-"text" block type, are ignored -- as are user tool_result rows and compact/meta rows, none
+    of which are `type == "assistant"` at all)."""
+    try:
+        obj = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict) or obj.get("type") != "assistant":
+        return None
+    message = obj.get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    if not isinstance(content, list):
+        return None
+    parts = [
+        block["text"]
+        for block in content
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+            and block["text"].strip()
+        )
+    ]
+    return "\n\n".join(parts) if parts else None
+
+
+def _codex_assistant_text_from_line(raw: bytes) -> str | None:
+    """The joined text of every non-blank `type == "output_text"` block in one Codex rollout
+    line's `payload.content[]`, or None if this line is not a top-level `type == "response_item"`
+    record whose payload is `type == "message"` and `role == "assistant"`, is malformed/non-object
+    JSON, or has no qualifying block (reasoning, function_call/function_call_output, event_msg,
+    token_count and user-role rows are all excluded by the type/role check -- commentary and final
+    assistant messages both count here, both are `role == "assistant"`)."""
+    try:
+        obj = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict) or obj.get("type") != "response_item":
+        return None
+    payload = obj.get("payload")
+    if (
+        not isinstance(payload, dict)
+        or payload.get("type") != "message"
+        or payload.get("role") != "assistant"
+    ):
+        return None
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return None
+    parts = [
+        block["text"]
+        for block in content
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "output_text"
+            and isinstance(block.get("text"), str)
+            and block["text"].strip()
+        )
+    ]
+    return "\n\n".join(parts) if parts else None
+
+
+_TRANSCRIPT_LAST_TEXT_PARSERS = {
+    "Claude": _claude_assistant_text_from_line,
+    "Codex": _codex_assistant_text_from_line,
+}
+
+
+def _transcript_scan_range_for_last_text(
+    path: Path, floor: int, end: int, parse_line,
+) -> tuple[str | None, int]:
+    """Reverse fixed-chunk scan for the text of the LAST (closest-to-EOF) line in [floor, end) of
+    `path` for which `parse_line(line_bytes)` returns non-None -- walking backward
+    _TRANSCRIPT_TAIL_BYTES at a time until a match is found or `floor` is reached. Mirrors
+    _codex_scan_range_for_turn_marker's chunk-bounded reverse walk and oversized-line handling
+    (assistant text records are tiny; a giant unrelated tool-output/image line is dropped, never
+    buffered or reparsed) -- but unlike a turn marker's timestamp comparison, JSONL's physical
+    order already IS chronological order here, so the FIRST qualifying line found walking
+    backward from `end` is the newest one, and this returns immediately instead of scanning on. A
+    trailing torn/incomplete line (a write mid-flight) parses to None like any other malformed
+    line and is simply skipped, never mistaken for -- or allowed to erase -- the last complete one.
+
+    Also returns `resume_from`: the offset where the last (possibly incomplete) line within
+    [floor, end) begins, as measured from the first (EOF-anchored) chunk only -- same torn-write
+    resume contract as _codex_scan_range_for_turn_marker, so a later incremental scan re-reads a
+    small trailing fragment together with whatever completes it rather than losing it.
+    """
+    if end <= floor:
+        return None, floor
+    try:
+        handle = path.open("rb")
+    except OSError:
+        return None, floor
+    with handle:
+        position = end
+        tail_fragment = b""
+        oversized = False
+        resume_from = end
+        first_chunk = True
+        while True:
+            read_size = min(_TRANSCRIPT_TAIL_BYTES, position - floor)
+            position -= read_size
+            try:
+                handle.seek(position)
+                chunk = handle.read(read_size)
+            except OSError:
+                return None, floor
+            if first_chunk:
+                last_newline = chunk.rfind(b"\n")
+                resume_from = (
+                    position if last_newline == -1 else position + last_newline + 1
+                )
+                first_chunk = False
+
+            if oversized:
+                boundary = chunk.rfind(b"\n")
+                if boundary == -1:
+                    if position <= floor:
+                        return None, resume_from
+                    continue
+                combined = chunk[:boundary]
+                oversized = False
+            else:
+                combined = chunk + tail_fragment
+                tail_fragment = b""
+
+            if position <= floor:
+                lines = combined.split(b"\n")
+            else:
+                parts = combined.split(b"\n")
+                prefix = parts[0]
+                lines = parts[1:]
+                if len(prefix) > _TRANSCRIPT_MAX_LINE_BYTES:
+                    oversized = True
+                else:
+                    tail_fragment = prefix
+
+            for line in reversed(lines):
+                text = parse_line(line)
+                if text is not None:
+                    return text, resume_from
+            if position <= floor:
+                return None, resume_from
+
+
+def _transcript_last_assistant_text(path: Path, provider: str) -> str:
+    """The newest assistant text message in `path` per `provider`'s own record shape (see
+    _claude_assistant_text_from_line / _codex_assistant_text_from_line), or "" if none exists, the
+    file is unreadable, or `provider` has no semantic parser here (e.g. Antigravity -- its
+    transcript is a SQLite DB, not JSONL; never substitutes pane/status-detail text instead).
+
+    Cached per path by (mtime_ns, size, (dev, ino)), bounded LRU -- an unchanged transcript costs
+    a stat plus a cache lookup and zero transcript I/O; a grown transcript is scanned
+    incrementally from the previous resume point, never re-derived from byte 0; a replaced or
+    truncated file (same-or-smaller size, or a changed (dev, ino) identity) cold-scans safely.
+    Same cache shape and reasoning as _codex_tail_turn_state.
+    """
+    parse_line = _TRANSCRIPT_LAST_TEXT_PARSERS.get(provider)
+    if parse_line is None:
+        return ""
+    try:
+        stat = path.stat()
+    except OSError:
+        return ""
+    key = str(path)
+    identity = (stat.st_dev, stat.st_ino)
+    cached = _transcript_last_text_cache.get(key)
+    if (
+        cached is not None
+        and cached[0] == stat.st_mtime_ns
+        and cached[1] == stat.st_size
+        and cached[2] == identity
+    ):
+        _transcript_last_text_cache.move_to_end(key)
+        return cached[3]
+    if cached is not None and cached[2] == identity and cached[1] < stat.st_size:
+        # Strict growth of the confirmed-same file: only the newly appended bytes can contain a
+        # qualifying line newer than the cached one -- everything below the previous resume point
+        # was already scanned. A qualifying line found in the new bytes IS the newer one (JSONL's
+        # physical order is chronological) and wins; finding none there leaves the previous text
+        # standing -- growth of unrelated records (tool calls, reasoning) must not erase it.
+        found, resume_from = _transcript_scan_range_for_last_text(
+            path, cached[4], stat.st_size, parse_line
+        )
+        text = found if found is not None else cached[3]
+    else:
+        found, resume_from = _transcript_scan_range_for_last_text(path, 0, stat.st_size, parse_line)
+        text = found or ""
+    _transcript_last_text_cache[key] = (
+        stat.st_mtime_ns, stat.st_size, identity, text, resume_from,
+    )
+    _transcript_last_text_cache.move_to_end(key)
+    if len(_transcript_last_text_cache) > _TRANSCRIPT_LAST_TEXT_CACHE_MAX:
+        _transcript_last_text_cache.popitem(last=False)
+    return text
 
 
 def _codex_activity(session: "Session", status: dict | None) -> tuple[str, str]:
@@ -6816,12 +7017,6 @@ class SessionHub(QMainWindow):
         self.usage_compact_bars: dict[str, QProgressBar] = {}
         self.thread_pool = QThreadPool.globalInstance()
         self.group_dialogs: dict[str, "ManageGroupDialog"] = {}
-        # task-2142: per-tmux-session-name pane census cache, keyed by the same
-        # `row["name"]` the rest of the Running machinery already uses. Persists
-        # across refresh_running_tab calls so an unchanged pane costs zero
-        # capture-pane invocations (window_activity alone tells us it changed).
-        self._pane_activity_cache: dict[str, str] = {}
-        self._pane_block_cache: dict[str, str] = {}
         # task-2142 row453 REWORK (orchestrator search REWORK): every saved group row's
         # identity, rebuilt once per refresh() straight from already-loaded metadata (no
         # subprocess) -- what apply_filter's All Sessions branch searches to surface a
@@ -7880,6 +8075,13 @@ class SessionHub(QMainWindow):
         for session in self.sessions:
             if session.session_id.startswith("group:"):
                 continue
+            # task-2164: a session already claimed by a group row above (the same live native
+            # key) must never ALSO render as its own standalone row -- self.sessions'/
+            # discover_sessions' own group-hiding resolves against a different (pre-tmux-
+            # census) snapshot, so it can disagree with the fresh `claimed` set just computed
+            # here. Fail closed to "already shown once", never render the same native key twice.
+            if session.native_key in claimed:
+                continue
             tmux_enabled, name, status = standalone_tmux_status(
                 session, session_overrides.get(session.key, {}), settings, live_names
             )
@@ -7888,26 +8090,6 @@ class SessionHub(QMainWindow):
                     session.title, session.cwd,
                     {"name": name, "provider": session.provider}, session, name,
                 ))
-
-        # task-2142: Last-message census. One list-panes call for every row's
-        # window_activity; only names whose activity changed since the cached value
-        # get captured, and every changed name is captured in ONE batched tmux
-        # invocation (capture_changed_panes), not one spawn per row. Keyed by the
-        # row's RESOLVED tmux name (task-2156) so this reads the pane the session
-        # actually lives in, and so a name change between refreshes is a natural
-        # cache miss rather than silently mixing another session's cached text.
-        changed_pane_ids: dict[str, str] = {}
-        for _dn, _cwd, _row, _m, resolved_name in running:
-            entry = pane_snapshot.get(resolved_name)
-            if not entry:
-                continue
-            pane_id, _pid, activity = entry
-            if self._pane_activity_cache.get(resolved_name) != activity:
-                changed_pane_ids[resolved_name] = pane_id
-        captured = capture_changed_panes(changed_pane_ids)
-        for name, raw_text in captured.items():
-            self._pane_block_cache[name] = extract_last_meaningful_block(raw_text)
-            self._pane_activity_cache[name] = pane_snapshot[name][2]
 
         name_counts = collections.Counter(row["name"] for _dn, _cwd, row, _m, _rn in running)
         self.running_table.setRowCount(len(running))
@@ -7941,10 +8123,11 @@ class SessionHub(QMainWindow):
                 if match else ("unknown", "")
             )
             self.running_table.setItem(index, 1, self._status_column_item(state))
-            # Last message is the latest meaningful terminal-output block (the pane
-            # census above), never session_activity's status detail -- the brief's
-            # explicit distinction (task-2142).
-            last_message = self._pane_block_cache.get(resolved_name, "")
+            # Last message is the newest assistant text in the session's own transcript (task-
+            # 2164) -- never session_activity's status detail, and never pane/terminal text: a
+            # row with no matched live session (match is None) shows an empty preview rather
+            # than falling back to anything else.
+            last_message = _transcript_last_assistant_text(match.path, match.provider) if match else ""
             self.running_table.setItem(index, 2, self._detail_column_item(last_message))
         # Reapply whatever query is currently typed (task-2142 row453 REWORK -- orchestrator
         # search REWORK): this repopulates every 2s via _on_running_status_tick, and a search
