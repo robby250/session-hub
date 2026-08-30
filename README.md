@@ -19,6 +19,8 @@ A small Linux desktop launcher for local Codex, Claude Code, and Antigravity ses
 - Groups linked native transcripts across all three agents into one visible logical session
 - Can ask the active agent to prepare a structured full-session handoff summary
 - Resumes every session in a separate terminal window
+- Running has an embedded terminal (X11 xterm) on the right; click, Enter or double-click a row to
+  attach it, `Ctrl+Shift+O` or right-click still opens that row's terminal in its own window
 - Starts new Codex, Claude, or Antigravity sessions in a chosen directory
 - Moves deleted histories into recoverable application trash
 

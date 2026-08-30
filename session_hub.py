@@ -23,10 +23,17 @@ import time
 import tomllib
 import uuid
 from dataclasses import dataclass, replace
+from terminal_profile import (  # noqa: E402  (see terminal_profile.py -- shared with vte_embed_helper.py)
+    gnome_terminal_profile_style,
+    resolve_gnome_terminal_font,
+    resolve_gnome_terminal_profile_uuid,
+)
 from datetime import date, datetime
 from pathlib import Path
 
-from PyQt6.QtCore import QByteArray, QObject, QRunnable, QThreadPool, QTimer, QUrl, Qt, pyqtSignal
+from PyQt6.QtCore import (
+    QByteArray, QObject, QRunnable, QSocketNotifier, QThreadPool, QTimer, QUrl, Qt, pyqtSignal,
+)
 from PyQt6.QtGui import (
     QAction,
     QColor,
@@ -51,8 +58,6 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -60,6 +65,8 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSlider,
     QSpinBox,
+    QSplitter,
+    QStackedLayout,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -89,26 +96,107 @@ METADATA_PATH = DATA_DIR / "metadata.json"
 # overwhelming majority on any given refresh - cost a single stat() call.
 _FILE_SCAN_CACHE: dict[str, tuple[tuple[float, int], dict]] = {}
 
+# task-2142: the above cache is per-process only, so a cold TUI/CLI
+# `--sessions-json` invocation - a brand-new interpreter every call -
+# re-scans every transcript from nothing. This on-disk index, keyed by path
+# identity (dev, ino) plus size/mtime, survives across process boundaries so
+# GUI, TUI and CLI (all funneling through discover_sessions()) share one
+# scanned-already record instead of each re-deriving it. A shrunk file, a
+# path whose (dev, ino) no longer matches (replaced/recreated), a corrupt
+# index file, or a schema version bump are all treated as "unseen" for the
+# affected entry (or the whole index, for corruption/schema) and rescanned -
+# never trusted, never crashed on.
+SCAN_INDEX_PATH = DATA_DIR / "scan_index.json"
+SCAN_INDEX_SCHEMA = 1
 
-def _file_signature(path: Path) -> tuple[float, int] | None:
+_PERSISTENT_SCAN_INDEX: dict[str, dict] | None = None
+_SCAN_INDEX_DIRTY = False
+
+
+def _load_persistent_scan_index() -> dict[str, dict]:
     try:
-        stat = path.stat()
+        payload = json.loads(SCAN_INDEX_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict) or payload.get("schema") != SCAN_INDEX_SCHEMA:
+        return {}
+    entries = payload.get("entries")
+    return entries if isinstance(entries, dict) else {}
+
+
+def _persistent_scan_index() -> dict[str, dict]:
+    global _PERSISTENT_SCAN_INDEX
+    if _PERSISTENT_SCAN_INDEX is None:
+        _PERSISTENT_SCAN_INDEX = _load_persistent_scan_index()
+    return _PERSISTENT_SCAN_INDEX
+
+
+def flush_persistent_scan_index() -> None:
+    """Atomically persist the on-disk scan index - called once per
+    discover_sessions() pass (the one choke point GUI refresh, TUI fetches
+    and the --sessions-json/--usage-json CLI verbs all share), not per file,
+    so a refresh touching hundreds of transcripts costs one write. A failed
+    write is swallowed: this index is a perf cache, never a correctness
+    dependency, and the next successful flush repairs it."""
+    global _SCAN_INDEX_DIRTY
+    if not _SCAN_INDEX_DIRTY or _PERSISTENT_SCAN_INDEX is None:
+        return
+    try:
+        SCAN_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SCAN_INDEX_PATH.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps({"schema": SCAN_INDEX_SCHEMA, "entries": _PERSISTENT_SCAN_INDEX}),
+            encoding="utf-8",
+        )
+        tmp.replace(SCAN_INDEX_PATH)
+        _SCAN_INDEX_DIRTY = False
     except OSError:
-        return None
-    return (stat.st_mtime, stat.st_size)
+        pass
 
 
 def _cached_file_scan(path: Path, scan) -> dict:
-    """Return scan(path) result, cached until the file's mtime/size change."""
-    signature = _file_signature(path)
-    if signature is None:
+    """Return scan(path) result, cached until the file's mtime/size change.
+
+    Two layers: the in-memory `_FILE_SCAN_CACHE` (this process's lifetime,
+    unchanged) and the on-disk `_persistent_scan_index()` (identity + size +
+    mtime, shared across process boundaries - see flush_persistent_scan_index).
+    """
+    global _SCAN_INDEX_DIRTY
+    try:
+        stat = path.stat()
+    except OSError:
         return {}
+    signature = (stat.st_mtime, stat.st_size)
     key = str(path)
+
     cached = _FILE_SCAN_CACHE.get(key)
     if cached is not None and cached[0] == signature:
         return cached[1]
+
+    index = _persistent_scan_index()
+    entry = index.get(key)
+    if (
+        isinstance(entry, dict)
+        and entry.get("dev") == stat.st_dev
+        and entry.get("ino") == stat.st_ino
+        and entry.get("size") == stat.st_size
+        and entry.get("mtime") == stat.st_mtime
+        and isinstance(entry.get("result"), dict)
+    ):
+        result = entry["result"]
+        _FILE_SCAN_CACHE[key] = (signature, result)
+        return result
+
     result = scan(path)
     _FILE_SCAN_CACHE[key] = (signature, result)
+    index[key] = {
+        "dev": stat.st_dev,
+        "ino": stat.st_ino,
+        "size": stat.st_size,
+        "mtime": stat.st_mtime,
+        "result": result,
+    }
+    _SCAN_INDEX_DIRTY = True
     return result
 TRASH_DIR = DATA_DIR / "trash"
 # Tracks Claude processes Session Hub itself launched, so a same-directory
@@ -1058,7 +1146,16 @@ class UsageActivity:
 
 
 def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | None:
-    """Compare actual usage against an even pace across the window's duration."""
+    """Compare actual usage against an even pace across the window's duration. The reported
+    deviation is relative to EXPECTED usage, not the full quota (task-2142 row453): 10% used at
+    5% expected is "100% over pace" -- an absolute-percentage-point delta ("5% over pace") buries
+    how much worse than expected that actually is once usage is still low. Desktop and the phone
+    TUI both render this exact string (never recompute the arithmetic) -- desktop calls it directly
+    and the TUI reads the same value back from `--sessions-json`'s "pace" field.
+
+    When expected usage is near zero, a relative percentage is undefined (unbounded, or a
+    divide-by-zero at exactly zero) rather than merely large, so a neutral bounded label is shown
+    instead of a number."""
     if not window.window_minutes or not window.reset_epoch:
         return None
     window_seconds = window.window_minutes * 60
@@ -1071,8 +1168,288 @@ def usage_pace_text(window: UsageWindow, now: datetime | None = None) -> str | N
     delta = window.used_percent - expected_percent
     if abs(delta) < 0.5:
         return f"{expected_percent:.1f}% expected · on pace"
+    if expected_percent < 0.05:
+        return f"{expected_percent:.1f}% expected · just started"
+    relative_percent = abs(delta) / expected_percent * 100
     direction = "over" if delta > 0 else "under"
-    return f"{expected_percent:.1f}% expected · {abs(delta):.1f}% {direction} pace"
+    return f"{expected_percent:.1f}% expected · {relative_percent:.1f}% {direction} pace"
+
+
+_GIREPOSITORY_SEARCH_DIRS = (
+    "/usr/lib/girepository-1.0",
+    "/usr/lib/x86_64-linux-gnu/girepository-1.0",
+    "/usr/lib/aarch64-linux-gnu/girepository-1.0",
+    "/usr/local/lib/girepository-1.0",
+)
+
+
+def _typelib_present(filename: str) -> bool:
+    """Filesystem-only check for a GObject-Introspection typelib (task-2142 row453 REWORK --
+    orchestrator audit, 2026-08-30: `_embed_helper_ready` previously did `import gi; ... from
+    gi.repository import Gtk, Vte` IN THIS QT PROCESS to check readiness -- loading GTK's native
+    libraries into the same process as PyQt6 is exactly the cross-toolkit risk that audit flagged.
+    A bare file-existence probe answers the same question without ever loading either toolkit
+    here; the helper subprocess is the only place Gtk/Vte are actually imported."""
+    search_dirs = [p for p in os.environ.get("GI_TYPELIB_PATH", "").split(":") if p]
+    search_dirs += list(_GIREPOSITORY_SEARCH_DIRS)
+    return any((Path(d) / filename).is_file() for d in search_dirs)
+
+
+def _embed_helper_ready(which=shutil.which) -> bool:
+    """True if the embedded-terminal helper's dependencies -- a python3 interpreter, plus the
+    Gtk3/Vte typelibs the HELPER SUBPROCESS needs -- look present (task-2142 row453 REWORK)."""
+    if not which("python3"):
+        return False
+    return _typelib_present("Gtk-3.0.typelib") and _typelib_present("Vte-2.91.typelib")
+
+
+def _embed_precheck(platform_name: str, helper_ready: bool, winid: int | None) -> str | None:
+    """Pure: the reason an embedded terminal cannot be attached right now, or None if every
+    precondition holds (task-2142 row453). Kept separate from EmbeddedTerminalController so every
+    branch is a plain string-in/string-out unit test with no Qt widget, X server or subprocess."""
+    if platform_name != "xcb":
+        return f"embedded terminal requires X11 (platform is {platform_name!r})"
+    if not helper_ready:
+        return "the embedded terminal helper is unavailable (python3-gi / gir1.2-vte-2.91 missing?)"
+    if not winid or winid <= 0:
+        return "no valid native window id for the terminal container"
+    return None
+
+
+class _EmbedWindowResizer:
+    """Injectable wrapper around python-xlib for keeping the VTE helper's Gtk.Plug window
+    pixel-exact with its Qt container on every resize (task-2142 row453 REWORK). Gtk.Plug embeds
+    itself into the socket window Session Hub hands it, but does not track that socket's size on
+    its own -- X11 embedding makes the EMBEDDER (Session Hub, the socket side) responsible for
+    resizing the child window, same as a window manager resizing any ordinary top-level window;
+    that resize is what makes GTK/Vte recompute the pty's rows/cols and send SIGWINCH.
+
+    python-xlib is imported lazily so constructing this class -- and therefore
+    EmbeddedTerminalController -- never requires Xlib to be installed for a hermetic, non-X
+    test."""
+
+    def __init__(self, display_factory=None):
+        self._display_factory = display_factory or self._real_display
+        self._display = None
+
+    @staticmethod
+    def _real_display():
+        from Xlib import display
+
+        return display.Display()
+
+    def _disp(self):
+        if self._display is None:
+            self._display = self._display_factory()
+        return self._display
+
+    def resize(self, child_winid: int, width: int, height: int) -> bool:
+        try:
+            disp = self._disp()
+            child = disp.create_resource_object("window", child_winid)
+            child.configure(width=max(1, width), height=max(1, height))
+            disp.sync()
+        except Exception:
+            return False
+        return True
+
+
+def _default_read_xid_line(process: subprocess.Popen, timeout: float) -> str | None:
+    """Blocking-with-timeout read of the helper's one `XID=<id>` stdout line (task-2142 row453
+    REWORK). Plain `readline()` has no timeout, so a helper that never realizes its window would
+    otherwise hang Session Hub's GUI thread forever."""
+    if process.stdout is None:
+        return None
+    ready, _, _ = select.select([process.stdout], [], [], timeout)
+    if not ready:
+        return None
+    return process.stdout.readline()
+
+
+class EmbeddedTerminalController:
+    """Owns AT MOST ONE embedded terminal client: a small first-party GTK3/Vte helper process
+    (`vte_embed_helper.py`), embedded via `Gtk.Plug` into one container widget's native X window,
+    running `tmux attach-session -t <name>` inside a real `Vte.Terminal` (task-2142 row453
+    REWORK -- replaces the earlier bare-xterm embed, which could not match gnome-terminal's font/
+    theme/DPI because it never consulted GNOME Terminal's actual profile). Switching sessions
+    gracefully ends only the OLD client -- `detach()` never sends anything to tmux, so the
+    session a client was attached to keeps running headless exactly as before, the same contract
+    as a user manually detaching a real tmux client.
+
+    `popen`/`which`/`platform_name`/`embedder`/`read_xid_line`/`helper_ready`/`profile_uuid` are
+    all injectable so a hermetic test can drive every precheck, switch, failure and
+    one-child-replacement path without a real X server, GTK, tmux session or gsettings -- it only
+    needs a fake container with `.winId()`/`.size()`."""
+
+    def __init__(self, container, popen=subprocess.Popen, which=shutil.which,
+                 platform_name=lambda: QApplication.platformName(),
+                 embedder=None, read_xid_line=_default_read_xid_line,
+                 helper_ready=None, profile_uuid=None, helper_script=None):
+        self._container = container
+        self._popen = popen
+        self._which = which
+        self._platform_name = platform_name
+        self._embedder = embedder or _EmbedWindowResizer()
+        self._read_xid_line = read_xid_line
+        self._helper_ready = helper_ready or _embed_helper_ready
+        self._profile_uuid = profile_uuid or resolve_gnome_terminal_profile_uuid
+        self._helper_script = helper_script or str(
+            Path(__file__).resolve().parent / "vte_embed_helper.py"
+        )
+        self.process: subprocess.Popen | None = None
+        self.current_name: str | None = None
+        self._child_winid: int | None = None
+        self._pending_name: str | None = None
+        # Bumped the moment a replacement attach COMMITS to displacing the previous one --
+        # at the detach() call in begin_attach, before the new popen() even runs (task-2142
+        # row453 REWORK -- reviewer rework round 2: bumping only after popen() succeeded left
+        # a hole where A is pending, B's precheck passes and detach()s A, B's popen() raises
+        # OSError, and A's still-current generation lets its late XID/timeout resurrect A's
+        # state through the just-failed B transition). Bumping at commit-to-replace time means
+        # ANY outcome of the replacement -- success, launch failure, or later stale callback --
+        # leaves the old generation permanently invalid, while a precheck failure (which returns
+        # before detach() is ever called) still touches neither the generation nor any existing
+        # state. The GUI layer snapshots `generation` right after `begin_attach` returns True and
+        # passes it back into `finish_attach`; a mismatch means a newer attach has already
+        # superseded this one.
+        self.generation = 0
+
+    def begin_attach(self, name: str) -> tuple[bool, str]:
+        """Phase 1 of attaching: precheck + launch the helper ONLY -- does not block waiting for
+        its XID line (task-2142 row453 REWORK -- orchestrator audit, 2026-08-30: a blocking read
+        here froze the GUI thread for up to 3s). The caller (the Qt GUI thread) waits for
+        readability asynchronously -- e.g. via QSocketNotifier plus a bounded singleShot timeout
+        -- then calls `finish_attach` with whatever line (or None) it got. `attach()` below is a
+        synchronous convenience wrapper over both for callers that don't need that split.
+
+        Precheck BEFORE touching any existing client: a systemic failure (no X11, no helper) must
+        never tear down an already-working embedded session just because the user clicked a
+        different row -- it fails the same way every time regardless, so check first."""
+        try:
+            winid = int(self._container.winId())
+        except (TypeError, ValueError):
+            winid = None
+        reason = _embed_precheck(self._platform_name(), self._helper_ready(), winid)
+        if reason:
+            return False, reason
+        self.detach()
+        # Invalidate the outgoing attach's generation HERE, at commit-to-replace, not after a
+        # successful popen() below -- a failed replacement launch must not leave the previous
+        # generation looking current to a late XID/timeout callback (task-2142 row453 REWORK
+        # round 2). Clearing _pending_name too: there is no pending attach until popen()
+        # actually succeeds, and the mismatch branch in finish_attach never reads it anyway.
+        self._pending_name = None
+        self.generation += 1
+        argv = [self._which("python3"), self._helper_script,
+                "--socket-id", str(winid), "--tmux-session", name]
+        profile_uuid = self._profile_uuid()
+        if profile_uuid:
+            argv += ["--profile-uuid", profile_uuid]
+        try:
+            self.process = self._popen(argv, stdout=subprocess.PIPE, text=True, bufsize=1)
+        except OSError as e:
+            self.process = None
+            return False, f"failed to launch the embedded terminal helper: {e}"
+        self._pending_name = name
+        return True, "launching"
+
+    def finish_attach(self, line: str | None, generation: int | None = None) -> tuple[bool | None, str]:
+        """Phase 2: complete (or fail) the attach `begin_attach` started, given ONE stdout line
+        the caller already read (or None on timeout/EOF) (task-2142 row453 REWORK).
+
+        `generation` is the value `self.generation` held right after the matching
+        `begin_attach` call (reviewer rework: A->B stale-attach race). A mismatch means a
+        NEWER attach has since started and superseded this one -- return `(None, ...)` and
+        touch NOTHING (no detach, no `_pending_name`, no `current_name`/`_child_winid`),
+        since `self.process`/`self._pending_name` already belong to that newer attach.
+        `generation=None` (the `attach()` convenience wrapper, which is synchronous and
+        cannot race) always passes the check."""
+        if generation is not None and generation != self.generation:
+            return None, "a newer attach superseded this one"
+        name = self._pending_name
+        self._pending_name = None
+        child_winid = None
+        if line and line.strip().startswith("XID="):
+            try:
+                child_winid = int(line.strip().split("=", 1)[1])
+            except ValueError:
+                child_winid = None
+        if child_winid is None:
+            self.detach()
+            return False, "the embedded terminal helper did not report a window id"
+        size = self._container.size()
+        if not self._embedder.resize(child_winid, size.width(), size.height()):
+            self.detach()
+            return False, "failed to size the embedded terminal's window"
+        self.current_name = name
+        self._child_winid = child_winid
+        return True, "attached"
+
+    def attach(self, name: str) -> tuple[bool, str]:
+        """Synchronous convenience wrapper over begin_attach+finish_attach (task-2142 row453
+        REWORK) -- for hermetic tests and any non-GUI caller. The real widget wiring in
+        SessionHub._switch_embedded_terminal uses begin_attach/finish_attach directly via a
+        QSocketNotifier so it never blocks the GUI thread; this wrapper is the one place still
+        allowed to block, via the injected `read_xid_line`."""
+        ok, reason = self.begin_attach(name)
+        if not ok:
+            return False, reason
+        line = self._read_xid_line(self.process, 3.0)
+        ok, detail = self.finish_attach(line)
+        return bool(ok), detail
+
+    def resize_to_container(self) -> None:
+        """Re-fill the container on every resize (window resize, splitter drag) -- must be
+        called by the owning widget's resizeEvent/splitterMoved; Gtk.Plug does not track the
+        socket side's size changes on its own (task-2142 row453 REWORK)."""
+        if self._child_winid is None or self.process is None or self.process.poll() is not None:
+            return
+        size = self._container.size()
+        self._embedder.resize(self._child_winid, size.width(), size.height())
+
+    def detach(self) -> None:
+        if self.process is not None:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=2)
+        self.process = None
+        self.current_name = None
+        self._child_winid = None
+
+    def poll_alive(self) -> bool:
+        """True if a client is currently attached and still running. Clears state -- without
+        touching tmux -- the moment the child has exited on its own (the helper quits itself on
+        Vte's `child-exited` signal, so this needs no dedicated poll timer -- see
+        `_check_embedded_terminal_liveness`, folded into the existing 2s status tick), so the
+        caller's next check shows the failure and can fall back to external attachment."""
+        if self.process is None:
+            return False
+        if self.process.poll() is not None:
+            self.process = None
+            self.current_name = None
+            self._child_winid = None
+            return False
+        return True
+
+
+class _EmbeddedTerminalContainer(QWidget):
+    """QWidget subclass so the container's own resizes reach the embedded terminal (task-2142
+    row453 REWORK). A plain QWidget's `resizeEvent` cannot be hooked from outside without
+    subclassing -- Qt dispatches virtual methods through the class's vtable, not an instance
+    attribute, so assigning `.resizeEvent = ...` on an existing QWidget instance is silently
+    never called."""
+
+    def __init__(self, on_resize):
+        super().__init__()
+        self._on_resize = on_resize
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._on_resize()
 
 
 def format_reset_timestamp(timestamp: int | None) -> str:
@@ -1173,6 +1550,90 @@ def strip_terminal_codes(text: str) -> str:
     text = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", text)
     text = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[()][A-Z0-9]|.)", "", text)
     return text.replace("\r", "\n")
+
+
+# task-2142: chrome patterns confirmed against live `tmux capture-pane -p` dumps of a
+# real running Claude Code session (VAMP-worker1) AND a real running Codex session
+# (VAMP-reviewer), both 2026-08-29 -- see the commit message and the test fixtures for
+# the exact samples. Structural (rule-character-dominant lines, blank lines, bare
+# prompt carets, spinner/status-line shapes) rather than provider-specific text, so the
+# same rules cover both without needing per-provider special-casing; the phrase/
+# substring lists are the only provider-specific literals, all drawn from real captures.
+_PANE_RULE_CHARS = set("─━═╌╍╾╼┄┅┈┉")
+_PANE_BARE_PROMPT_RE = re.compile(r"^[❯>▌›]\s*$")
+# The spinner glyph cycles through several frames (✻, ∴, ✢, ✽, ·, braille dots, ...);
+# matching the shape -- a short leading glyph, a gerund ending in an ellipsis, then a
+# parenthesized "(Nm Ns · ... tokens)" stat block -- is more robust than an exhaustive
+# glyph whitelist, which a future spinner frame would silently fall through.
+_PANE_SPINNER_STATUS_RE = re.compile(r"^\S{1,2}\s+\S+…\s*\(.*\)$")
+_PANE_RATING_LINE_RE = re.compile(r"^(\d:\s+\S+\s*){2,}$")
+_PANE_CONTEXT_FOOTER_RE = re.compile(r"context\s+\d+%", re.IGNORECASE)
+_PANE_FOOTER_PHRASES = (
+    "esc to interrupt", "shift+tab to cycle", "bypass permissions",
+    "for shortcuts", "ctrl+c to interrupt", "ctrl+c to exit", "to interrupt",
+)
+_PANE_KNOWN_CHROME_SUBSTRINGS = (
+    "how is claude doing this session?",
+    "ask codex to do anything",
+)
+
+
+def _is_pane_border_rule_line(stripped: str) -> bool:
+    """A rule/separator line: mostly box-drawing rule characters, with at most a
+    short embedded label (a session name, or Codex's "Worked for Ns" caption).
+    A real content line is never dominated by these characters."""
+    rule_count = sum(1 for c in stripped if c in _PANE_RULE_CHARS)
+    if rule_count < 3:
+        return False
+    label = "".join(c for c in stripped if c not in _PANE_RULE_CHARS).strip()
+    return len(label) <= 40 and rule_count >= len(stripped) * 0.5
+
+
+def _is_pane_chrome_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    # An OSC8 hyperlink's visible remnant text (e.g. a trailing "/rc") renders on its
+    # own line in a plain `-p` capture; real content is never this short on its own.
+    if len(stripped) <= 3:
+        return True
+    if _is_pane_border_rule_line(stripped):
+        return True
+    if _PANE_BARE_PROMPT_RE.match(stripped):
+        return True
+    if _PANE_SPINNER_STATUS_RE.match(stripped):
+        return True
+    if _PANE_RATING_LINE_RE.match(stripped):
+        return True
+    if _PANE_CONTEXT_FOOTER_RE.search(stripped):
+        return True
+    lowered = stripped.lower()
+    if any(p in lowered for p in _PANE_FOOTER_PHRASES):
+        return True
+    if any(s in lowered for s in _PANE_KNOWN_CHROME_SUBSTRINGS):
+        return True
+    return False
+
+
+def extract_last_meaningful_block(raw_pane_text: str) -> str:
+    """The latest meaningful terminal-output block from a raw `tmux capture-pane -p`
+    dump: strips Claude/Codex prompt borders, footers, spinner-status and blank
+    chrome, then returns the last contiguous run of remaining lines (reading from the
+    bottom up, stopping at the first post-filter gap) joined by newlines. "" for a
+    pane with no meaningful content at all (fresh/empty session, chrome only).
+    """
+    lines = strip_terminal_codes(raw_pane_text).split("\n")
+    block: list[str] = []
+    started = False
+    for line in reversed(lines):
+        if _is_pane_chrome_line(line):
+            if started:
+                break
+            continue
+        block.append(line.rstrip())
+        started = True
+    block.reverse()
+    return "\n".join(block)
 
 
 def relative_reset_timestamp(value: str, now: datetime | None = None) -> str:
@@ -1502,7 +1963,44 @@ def backup_metadata_once_per_day() -> None:
             old.unlink()
 
 
+
+# task-2142 row453 incident, 2026-08-30: an ad-hoc debug script imported session_hub without the
+# test-only XDG_DATA_HOME sandbox (see the comment atop test_session_hub.py, task-2134) and, via
+# discover_sessions() -> write_metadata(), clobbered the real ~13KB metadata.json with a throwaway
+# ~1KB test fixture. The once-per-day backup below made it recoverable, but a write this much
+# smaller than what is already on disk is itself a strong signal something upstream is wrong --
+# refuse by default. A real, intentional large purge (e.g. years of trashed-session cleanup) sets
+# SESSION_HUB_ALLOW_METADATA_SHRINK=1 to proceed anyway.
+METADATA_SHRINK_REFUSAL_RATIO = 0.25
+METADATA_SHRINK_REFUSAL_MIN_BYTES = 2000
+
+
+def _refuse_drastic_metadata_shrink(new_data: dict) -> None:
+    """Pure enough to unit test directly: raises if `new_data` would replace an existing on-disk
+    metadata.json with something implausibly smaller. No-ops on a fresh install (nothing to
+    protect) and on an already-tiny existing file (too noisy to be worth guarding)."""
+    if os.environ.get("SESSION_HUB_ALLOW_METADATA_SHRINK"):
+        return
+    if not METADATA_PATH.exists():
+        return
+    try:
+        current_size = METADATA_PATH.stat().st_size
+    except OSError:
+        return
+    if current_size < METADATA_SHRINK_REFUSAL_MIN_BYTES:
+        return
+    new_size = len(json.dumps(new_data, ensure_ascii=False).encode("utf-8"))
+    if new_size < current_size * METADATA_SHRINK_REFUSAL_RATIO:
+        raise RuntimeError(
+            f"write_metadata refused: new metadata is {new_size}B, under "
+            f"{METADATA_SHRINK_REFUSAL_RATIO:.0%} of the {current_size}B already at "
+            f"{METADATA_PATH} -- this looks like an accidental overwrite, not an intended purge. "
+            "Set SESSION_HUB_ALLOW_METADATA_SHRINK=1 to proceed anyway."
+        )
+
+
 def write_metadata(data: dict) -> None:
+    _refuse_drastic_metadata_shrink(data)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     backup_metadata_once_per_day()
     temp = METADATA_PATH.with_suffix(".tmp")
@@ -2396,6 +2894,7 @@ def discover_sessions(metadata: dict) -> list[Session]:
         session for session in visible if session.native_key not in group_hidden
     ] + group_pseudo_sessions
 
+    flush_persistent_scan_index()
     return sorted(visible, key=lambda item: item.updated_ms, reverse=True)
 
 
@@ -2716,6 +3215,79 @@ def tmux_live_session_names() -> frozenset[str]:
     return frozenset(line for line in result.stdout.splitlines() if line)
 
 
+def tmux_pane_activity_snapshot() -> dict[str, tuple[str, str]]:
+    """One bounded `tmux list-panes -a` call: {session_name: (pane_id, window_activity)}.
+
+    `window_activity` is tmux's own last-output timestamp for the pane's window --
+    free (already tracked by the tmux server for every pane, no opt-in option
+    needed), so comparing it against a previous snapshot tells us whether a pane's
+    content changed since last look without ever calling capture-pane. task-2142's
+    "capture only changed panes" requirement is built on this: a session whose
+    window_activity is unchanged needs no fresh capture at all.
+    """
+    tmux = shutil.which("tmux")
+    if not tmux:
+        return {}
+    try:
+        result = subprocess.run(
+            [tmux, "list-panes", "-a", "-F", "#{session_name}\t#{pane_id}\t#{window_activity}"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if result.returncode != 0:
+        return {}
+    snapshot: dict[str, tuple[str, str]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        name, pane_id, activity = parts
+        # A tmux session can have several windows/panes; the group-row/standalone
+        # launch paths always create exactly one, but if more than one somehow
+        # exists for a name, keep the FIRST (list-panes' own window/pane order),
+        # not the last -- deterministic rather than whichever happened to sort last.
+        snapshot.setdefault(name, (pane_id, activity))
+    return snapshot
+
+
+def capture_changed_panes(pane_ids: dict[str, str]) -> dict[str, str]:
+    """Batch-capture several panes' text in ONE tmux client invocation.
+
+    `pane_ids` maps an arbitrary key (here, the tmux session name) to its %pane-id.
+    tmux's CLI accepts several commands chained by a literal ';' argv token in one
+    invocation; injecting a unique `display-message -p <marker>` between each
+    `capture-pane -p` gives an unambiguous split point in the combined stdout, so N
+    changed panes cost exactly one subprocess spawn -- never N -- matching the
+    brief's "batch all changed pane IDs into one bounded tmux client invocation."
+    """
+    tmux = shutil.which("tmux")
+    if not tmux or not pane_ids:
+        return {}
+    marker = f"@@@SHPANE-{uuid.uuid4().hex}@@@"
+    args = [tmux]
+    for index, pane_id in enumerate(pane_ids.values()):
+        if index > 0:
+            args += [";", "display-message", "-p", marker, ";"]
+        args += ["capture-pane", "-p", "-t", pane_id]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if result.returncode != 0:
+        return {}
+    parts = result.stdout.split(marker)
+    keys = list(pane_ids.keys())
+    if len(parts) != len(keys):
+        # A capture that failed mid-batch (a pane vanished between the census and
+        # this call) desynchronizes the split count -- fail closed to no update
+        # rather than mis-attributing one pane's text to another's cache entry.
+        return {}
+    return dict(zip(keys, parts))
+
+
 def tmux_session_alive(name: str, live_names: frozenset[str] | None = None) -> bool:
     """Is a tmux session named `name` currently alive.
 
@@ -2860,11 +3432,13 @@ def hook_notify_command() -> list[str]:
     return [sys.executable, str(Path(__file__).resolve()), "--hook-notify"]
 
 
-def write_session_status(session_id: str, state: str, detail: str = "") -> None:
+def write_session_status(session_id: str, state: str, detail: str = "", reason: str = "") -> None:
     STATUS_DIR.mkdir(parents=True, exist_ok=True)
     path = STATUS_DIR / f"{session_id}.json"
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"state": state, "ts": time.time(), "detail": detail}))
+    tmp.write_text(
+        json.dumps({"state": state, "ts": time.time(), "detail": detail, "reason": reason})
+    )
     tmp.replace(path)
 
 
@@ -2875,34 +3449,22 @@ def read_session_status(session_id: str) -> dict | None:
         return None
 
 
-def all_session_statuses() -> list[tuple[str, dict]]:
-    """Every known (session_id, status) pair, newest first.
-
-    The single source both the Status column and the Recent-activity strip
-    read from - one writer (write_session_status), two readers, no separate
-    log to drift out of sync with it.
-    """
-    if not STATUS_DIR.is_dir():
-        return []
-    entries = []
-    for path in STATUS_DIR.glob("*.json"):
-        try:
-            entries.append((path.stem, json.loads(path.read_text())))
-        except (OSError, ValueError):
-            continue
-    entries.sort(key=lambda entry: entry[1].get("ts", 0), reverse=True)
-    return entries
+# Notification types that are a genuine blocker on the agent - the ONLY
+# reasons a status file may legitimately carry state="needs_input". A record
+# with state="needs_input" and a reason outside this set (or no "reason" key
+# at all - every file written before this set existed) is not trustworthy
+# evidence of a real blocker and must fail closed to Idle; see
+# _resolve_claude_state.
+_BLOCKING_NOTIFICATION_TYPES = {"permission_prompt", "agent_needs_input"}
 
 
-_NEEDS_INPUT_NOTIFICATION_TYPES = {"idle_prompt", "permission_prompt", "agent_needs_input"}
-
-
-def hook_event_to_status(payload: dict) -> tuple[str, str] | None:
-    """(state, detail) for one hook stdin payload, or None if this event
-    doesn't change status - see hook_notify_cli."""
+def hook_event_to_status(payload: dict) -> tuple[str, str, str] | None:
+    """(state, detail, reason) for one hook stdin payload, or None if this
+    event doesn't change status - see hook_notify_cli. `reason` is the raw
+    notification_type behind a "needs_input" state, "" otherwise."""
     event = payload.get("hook_event_name")
     if event == "UserPromptSubmit":
-        return "working", ""
+        return "working", "", ""
     if event == "SessionStart":
         # Fires for plain "startup" too, but also for "resume"/"compact"/
         # "clear" - a /compact or a scheduled wakeup resume isn't the agent
@@ -2912,13 +3474,18 @@ def hook_event_to_status(payload: dict) -> tuple[str, str] | None:
         return None
     if event == "Notification":
         notification_type = payload.get("notification_type", "")
-        if notification_type in _NEEDS_INPUT_NOTIFICATION_TYPES:
-            return "needs_input", str(payload.get("message", ""))
+        message = str(payload.get("message", ""))
+        if notification_type == "idle_prompt":
+            # A live agent sitting at its own idle prompt is Idle, never
+            # Needs input - there is no actual blocker here.
+            return "idle", message, ""
+        if notification_type in _BLOCKING_NOTIFICATION_TYPES:
+            return "needs_input", message, notification_type
         if notification_type == "agent_completed":
-            return "done", str(payload.get("message", ""))
+            return "done", message, ""
         return None
     if event == "Stop":
-        return "done", str(payload.get("last_assistant_message", ""))
+        return "done", str(payload.get("last_assistant_message", "")), ""
     return None
 
 
@@ -3271,16 +3838,6 @@ def session_activity(
     computes it through, so no provider branch can diverge or silently
     return blank (see status_pipeline_plan.md's contract).
 
-    The recent-activity strip (_refresh_activity_list) is NOT one of these
-    callers - it is a history log of past write_session_status events, each
-    already carrying its own (state, detail, ts) from the moment it was
-    written, not a live "what is this session doing right now" readout.
-    Recomputing each historical row's CURRENT verdict here would replace what
-    the log is for (what happened, and when) with today's live state,
-    silently rewriting history on every refresh. It shares this function's
-    activity_label() vocabulary so the two surfaces render identically, but
-    intentionally not the verdict computation itself.
-
     Liveness is a separate fact from activity (also per that contract) and is
     checked here only to keep transcript parsing bounded to rows that are
     actually running: `session_is_tracked_alive` is Claude's own best-effort
@@ -3303,8 +3860,21 @@ def session_activity(
     if session.provider == "Codex":
         return _codex_activity(session, status)
     if not status:
-        return "unknown", ""
-    return status.get("state", "unknown"), status.get("detail", "")
+        # Live Claude session, no status file yet (just launched, no hook
+        # event has fired) - "no submitted work" is Idle, not Unknown.
+        return "idle", ""
+    return _resolve_claude_state(status), status.get("detail", "")
+
+
+def _resolve_claude_state(status: dict) -> str:
+    """The status file's state, with a needs_input record lacking an
+    explicit blocking reason failed closed to idle - see
+    _BLOCKING_NOTIFICATION_TYPES. Covers both a legacy record written before
+    "reason" existed (no key at all) and any other non-blocking reason."""
+    state = status.get("state", "unknown")
+    if state == "needs_input" and status.get("reason") not in _BLOCKING_NOTIFICATION_TYPES:
+        return "idle"
+    return state
 
 
 ACTIVITY_LABELS = {
@@ -5971,8 +6541,25 @@ class SessionHub(QMainWindow):
         self.usage_widgets: dict[str, list[tuple[QLabel, QProgressBar, QLabel]]] = {}
         self.usage_headers: dict[str, QLabel] = {}
         self.usage_workers: dict[str, UsageWorker] = {}
+        # task-2142: compact one-line usage summary (label + tiny bar per
+        # enabled provider). The full per-window grid is now the "Expand"
+        # detail view, hidden until the user opens it - deliberately not a
+        # saved setting, so every launch starts compact.
+        self.usage_compact_labels: dict[str, QLabel] = {}
+        self.usage_compact_bars: dict[str, QProgressBar] = {}
         self.thread_pool = QThreadPool.globalInstance()
         self.group_dialogs: dict[str, "ManageGroupDialog"] = {}
+        # task-2142: per-tmux-session-name pane census cache, keyed by the same
+        # `row["name"]` the rest of the Running machinery already uses. Persists
+        # across refresh_running_tab calls so an unchanged pane costs zero
+        # capture-pane invocations (window_activity alone tells us it changed).
+        self._pane_activity_cache: dict[str, str] = {}
+        self._pane_block_cache: dict[str, str] = {}
+        # task-2142 row453 REWORK (orchestrator search REWORK): every saved group row's
+        # identity, rebuilt once per refresh() straight from already-loaded metadata (no
+        # subprocess) -- what apply_filter's All Sessions branch searches to surface a
+        # matching member as its own directly-activatable row.
+        self._search_member_rows: list[tuple[str, str, str | None, str, str]] = []
         self.setWindowTitle("Session Hub")
         self.setWindowIcon(
             QIcon(str(APP_ICON)) if APP_ICON.is_file() else QIcon.fromTheme("utilities-terminal")
@@ -6000,8 +6587,36 @@ class SessionHub(QMainWindow):
         self._codex_notify_warned = False
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(2000)
-        self._status_timer.timeout.connect(self.refresh_running_tab)
+        self._status_timer.timeout.connect(self._on_running_status_tick)
         self._status_timer.start()
+
+    def _running_tab_visible(self) -> bool:
+        """task-2142: the tmux census (session-level list-sessions AND the pane-level
+        activity/capture below) only earns its cost while a human could actually see
+        the result -- window minimized or another tab selected means nobody is
+        looking, so skip the whole tick rather than just the capture step."""
+        return (
+            not self.isMinimized()
+            and self.main_tabs.currentIndex() == self.main_tabs.indexOf(self.running_page)
+        )
+
+    def _on_running_status_tick(self) -> None:
+        if self._running_tab_visible():
+            self.refresh_running_tab()
+            self._check_embedded_terminal_liveness()
+
+    def _on_main_tab_changed(self, _index: int) -> None:
+        # Refresh immediately on becoming visible instead of leaving the table up to
+        # 2s stale after a tab switch -- cheap (one refresh), and it's exactly the
+        # moment a capture is now worth paying for. refresh_running_tab() reapplies
+        # the current query itself; the All Sessions branch needs an explicit
+        # apply_filter() since nothing else refreshes it on tab switch (task-2142
+        # row453 REWORK -- orchestrator search REWORK: "filters whichever tab is
+        # visible" must also cover switching TO a tab with a query already typed).
+        if self._running_tab_visible():
+            self.refresh_running_tab()
+        else:
+            self.apply_filter()
 
     def build_ui(self) -> None:
         root = QWidget()
@@ -6041,12 +6656,57 @@ class SessionHub(QMainWindow):
             toolbar.addWidget(button)
         layout.addLayout(toolbar)
 
+        usage_compact = QHBoxLayout()
+        usage_compact.setSpacing(10)
+        for provider in PROVIDERS:
+            label = QLabel(provider)
+            label.setStyleSheet("font-size: 11px; color: #aaa;")
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            # Centered remaining-% text at the SAME fixed size (task-2142 row453
+            # REWORK -- orchestrator visual REWORK): setAlignment/setFormat change
+            # what's drawn inside the existing 60x8 rect, never its geometry.
+            bar.setTextVisible(True)
+            bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            bar.setFormat("…")
+            bar.setFixedSize(60, 8)
+            bar.setToolTip("Loading…")
+            usage_compact.addWidget(label)
+            usage_compact.addWidget(bar)
+            self.usage_compact_labels[provider] = label
+            self.usage_compact_bars[provider] = bar
+        usage_compact.addStretch(1)
+        self.usage_expand_button = QPushButton("Expand")
+        self.usage_expand_button.clicked.connect(lambda: self.set_usage_expanded(True))
+        usage_compact.addWidget(self.usage_expand_button)
+        # Wrapped in a QWidget (task-2142 row453 REWORK -- orchestrator visual
+        # REWORK) so the WHOLE compact strip -- labels, bars, Expand button --
+        # can be hidden as one unit once expanded; a bare QHBoxLayout has no
+        # setVisible of its own.
+        self.usage_compact_row = QWidget()
+        self.usage_compact_row.setLayout(usage_compact)
+        layout.addWidget(self.usage_compact_row)
+
         usage_frame = QFrame()
         usage_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        usage_frame.setVisible(False)
+        self.usage_detail_frame = usage_frame
         usage_layout = QGridLayout(usage_frame)
         usage_layout.setContentsMargins(12, 8, 12, 8)
         usage_layout.setHorizontalSpacing(18)
         usage_layout.setVerticalSpacing(4)
+        # Collapse lives in the expanded panel's OWN header row (top-right,
+        # alongside the per-provider header labels below), never a separate
+        # row of its own (task-2142 row453 REWORK -- orchestrator visual
+        # REWORK). Being a child of usage_frame, it hides for free whenever
+        # usage_frame does.
+        self.usage_collapse_button = QPushButton("Collapse")
+        self.usage_collapse_button.clicked.connect(lambda: self.set_usage_expanded(False))
+        usage_layout.addWidget(
+            self.usage_collapse_button, 0, len(PROVIDERS) * 2, 1, 1,
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
+        )
         for column, provider in enumerate(PROVIDERS):
             offset = column * 2
             header = QLabel(f"<b>{provider} usage</b>")
@@ -6158,9 +6818,16 @@ class SessionHub(QMainWindow):
         running_page = QWidget()
         running_layout = QVBoxLayout(running_page)
         running_layout.setContentsMargins(0, 0, 0, 0)
-        self.running_table = QTableWidget(0, 5)
-        self.running_table.setHorizontalHeaderLabels(
-            ["Project", "Name", "Provider", "Status", "Last message"]
+
+        running_list_page = QWidget()
+        running_list_layout = QVBoxLayout(running_list_page)
+        running_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.running_table = QTableWidget(0, 3)
+        self.running_table.setHorizontalHeaderLabels(["Name", "Status", "Last message"])
+        self.running_table.setToolTip(
+            "Click, Enter or double-click a row to attach the embedded terminal on the right.\n"
+            "Ctrl+Shift+O or right-click → Open externally opens that row's terminal in its "
+            "own window."
         )
         self.running_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.running_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -6168,42 +6835,69 @@ class SessionHub(QMainWindow):
         self.running_table.setAlternatingRowColors(True)
         self.running_table.verticalHeader().setVisible(False)
         self.running_table.horizontalHeader().setStretchLastSection(True)
-        self.running_table.cellDoubleClicked.connect(self.reveal_running_row)
+        # task-2142 row453: single click, Enter and double-click all converge on the same exact
+        # embedded-terminal switch -- itemActivated already fires for both Enter and double-click
+        # in Qt, so only itemClicked (single click) needs a second connection.
+        self.running_table.itemClicked.connect(self._activate_running_row)
+        self.running_table.itemActivated.connect(self._activate_running_row)
         self.running_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.running_table.customContextMenuRequested.connect(self.running_context_menu)
-        running_layout.addWidget(self.running_table, 1)
+        running_list_layout.addWidget(self.running_table, 1)
         running_actions = QHBoxLayout()
         running_actions.addStretch(1)
         stop_button = QPushButton("Stop")
         stop_button.clicked.connect(self.stop_selected_running)
         running_actions.addWidget(stop_button)
-        running_layout.addLayout(running_actions)
+        running_list_layout.addLayout(running_actions)
 
-        activity_label = QLabel("Recent activity")
-        activity_label.setStyleSheet("color: #888;")
-        running_layout.addWidget(activity_label)
-        self.activity_list = QListWidget()
-        self.activity_list.setMaximumHeight(160)
-        self.activity_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        # itemActivated covers both double-click (the same activation gesture Running's
-        # cellDoubleClicked uses) and Enter/Return on the current item - one signal, one
-        # handler, for both the mouse and keyboard paths (task-2135).
-        self.activity_list.itemActivated.connect(self.activate_activity_item)
-        running_layout.addWidget(self.activity_list)
+        running_terminal_page = QWidget()
+        running_terminal_stack = QStackedLayout(running_terminal_page)
+        self.running_terminal_placeholder = QLabel("Select a session to attach a terminal.")
+        self.running_terminal_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.running_terminal_failure = QLabel()
+        self.running_terminal_failure.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.running_terminal_failure.setWordWrap(True)
+        self.running_terminal_container = _EmbeddedTerminalContainer(
+            self._on_terminal_container_resize
+        )
+        running_terminal_stack.addWidget(self.running_terminal_placeholder)
+        running_terminal_stack.addWidget(self.running_terminal_failure)
+        running_terminal_stack.addWidget(self.running_terminal_container)
+        self._running_terminal_stack = running_terminal_stack
+        self._embedded_terminal = EmbeddedTerminalController(self.running_terminal_container)
+        self._embedded_terminal_meta: dict[str, tuple[str, str | None]] = {}
+
+        running_splitter = QSplitter(Qt.Orientation.Horizontal)
+        running_splitter.addWidget(running_list_page)
+        running_splitter.addWidget(running_terminal_page)
+        running_splitter.setStretchFactor(0, 0)
+        running_splitter.setStretchFactor(1, 1)
+        running_splitter.splitterMoved.connect(
+            lambda *_a: self._on_terminal_container_resize()
+        )
+        running_layout.addWidget(running_splitter, 1)
+
+        external_shortcut = QShortcut(QKeySequence("Ctrl+Shift+O"), running_page)
+        external_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        external_shortcut.activated.connect(self.open_selected_running_externally)
 
         tabs = QTabWidget()
         tabs.addTab(all_sessions_page, "All Sessions")
         tabs.addTab(running_page, "Running")
+        self.main_tabs = tabs
+        self.running_page = running_page
+        tabs.currentChanged.connect(self._on_main_tab_changed)
         layout.addWidget(tabs, 1)
         self.setCentralWidget(root)
 
         refresh_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F5), self)
         refresh_shortcut.activated.connect(self.refresh_all)
 
-        settings_menu = self.menuBar().addMenu("Settings")
-        permissions_action = QAction("Launch permissions…", self)
-        permissions_action.triggered.connect(self.open_settings)
-        settings_menu.addAction(permissions_action)
+        # No top-left menubar (task-2142 row453 REWORK -- orchestrator layout REWORK): it only
+        # ever held a "Launch permissions…" entry wired to the exact same `open_settings` the
+        # toolbar's own Settings button (below, top-right of the toolbar row) already calls --
+        # a redundant blank row for a duplicate entry point. `self.menuBar()` is never called at
+        # all now, so QMainWindow never allocates one.
 
     def settings(self) -> dict:
         return self.metadata.setdefault("settings", {})
@@ -6218,6 +6912,10 @@ class SessionHub(QMainWindow):
             self.settings().pop("window_geometry", None)
 
     def closeEvent(self, event) -> None:
+        # task-2142 row453: end only the embedded xterm CLIENT process -- detach() never touches
+        # tmux, so the session it was attached to (if any) stays running headless exactly as if
+        # the user had detached it themselves.
+        self._embedded_terminal.detach()
         if QApplication.platformName() != "offscreen":
             latest = read_metadata()
             latest.setdefault("settings", {}).update(self.settings())
@@ -6240,6 +6938,20 @@ class SessionHub(QMainWindow):
                     label.setVisible(enabled)
                     bar.setVisible(enabled)
                     detail.setVisible(enabled)
+            if provider in self.usage_compact_labels:
+                self.usage_compact_labels[provider].setVisible(enabled)
+                self.usage_compact_bars[provider].setVisible(enabled)
+
+    def set_usage_expanded(self, expanded: bool) -> None:
+        """Transient only - never written to settings, so every fresh
+        launch (or window reload) starts back in the compact view. Mutual
+        exclusion both directions (task-2142 row453 REWORK -- orchestrator
+        visual REWORK): expanding hides the compact strip entirely (labels,
+        bars, Expand button) so only the detailed per-window bars remain;
+        collapsing (via the button living inside the expanded panel's own
+        header) restores only the compact strip."""
+        self.usage_detail_frame.setVisible(expanded)
+        self.usage_compact_row.setVisible(not expanded)
 
     def update_new_provider_list(self) -> None:
         settings = self.settings()
@@ -6468,6 +7180,12 @@ class SessionHub(QMainWindow):
                 bar.setFormat("Loading…")
                 bar.setStyleSheet("")
                 detail.setText("")
+            if provider in self.usage_compact_bars:
+                compact_bar = self.usage_compact_bars[provider]
+                compact_bar.setValue(0)
+                compact_bar.setStyleSheet("")
+                compact_bar.setFormat("…")
+                compact_bar.setToolTip("Loading…")
             worker = UsageWorker(provider)
             worker.signals.finished.connect(self.usage_loaded)
             self.usage_workers[provider] = worker
@@ -6559,6 +7277,38 @@ class SessionHub(QMainWindow):
                     "QProgressBar { text-align: center; } "
                     f"QProgressBar::chunk {{ background-color: {color}; }}"
                 )
+        self._sync_usage_compact(provider, error)
+
+    def _sync_usage_compact(self, provider: str, error: str) -> None:
+        """Mirror the worst (most-used) visible window onto the compact
+        one-line bar; the reset/pace detail lives in its tooltip instead of
+        the always-visible full grid this replaces."""
+        compact_bar = self.usage_compact_bars.get(provider)
+        if compact_bar is None:
+            return
+        worst: tuple[int, str] | None = None
+        tooltip_lines = []
+        for label, bar, detail in self.usage_widgets[provider]:
+            if bar.isHidden():
+                continue
+            if "% left" in bar.format():
+                remaining = bar.value()
+                if worst is None or remaining < worst[0]:
+                    worst = (remaining, bar.styleSheet())
+                detail_text = detail.text().replace("\n", " · ")
+                tooltip_lines.append(f"{label.text()}: {bar.format()} ({detail_text})")
+            elif "requests" in bar.format():
+                tooltip_lines.append(f"{label.text()}: {bar.format()} ({detail.text()})")
+        if worst is not None:
+            compact_bar.setValue(worst[0])
+            compact_bar.setStyleSheet(worst[1])
+            compact_bar.setFormat(f"{worst[0]}%")
+        elif error:
+            compact_bar.setValue(0)
+            compact_bar.setStyleSheet("")
+            compact_bar.setFormat("—")
+        compact_bar.setToolTip("\n".join(tooltip_lines) if tooltip_lines else (error or "Unavailable"))
+
     @staticmethod
     def set_usage_row_visible(
         row: tuple[QLabel, QProgressBar, QLabel], visible: bool
@@ -6755,6 +7505,12 @@ class SessionHub(QMainWindow):
     def refresh(self) -> None:
         self.metadata = read_metadata()
         self.sessions = discover_sessions(self.metadata)
+        self._search_member_rows = [
+            (cwd, row["name"], row.get("session_key"), row.get("provider", "Claude"),
+             group.get("display_name") or Path(cwd).name or cwd)
+            for cwd, group in self.metadata.get("groups", {}).items()
+            for row in group.get("rows", [])
+        ]
         self.populate_session_table(self.table, self.sessions, self.SESSION_TABLE_COLUMNS)
         self.table.sortItems(
             self.SESSION_TABLE_COLUMNS.index("Last updated"), Qt.SortOrder.DescendingOrder
@@ -6810,16 +7566,41 @@ class SessionHub(QMainWindow):
                     {"name": name, "provider": session.provider}, session,
                 ))
 
+        # task-2142: Last-message census. One list-panes call for every row's
+        # window_activity; only names whose activity changed since the cached value
+        # get captured, and every changed name is captured in ONE batched tmux
+        # invocation (capture_changed_panes), not one spawn per row.
+        pane_snapshot = tmux_pane_activity_snapshot()
+        changed_pane_ids: dict[str, str] = {}
+        for _dn, _cwd, row, _m in running:
+            entry = pane_snapshot.get(row["name"])
+            if not entry:
+                continue
+            pane_id, activity = entry
+            if self._pane_activity_cache.get(row["name"]) != activity:
+                changed_pane_ids[row["name"]] = pane_id
+        captured = capture_changed_panes(changed_pane_ids)
+        for name, raw_text in captured.items():
+            self._pane_block_cache[name] = extract_last_meaningful_block(raw_text)
+            self._pane_activity_cache[name] = pane_snapshot[name][1]
+
+        name_counts = collections.Counter(row["name"] for _dn, _cwd, row, _m in running)
         self.running_table.setRowCount(len(running))
         for index, (display_name, cwd, row, match) in enumerate(running):
             session_id = match.session_id if match else None
-            project_item = QTableWidgetItem(display_name)
-            project_item.setData(Qt.ItemDataRole.UserRole, (cwd, row["name"], session_id))
-            self.running_table.setItem(index, 0, project_item)
-            self.running_table.setItem(index, 1, QTableWidgetItem(row["name"]))
-            self.running_table.setItem(
-                index, 2, QTableWidgetItem(row.get("provider", "Claude"))
+            provider = row.get("provider", "Claude")
+            name_item = QTableWidgetItem(
+                row["name"]
+                if name_counts[row["name"]] <= 1
+                # A visible name collision (same row name, different project) gets a
+                # parenthetical project suffix so the two rows are distinguishable at
+                # a glance - full identity (provider/project/cwd) lives in the tooltip
+                # rather than cluttering every row with it.
+                else f"{row['name']}  ({display_name})"
             )
+            name_item.setData(Qt.ItemDataRole.UserRole, (cwd, row["name"], session_id))
+            name_item.setToolTip(f"{provider} · {display_name} · {cwd}")
+            self.running_table.setItem(index, 0, name_item)
             # Every row here is already confirmed tmux-alive (group_row_status/
             # standalone_tmux_status above), so session_activity's own liveness
             # check always passes - it still goes through the one shared verdict
@@ -6828,16 +7609,20 @@ class SessionHub(QMainWindow):
             # JSON verdicts for the same session. Read-only: refresh must never
             # write status itself (status_pipeline_plan.md's contract) - the
             # only writer is the hook pipeline (write_session_status).
-            state, detail = (
+            state, _detail = (
                 session_activity(match, tmux_enabled=True, tmux_name=row["name"], live_names=live_names)
                 if match else ("unknown", "")
             )
-            self.running_table.setItem(index, 3, self._status_column_item(state))
-            self.running_table.setItem(index, 4, self._detail_column_item(detail))
-        live_by_id = {
-            match.session_id: (cwd, row["name"]) for _dn, cwd, row, match in running if match
-        }
-        self._refresh_activity_list(live_by_id)
+            self.running_table.setItem(index, 1, self._status_column_item(state))
+            # Last message is the latest meaningful terminal-output block (the pane
+            # census above), never session_activity's status detail -- the brief's
+            # explicit distinction (task-2142).
+            last_message = self._pane_block_cache.get(row["name"], "")
+            self.running_table.setItem(index, 2, self._detail_column_item(last_message))
+        # Reapply whatever query is currently typed (task-2142 row453 REWORK -- orchestrator
+        # search REWORK): this repopulates every 2s via _on_running_status_tick, and a search
+        # must keep filtering the live rows rather than reverting to unfiltered on the next tick.
+        self._apply_running_filter(self.search.text().strip().lower())
 
     def _status_column_item(self, state: str) -> QTableWidgetItem:
         label, color = activity_label(state)
@@ -6853,52 +7638,6 @@ class SessionHub(QMainWindow):
         if detail:
             item.setToolTip(detail)
         return item
-
-    def _refresh_activity_list(self, live_by_id: dict[str, tuple[str, str]]) -> None:
-        """Recent-activity strip: a history log of raw write_session_status
-        events (each entry's own recorded state/detail/ts), deliberately NOT
-        routed through session_activity's CURRENT-state verdict - see that
-        function's docstring for why a log of past events must not be
-        rewritten to today's live state. Shares only activity_label() so the
-        two surfaces render identically.
-
-        `live_by_id` is exactly the (cwd, name) pair the current refresh's
-        running-row resolution assigned to a session_id (task-2135) - not a
-        display-name lookup. An entry whose session_id is not a key here is
-        stale/stopped/historical: it gets no identity data at all, so
-        activate_activity_item() below is inert for it by construction
-        rather than guessing a same-name row or a different linked member.
-        """
-        self.activity_list.clear()
-        for session_id, status in all_session_statuses()[:20]:
-            label, color = activity_label(status.get("state"))
-            if not label:
-                continue
-            when = datetime.fromtimestamp(status.get("ts", 0)).strftime("%H:%M:%S")
-            detail = " ".join(status.get("detail", "").split())[:80]
-            live = live_by_id.get(session_id)
-            name = live[1] if live else session_id[:8]
-            text = f"{when}  {name}  {label}" + (f" — {detail}" if detail else "")
-            entry = QListWidgetItem(text)
-            entry.setForeground(QColor(color))
-            entry.setData(
-                Qt.ItemDataRole.UserRole,
-                (live[0], live[1], session_id) if live else None,
-            )
-            self.activity_list.addItem(entry)
-
-    def activate_activity_item(self, item: QListWidgetItem) -> None:
-        """Recent-activity double-click/Enter: focus the row's live session
-        through the exact same authority as Running (task-2135). A stale,
-        stopped or historical entry carries no identity data (see
-        _refresh_activity_list) and is inert here - it never starts a new
-        session, resumes a different linked member, or focuses an unrelated
-        same-name row."""
-        identity = item.data(Qt.ItemDataRole.UserRole)
-        if not identity:
-            return
-        cwd, name, session_id = identity
-        self._focus_or_resume_session(cwd, name, session_id)
 
     def stop_selected_running(self) -> None:
         row = self.running_table.currentRow()
@@ -6958,12 +7697,121 @@ class SessionHub(QMainWindow):
         threading.Thread(target=focus_window_by_title, args=(name,), daemon=True).start()
 
     def reveal_running_row(self, row: int, _column: int = 0) -> None:
-        """Double-click a Running row: bring its terminal to the front."""
+        """Open externally: bring a Running row's own terminal window to the front (or open one),
+        never the embedded panel. Reachable via the context menu action and the Ctrl+Shift+O
+        shortcut (task-2142 row453) -- single click/Enter/double-click switch the embedded panel
+        instead, see `_activate_running_row`."""
         item = self.running_table.item(row, 0)
         if not item:
             return
         cwd, name, session_id = item.data(Qt.ItemDataRole.UserRole)
         self._focus_or_resume_session(cwd, name, session_id)
+
+    def open_selected_running_externally(self) -> None:
+        """Ctrl+Shift+O: `reveal_running_row` for the currently selected row."""
+        row = self.running_table.currentRow()
+        if row < 0:
+            return
+        self.reveal_running_row(row)
+
+    def _activate_running_row(self, item) -> None:
+        """Single click, Enter or double-click on a Running row (task-2142 row453): switch the
+        embedded terminal panel to that exact tmux session. `itemActivated` already fires for both
+        Enter and double-click in Qt, so this one handler covers all three gestures."""
+        row = item.row()
+        name_item = self.running_table.item(row, 0)
+        if not name_item:
+            return
+        cwd, name, session_id = name_item.data(Qt.ItemDataRole.UserRole)
+        self._switch_embedded_terminal(cwd, name, session_id)
+
+    def _switch_embedded_terminal(self, cwd: str, name: str, session_id: str | None) -> None:
+        if (self._embedded_terminal.current_name == name
+                and self._embedded_terminal.poll_alive()):
+            return  # already attached to this exact session -- no needless restart
+        ok, detail = self._embedded_terminal.begin_attach(name)
+        if not ok:
+            self._show_embed_failure(cwd, name, session_id, detail)
+            return
+        self._await_embed_xid(cwd, name, session_id)
+
+    def _await_embed_xid(self, cwd: str, name: str, session_id: str | None) -> None:
+        """Waits for the helper's one `XID=` stdout line EVENT-DRIVEN via QSocketNotifier, with a
+        bounded 3s singleShot (never periodic/recurring) timeout fallback -- never a blocking read
+        on the GUI thread (task-2142 row453 REWORK -- orchestrator audit, 2026-08-30)."""
+        process = self._embedded_terminal.process
+        generation = self._embedded_terminal.generation
+        notifier = QSocketNotifier(process.stdout.fileno(), QSocketNotifier.Type.Read, self)
+        timeout_timer = QTimer(self)
+        timeout_timer.setSingleShot(True)
+        state = {"done": False}
+
+        def finish(line: str | None) -> None:
+            if state["done"]:
+                return
+            state["done"] = True
+            notifier.setEnabled(False)
+            notifier.deleteLater()
+            timeout_timer.stop()
+            timeout_timer.deleteLater()
+            self._finish_embed_attach(cwd, name, session_id, line, generation)
+
+        notifier.activated.connect(lambda _fd: finish(process.stdout.readline()))
+        timeout_timer.timeout.connect(lambda: finish(None))
+        timeout_timer.start(3000)
+        # Keep references alive -- an unreferenced QSocketNotifier/QTimer can be garbage
+        # collected out from under Qt before it ever fires.
+        self._embed_await_notifier = notifier
+        self._embed_await_timer = timeout_timer
+
+    def _finish_embed_attach(self, cwd: str, name: str, session_id: str | None,
+                              line: str | None, generation: int | None = None) -> None:
+        ok, detail = self._embedded_terminal.finish_attach(line, generation)
+        if ok is None:
+            # A newer attach (a different row clicked before this one's XID/timeout
+            # arrived) already superseded this generation -- the current controller
+            # state belongs to that newer attach; touch nothing here (task-2142
+            # row453 REWORK -- reviewer rework, stale-attach race).
+            return
+        if ok:
+            # finish_attach() already resized the child to the container's exact current size --
+            # no need for a second _on_terminal_container_resize() call here.
+            self._embedded_terminal_meta[name] = (cwd, session_id)
+            self._running_terminal_stack.setCurrentWidget(self.running_terminal_container)
+        else:
+            self._show_embed_failure(cwd, name, session_id, detail)
+
+    def _show_embed_failure(self, cwd: str, name: str, session_id: str | None, detail: str) -> None:
+        self.running_terminal_failure.setText(
+            f"Could not embed a terminal for {name!r}: {detail}\n"
+            "Falling back to an external terminal window."
+        )
+        self._running_terminal_stack.setCurrentWidget(self.running_terminal_failure)
+        self._focus_or_resume_session(cwd, name, session_id)
+
+    def _on_terminal_container_resize(self) -> None:
+        """Re-fill the panel on container resize AND splitter drag (task-2142 row453 REWORK) --
+        wired from `_EmbeddedTerminalContainer.resizeEvent` and `running_splitter.splitterMoved`.
+        A plain attribute lookup rather than a direct bound-method reference at construction time,
+        so this can be wired before `self._embedded_terminal` exists yet."""
+        if hasattr(self, "_embedded_terminal"):
+            self._embedded_terminal.resize_to_container()
+
+    def _check_embedded_terminal_liveness(self) -> None:
+        """The embedded terminal's helper process can exit on its own (tmux session ended, the
+        helper crashed) -- caught here, folded into the EXISTING 2s `_status_timer` tick rather
+        than a dedicated poll timer (task-2142 row453 REWORK; a prior version added its own 1s
+        timer, which the brief's no-new-periodic-poll rule forbids), so the panel never silently
+        keeps showing a dead terminal, and falls back to an external terminal window exactly like
+        a failed attach does."""
+        name = self._embedded_terminal.current_name
+        if name is None or self._embedded_terminal.poll_alive():
+            return
+        cwd, session_id = self._embedded_terminal_meta.get(name, (None, None))
+        self.running_terminal_failure.setText(f"The embedded terminal for {name!r} exited.")
+        self._running_terminal_stack.setCurrentWidget(self.running_terminal_failure)
+        if cwd is not None:
+            self._focus_or_resume_session(cwd, name, session_id)
 
     def running_context_menu(self, point) -> None:
         """Right-click a Running row: the same exact-identity focus/stop
@@ -6975,24 +7823,94 @@ class SessionHub(QMainWindow):
         row = item.row()
         self.running_table.setCurrentCell(row, 0)
         menu = QMenu(self)
-        bring_up_action = QAction("Bring up window", self)
-        bring_up_action.triggered.connect(lambda: self.reveal_running_row(row))
-        menu.addAction(bring_up_action)
+        external_action = QAction("Open externally", self)
+        external_action.triggered.connect(lambda: self.reveal_running_row(row))
+        menu.addAction(external_action)
         stop_action = QAction("Stop session", self)
         stop_action.triggered.connect(self.stop_selected_running)
         menu.addAction(stop_action)
         menu.exec(self.running_table.viewport().mapToGlobal(point))
 
     def apply_filter(self) -> None:
+        """The search box filters whichever tab is visible (task-2142 row453 REWORK --
+        orchestrator search REWORK): Running gets `_apply_running_filter` (live rows, cached
+        data only, no rescan); All Sessions gets `_apply_all_sessions_filter` (also exposes
+        matching saved group members as directly-activatable rows)."""
         query = self.search.text().strip().lower()
+        if self.main_tabs.currentWidget() is self.running_page:
+            self._apply_running_filter(query)
+        else:
+            self._apply_all_sessions_filter(query)
+
+    def _apply_running_filter(self, query: str) -> None:
+        """Filters `running_table`'s already-populated rows by name, status, last-message
+        text, AND the hidden identity fields (cwd/exact tmux name/session id) carried in
+        column 0's UserRole data -- entirely from what's already rendered/cached, never a new
+        discovery or capture pass (task-2142 row453 REWORK -- orchestrator search REWORK)."""
+        for row in range(self.running_table.rowCount()):
+            name_item = self.running_table.item(row, 0)
+            if not name_item:
+                continue
+            cwd, name, session_id = name_item.data(Qt.ItemDataRole.UserRole)
+            status_item = self.running_table.item(row, 1)
+            detail_item = self.running_table.item(row, 2)
+            haystack = " ".join(
+                str(part) for part in (
+                    name_item.text(), status_item.text() if status_item else "",
+                    detail_item.text() if detail_item else "", cwd, name, session_id,
+                ) if part
+            ).lower()
+            self.running_table.setRowHidden(row, bool(query) and query not in haystack)
+
+    def _apply_all_sessions_filter(self, query: str) -> None:
+        """Text-filters the ordinary grouped rows; a non-empty query additionally surfaces
+        matching saved group members (from `_search_member_rows`, rebuilt once per refresh()
+        with no subprocess) as their own directly-activatable rows, while the group's own
+        collapsed summary row hides during search -- the member row already represents it,
+        and showing both would be the "duplicate" the brief asks to avoid. Clearing the query
+        drops every synthetic row and restores the plain grouped table exactly (task-2142
+        row453 REWORK -- orchestrator search REWORK)."""
+        base_rows = len(self.sessions)
+        if self.table.rowCount() > base_rows:
+            self.table.setRowCount(base_rows)  # drop synthetic member rows from a prior query
+        by_key = {session.key: session for session in self.sessions}
         shown = 0
-        for row in range(self.table.rowCount()):
+        for row in range(base_rows):
+            item0 = self.table.item(row, 0)
+            session = by_key.get(item0.data(Qt.ItemDataRole.UserRole + 1)) if item0 else None
             text = " ".join(
                 self.table.item(row, column).text() for column in range(self.table.columnCount())
             ).lower()
-            visible = not query or query in text
+            if query and session is not None and self.is_group_session(session):
+                visible = False
+            else:
+                visible = not query or query in text
             self.table.setRowHidden(row, not visible)
             shown += int(visible)
+        if query:
+            self.table.setSortingEnabled(False)
+            seen_identities = set()
+            columns = self.SESSION_TABLE_COLUMNS
+            for cwd, name, session_key, provider, display_name in self._search_member_rows:
+                haystack = " ".join(
+                    str(part) for part in (cwd, name, session_key, provider, display_name) if part
+                ).lower()
+                if query not in haystack or (cwd, name) in seen_identities:
+                    continue
+                seen_identities.add((cwd, name))
+                values = {
+                    "Agent": provider, "Model": "", "Name": f"{name}  ({display_name})",
+                    "Working directory": cwd, "Last updated": "", "Session ID": session_key or "",
+                }
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                for col, column in enumerate(columns):
+                    cell = QTableWidgetItem(values.get(column, ""))
+                    if col == 0:
+                        cell.setData(Qt.ItemDataRole.UserRole + 2, (cwd, name, session_key))
+                    self.table.setItem(row, col, cell)
+                shown += 1
+            self.table.setSortingEnabled(True)
         self.status.setText(f"{shown} of {len(self.sessions)} sessions")
 
     def selected(self) -> Session | None:
@@ -7489,7 +8407,22 @@ class SessionHub(QMainWindow):
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(self, "Could not launch session", str(error))
 
+    def _selected_search_member(self) -> tuple[str, str, str | None] | None:
+        """(cwd, name, session_id) if the currently-selected All Sessions row is a search-
+        surfaced group member (task-2142 row453 REWORK -- orchestrator search REWORK), else
+        None. Column 0's UserRole+2 data is only ever set on those synthetic rows."""
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        item = self.table.item(row, 0)
+        return item.data(Qt.ItemDataRole.UserRole + 2) if item else None
+
     def resume_selected(self) -> None:
+        member = self._selected_search_member()
+        if member:
+            cwd, name, session_id = member
+            self._focus_or_resume_session(cwd, name, session_id)
+            return
         session = self.selected()
         if not session:
             return
@@ -8206,8 +9139,14 @@ class SessionHub(QMainWindow):
             return {"status": "error", "message": f"No row named {name!r} in this group"}
         provider = row.get("provider", "Claude")
         use_tmux = self.effective_tmux(group.get("tmux"))
-        if use_tmux and tmux_session_alive(row["name"]):
-            return {"status": "already_running", "name": name}
+        # No tmux-alive short-circuit here (task-2142): a live-but-detached row (no window open)
+        # reaches this function through _focus_or_resume_session precisely because window_titled()
+        # found nothing, and an early "already_running" return used to hand back a status dict
+        # with no terminal ever opened - a silent no-op. Falling through to the history
+        # check/resume_group_row or the fresh self.launch() below is safe regardless of whether
+        # the tmux session is already alive: both route through tmux_group_launch_command, whose
+        # `has-session -t "=name" || new-session ...; attach -t "=name"` script attaches to an
+        # existing session instead of erroring, never spawning a duplicate.
 
         # A pending marker only describes the process that was just launched.
         # If its tmux row is gone, it is stale and must not mask the row's
@@ -8631,10 +9570,22 @@ class SessionHub(QMainWindow):
             return
         self.table.setCurrentCell(item.row(), item.column())
         menu = QMenu(self)
-        for label, slot in self.context_menu_actions():
-            action = QAction(label, self)
-            action.triggered.connect(slot)
+        member = self._selected_search_member()
+        if member:
+            # A search-surfaced group member (task-2142 row453 REWORK -- orchestrator search
+            # REWORK) isn't a full Session -- the rest of context_menu_actions() assumes one.
+            # One action, wired to the same exact-identity launch Enter/double-click use.
+            cwd, name, session_id = member
+            action = QAction("Open", self)
+            action.triggered.connect(
+                lambda: self._focus_or_resume_session(cwd, name, session_id)
+            )
             menu.addAction(action)
+        else:
+            for label, slot in self.context_menu_actions():
+                action = QAction(label, self)
+                action.triggered.connect(slot)
+                menu.addAction(action)
         menu.exec(self.table.viewport().mapToGlobal(point))
 
 

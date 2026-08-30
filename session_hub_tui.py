@@ -204,10 +204,16 @@ class MainPane(Vertical):
         yield DataTable(id="main")
 
     def on_mount(self) -> None:
-        self.refresh_data()
+        # Shell paints immediately with an empty, correctly-columned table;
+        # SessionHubTUI.fetch_sessions() publishes the one shared generation
+        # to this pane (and RunningPane) once the async fetch completes -
+        # see apply_sessions().
+        table = self.query_one("#main", DataTable)
+        table.add_columns("Provider", "Name", "Working directory", "Session ID")
+        table.cursor_type = "row"
 
-    def refresh_data(self) -> None:
-        self.data = sessions_json()
+    def apply_sessions(self, data: dict) -> None:
+        self.data = data
         self.apply_filter(self.query_one("#search", Input).value)
 
     def apply_filter(self, query: str) -> None:
@@ -239,7 +245,7 @@ class MainPane(Vertical):
         self.query_one("#search", Input).focus()
 
     def action_refresh(self) -> None:
-        self.refresh_data()
+        self.app.fetch_sessions()
 
     async def on_data_table_row_selected(self, _event: DataTable.RowSelected) -> None:
         table = self.query_one("#main", DataTable)
@@ -298,10 +304,13 @@ class RunningPane(Vertical):
         yield DataTable(id="running")
 
     def on_mount(self) -> None:
-        self.refresh_data()
+        # See MainPane.on_mount - shell first, shared generation applied by
+        # apply_sessions() once SessionHubTUI.fetch_sessions() completes.
+        table = self.query_one("#running", DataTable)
+        table.add_columns("Project", "Name", "Provider", "Status", "Last message")
+        table.cursor_type = "row"
 
-    def refresh_data(self) -> None:
-        data = sessions_json()
+    def apply_sessions(self, data: dict) -> None:
         self.rows = [
             {
                 "kind": "group", "cwd": cwd, "name": row["name"], "provider": row["provider"],
@@ -355,10 +364,10 @@ class RunningPane(Vertical):
             await asyncio.to_thread(stop_group_row, picked["cwd"], picked["name"])
         else:
             await asyncio.to_thread(stop_session, picked["key"])
-        self.refresh_data()
+        self.app.fetch_sessions()
 
     def action_refresh(self) -> None:
-        self.refresh_data()
+        self.app.fetch_sessions()
 
 
 class UsagePane(VerticalScroll):
@@ -374,14 +383,23 @@ class UsagePane(VerticalScroll):
     def __init__(self) -> None:
         super().__init__()
         self.data: dict = {}
+        self._loaded = False
 
     def compose(self) -> ComposeResult:
-        yield Label("Loading usage…", id="usage-status")
+        yield Label("Usage loads when this tab is opened.", id="usage-status")
 
-    def on_mount(self) -> None:
+    def ensure_loaded(self) -> None:
+        """Usage does no work (no subprocess call) until this tab is first
+        opened - `SessionHubTUI.on_tabbed_content_tab_activated` calls this,
+        not `on_mount`, since TabbedContent mounts every TabPane's children
+        up front regardless of which tab is visible."""
+        if self._loaded:
+            return
+        self._loaded = True
         self.refresh_data()
 
     def action_refresh(self) -> None:
+        self._loaded = True
         self.refresh_data()
 
     @work(exclusive=True)
@@ -442,6 +460,27 @@ class SessionHubTUI(App):
             with TabPane("Usage", id="usage"):
                 yield UsagePane()
         yield Footer()
+
+    def on_mount(self) -> None:
+        # Shell (Header/tabs/empty tables) is already painted by compose()
+        # before this runs; the one shared sessions fetch happens async and
+        # publishes atomically to both MainPane and RunningPane.
+        self.fetch_sessions()
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        if event.pane.id == "usage":
+            self.query_one(UsagePane).ensure_loaded()
+
+    @work(exclusive=True)
+    async def fetch_sessions(self) -> None:
+        data = await asyncio.to_thread(sessions_json)
+        if data.get("status") == "error":
+            # Failure leaves whatever generation the panes already have
+            # (the initial empty shell, or the last good fetch) intact.
+            self.notify(data.get("message", "Failed to refresh sessions"), severity="error")
+            return
+        self.query_one(MainPane).apply_sessions(data)
+        self.query_one(RunningPane).apply_sessions(data)
 
 
 def main() -> int:

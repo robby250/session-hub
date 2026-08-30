@@ -3,6 +3,7 @@ import contextlib
 import io
 import os
 import json
+import select
 import subprocess
 import shutil
 import sys
@@ -33,9 +34,11 @@ os.environ["XDG_DATA_HOME"] = _TEST_XDG_DATA_HOME
 atexit.register(shutil.rmtree, _TEST_XDG_DATA_HOME, ignore_errors=True)
 
 from PyQt6.QtCore import QPoint
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtGui import QResizeEvent
+from PyQt6.QtWidgets import QApplication, QMenuBar
 
 import session_hub
+import session_hub_tui
 
 # Captured before any per-test patch.start() can shadow them (setUp() below
 # patches session_hub.METADATA_PATH/PID_DIR for defense-in-depth on every
@@ -176,6 +179,220 @@ class SessionHubTests(unittest.TestCase):
             third = session_hub._cached_file_scan(path, scan)
             self.assertEqual(third, {"content": "v2-longer"})
             self.assertEqual(len(calls), 2)
+
+    def _isolated_scan_index(self, tmp_dir: str):
+        """Patch SCAN_INDEX_PATH to a fresh file under tmp_dir and force the
+        next _cached_file_scan call to reload from disk instead of reusing
+        whatever another test left in the module-level singleton."""
+        index_path = Path(tmp_dir) / "scan_index.json"
+        session_hub._PERSISTENT_SCAN_INDEX = None
+        session_hub._SCAN_INDEX_DIRTY = False
+        return patch.object(session_hub, "SCAN_INDEX_PATH", index_path)
+
+    def _simulate_process_restart(self):
+        """Drop the in-memory layers only - the on-disk index (already
+        flushed) is what a brand-new TUI/CLI process would read."""
+        session_hub._FILE_SCAN_CACHE.clear()
+        session_hub._PERSISTENT_SCAN_INDEX = None
+        session_hub._SCAN_INDEX_DIRTY = False
+
+    def test_persistent_scan_index_survives_a_simulated_process_restart(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                path = Path(temp) / "data.txt"
+                path.write_text("v1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                session_hub._cached_file_scan(path, scan)
+                session_hub.flush_persistent_scan_index()
+                self.assertTrue(session_hub.SCAN_INDEX_PATH.exists())
+                self.assertEqual(len(calls), 1)
+
+                self._simulate_process_restart()
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "v1"})
+                self.assertEqual(len(calls), 1, "unchanged file must not rescan after restart")
+
+    def test_persistent_scan_index_growth_only_rescans_the_changed_entry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                path_a = Path(temp) / "a.txt"
+                path_b = Path(temp) / "b.txt"
+                path_a.write_text("a1", encoding="utf-8")
+                path_b.write_text("b1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                session_hub._cached_file_scan(path_a, scan)
+                session_hub._cached_file_scan(path_b, scan)
+                session_hub.flush_persistent_scan_index()
+                self.assertEqual(len(calls), 2)
+
+                self._simulate_process_restart()
+                os.utime(path_a, (os.path.getmtime(path_a) + 5,) * 2)
+                path_a.write_text("a1-grown", encoding="utf-8")
+
+                result_a = session_hub._cached_file_scan(path_a, scan)
+                result_b = session_hub._cached_file_scan(path_b, scan)
+                self.assertEqual(result_a, {"content": "a1-grown"})
+                self.assertEqual(result_b, {"content": "b1"})
+                self.assertEqual(len(calls), 3, "only the grown file should have rescanned")
+
+    def test_persistent_scan_index_shrink_forces_rescan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                path = Path(temp) / "data.txt"
+                path.write_text("a-long-first-version", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                session_hub._cached_file_scan(path, scan)
+                session_hub.flush_persistent_scan_index()
+
+                self._simulate_process_restart()
+                path.write_text("short", encoding="utf-8")
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "short"})
+                self.assertEqual(len(calls), 2, "a shrunk file must rescan, not trust the stale entry")
+
+    def test_persistent_scan_index_identity_change_forces_rescan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                path = Path(temp) / "data.txt"
+                path.write_text("v1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                session_hub._cached_file_scan(path, scan)
+                session_hub.flush_persistent_scan_index()
+
+                self._simulate_process_restart()
+                # Same path, same size/mtime as far as a naive check would
+                # see - but a different inode (a replaced/recreated file at
+                # the same path) must still force a rescan rather than
+                # trusting stale content from the old file.
+                index = session_hub._persistent_scan_index()
+                index[str(path)]["ino"] = -1
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "v1"})
+                self.assertEqual(len(calls), 2, "an identity mismatch must rescan, not trust the entry")
+
+    def test_persistent_scan_index_scalar_entry_rescans_instead_of_crashing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                path = Path(temp) / "data.txt"
+                path.write_text("v1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                index = session_hub._persistent_scan_index()
+                index[str(path)] = "corrupt"
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "v1"})
+                self.assertEqual(len(calls), 1, "a scalar entry must rescan, not crash on .get()")
+
+    def test_persistent_scan_index_list_entry_rescans_instead_of_crashing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                path = Path(temp) / "data.txt"
+                path.write_text("v1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                index = session_hub._persistent_scan_index()
+                index[str(path)] = ["corrupt"]
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "v1"})
+                self.assertEqual(len(calls), 1, "a list entry must rescan, not crash on .get()")
+
+    def test_persistent_scan_index_malformed_result_rescans_and_repairs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                path = Path(temp) / "data.txt"
+                path.write_text("v1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                stat = path.stat()
+                index = session_hub._persistent_scan_index()
+                index[str(path)] = {
+                    "dev": stat.st_dev,
+                    "ino": stat.st_ino,
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "result": "corrupt",
+                }
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "v1"})
+                self.assertEqual(len(calls), 1, "a non-dict result must rescan, not be trusted")
+
+                session_hub.flush_persistent_scan_index()
+                self._simulate_process_restart()
+                result_again = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result_again, {"content": "v1"})
+                self.assertEqual(len(calls), 1, "the flush must repair the entry so it caches clean")
+
+    def test_persistent_scan_index_corruption_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                session_hub.SCAN_INDEX_PATH.write_text("not valid json {{{", encoding="utf-8")
+                path = Path(temp) / "data.txt"
+                path.write_text("v1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "v1"})
+                self.assertEqual(len(calls), 1)
+                # A corrupt index must never crash the flush that follows,
+                # and the flush repairs it with a clean, valid file.
+                session_hub.flush_persistent_scan_index()
+                reloaded = json.loads(session_hub.SCAN_INDEX_PATH.read_text(encoding="utf-8"))
+                self.assertEqual(reloaded["schema"], session_hub.SCAN_INDEX_SCHEMA)
+
+    def test_persistent_scan_index_schema_mismatch_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self._isolated_scan_index(temp):
+                session_hub.SCAN_INDEX_PATH.write_text(
+                    json.dumps({"schema": 999, "entries": {"bogus": {}}}),
+                    encoding="utf-8",
+                )
+                path = Path(temp) / "data.txt"
+                path.write_text("v1", encoding="utf-8")
+                calls = []
+
+                def scan(p):
+                    calls.append(p)
+                    return {"content": p.read_text(encoding="utf-8")}
+
+                result = session_hub._cached_file_scan(path, scan)
+                self.assertEqual(result, {"content": "v1"})
+                self.assertEqual(len(calls), 1)
 
     def test_scan_claude_file_stops_after_max_lines(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -369,7 +586,157 @@ class SessionHubTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_usage_panel_starts_compact_with_no_saved_preference(self):
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertTrue(window.usage_detail_frame.isHidden())
+            self.assertEqual(window.usage_expand_button.text(), "Expand")
+            self.assertNotIn("usage_expanded", window.settings())
+        finally:
+            window.close()
+
+    def test_usage_expand_button_toggles_detail_frame_transiently(self):
+        """task-2142 row453 REWORK (orchestrator visual REWORK): Expand/Collapse are two
+        separate fixed-label buttons now, not one checkable button that renames itself -- see
+        the mutual-exclusion tests below for the compact-strip-hides / collapse-lives-in-header
+        halves of this."""
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            window.usage_expand_button.click()
+            self.assertFalse(window.usage_detail_frame.isHidden())
+            window.usage_collapse_button.click()
+            self.assertTrue(window.usage_detail_frame.isHidden())
+            self.assertNotIn("usage_expanded", window.settings())
+        finally:
+            window.close()
+
+    def test_expanding_hides_the_whole_compact_strip_not_just_relabels_a_button(self):
+        """Expand must hide the compact strip (labels/bars/Expand button) so only the detailed
+        per-window bars remain (task-2142 row453 REWORK -- orchestrator visual REWORK)."""
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertFalse(window.usage_compact_row.isHidden())
+            window.set_usage_expanded(True)
+            self.assertTrue(window.usage_compact_row.isHidden())
+            self.assertFalse(window.usage_detail_frame.isHidden())
+            window.set_usage_expanded(False)
+            self.assertFalse(window.usage_compact_row.isHidden())
+            self.assertTrue(window.usage_detail_frame.isHidden())
+        finally:
+            window.close()
+
+    def test_collapse_button_lives_inside_the_expanded_panel_own_header(self):
+        """Not a separate row of its own -- the Collapse button is a child of
+        `usage_detail_frame` itself (task-2142 row453 REWORK -- orchestrator visual REWORK), so
+        it is hidden/shown for free by the same setVisible call as the rest of the panel."""
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertIs(window.usage_collapse_button.parentWidget(), window.usage_detail_frame)
+            self.assertIsNot(
+                window.usage_collapse_button.parentWidget(), window.usage_compact_row
+            )
+        finally:
+            window.close()
+
+    def test_no_menubar_no_duplicate_settings_entry_remaining_button_still_opens_settings(self):
+        """task-2142 row453 REWORK (orchestrator layout REWORK): the redundant top-left
+        Settings menubar/menu is gone -- QMainWindow never allocates a QMenuBar (no blank
+        row), there's exactly one "Settings" entry point left (the toolbar button), and it
+        still reaches `open_settings` exactly as before."""
+        metadata = {"sessions": {}, "settings": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            self.assertIsNone(window.findChild(QMenuBar))
+            settings_buttons = [
+                w for w in window.findChildren(session_hub.QPushButton)
+                if w.text() == "Settings"
+            ]
+            self.assertEqual(len(settings_buttons), 1)
+            # Qt's clicked.connect(self.open_settings) bound to the REAL method at connect
+            # time -- patch.object(window, "open_settings") afterwards wouldn't retarget it,
+            # so mock the dialog class itself and let the real open_settings run, with
+            # SettingsDialog.exec() returning immediately instead of blocking on a real modal.
+            with patch("session_hub.SettingsDialog") as dialog_cls:
+                dialog_cls.return_value.exec.return_value = session_hub.QDialog.DialogCode.Rejected
+                settings_buttons[0].click()
+            dialog_cls.assert_called_once()
+        finally:
+            window.close()
+
+    def test_usage_compact_bar_mirrors_worst_visible_window(self):
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": True, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            def make(name, pct):
+                return session_hub.UsageWindow(name, pct, "Resets later")
+
+            window.usage_loaded(
+                "Claude", [make("5-hour", 10), make("Weekly", 60)], ""
+            )
+            compact_bar = window.usage_compact_bars["Claude"]
+            # 5-hour is 10% used (90 remaining), Weekly is 60% used (40
+            # remaining) - the compact bar mirrors the worst (lowest
+            # remaining), and both windows' detail lives in its tooltip.
+            self.assertEqual(compact_bar.value(), 40)
+            self.assertIn("5-hour", compact_bar.toolTip())
+            self.assertIn("Weekly", compact_bar.toolTip())
+            # Centered remaining-% text at the SAME fixed size, not an added row
+            # (task-2142 row453 REWORK -- orchestrator visual REWORK).
+            self.assertTrue(compact_bar.isTextVisible())
+            self.assertEqual(compact_bar.alignment(), session_hub.Qt.AlignmentFlag.AlignCenter)
+            self.assertEqual(compact_bar.format(), "40%")
+            self.assertEqual((compact_bar.width(), compact_bar.height()), (60, 8))
+        finally:
+            window.close()
+
+    def test_usage_compact_widgets_follow_provider_enable_visibility(self):
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": False, "enable_claude": True,
+                         "enable_antigravity": True},
+        }
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            window.update_usage_visibility()
+            self.assertTrue(window.usage_compact_bars["Codex"].isHidden())
+            self.assertFalse(window.usage_compact_bars["Claude"].isHidden())
+        finally:
+            window.close()
+
     def test_usage_pace_flags_usage_ahead_of_even_allocation(self):
+        # 30% used at 28.6% expected: relative deviation is abs(30-28.5714)/28.5714*100 = 5.0%,
+        # not the old absolute-percentage-point delta (1.4).
         now = datetime(2026, 6, 19, 12, 0)
         reset = now + timedelta(days=5)
         window = session_hub.UsageWindow(
@@ -377,7 +744,7 @@ class SessionHubTests(unittest.TestCase):
         )
         self.assertEqual(
             session_hub.usage_pace_text(window, now=now),
-            "28.6% expected · 1.4% over pace",
+            "28.6% expected · 5.0% over pace",
         )
 
     def test_usage_pace_flags_usage_under_pace_and_missing_data(self):
@@ -388,10 +755,70 @@ class SessionHubTests(unittest.TestCase):
         )
         self.assertEqual(
             session_hub.usage_pace_text(under, now=now),
-            "28.6% expected · 18.6% under pace",
+            "28.6% expected · 65.0% under pace",
         )
         missing = session_hub.UsageWindow("Weekly", 10, "Resets later")
         self.assertIsNone(session_hub.usage_pace_text(missing, now=now))
+
+    def test_usage_pace_relative_to_expected_table(self):
+        """task-2142 row453: the reported deviation is relative to EXPECTED usage
+        (abs(used-expected)/expected*100), not an absolute percentage-point delta -- 10% used at
+        5% expected is "100% over pace", and 2.5% used at 5% expected is "50% under pace" (the
+        brief's own worked examples). expected=0 (window just opened) must show a neutral bounded
+        label, never divide by zero or print a percentage at all."""
+        now = datetime(2026, 6, 19, 12, 0)
+        reset = now + timedelta(days=5)  # 5 of 7 days remain => 2/7 = 28.5714...% expected
+
+        def window(used_percent: int) -> session_hub.UsageWindow:
+            return session_hub.UsageWindow(
+                "Weekly", used_percent, "Resets later",
+                window_minutes=10080, reset_epoch=reset.timestamp(),
+            )
+
+        # equal pace: used == expected (rounded to the nearest int the dataclass accepts)
+        equal = session_hub.usage_pace_text(window(29), now=now)  # 29 vs 28.5714 -> delta<0.5
+        self.assertIn("on pace", equal)
+
+        # 2x expected: used = 2 * expected_percent -> 100% over
+        double = session_hub.UsageWindow(
+            "Weekly", 57, "Resets later", window_minutes=10080, reset_epoch=reset.timestamp()
+        )
+        text = session_hub.usage_pace_text(double, now=now)
+        self.assertIn("over pace", text)
+        relative = float(text.split("·")[1].strip().split("%")[0])
+        self.assertAlmostEqual(relative, 99.5, delta=2.0)  # ~2x expected -> ~100% over
+
+        # half expected: used = 0.5 * expected_percent -> 50% under
+        half = session_hub.UsageWindow(
+            "Weekly", 14, "Resets later", window_minutes=10080, reset_epoch=reset.timestamp()
+        )
+        text = session_hub.usage_pace_text(half, now=now)
+        self.assertIn("under pace", text)
+        relative = float(text.split("·")[1].strip().split("%")[0])
+        self.assertAlmostEqual(relative, 51.0, delta=2.0)  # ~half expected -> ~50% under
+
+        # expected == 0: window just opened (now == reset - window_minutes exactly), any nonzero
+        # used_percent would be an undefined relative percentage -- must not divide by zero
+        start = reset - timedelta(days=7)
+        just_started = session_hub.UsageWindow(
+            "Weekly", 3, "Resets later", window_minutes=10080, reset_epoch=reset.timestamp()
+        )
+        text = session_hub.usage_pace_text(just_started, now=start)
+        self.assertNotIn("over pace", text)
+        self.assertNotIn("under pace", text)
+        self.assertIn("just started", text)
+
+    def test_usage_pace_tui_reads_the_same_formatted_string(self):
+        """task-2142 row453: the phone TUI must consume the shared formatter's OUTPUT, never
+        reimplement the pace arithmetic itself -- source-level proof that
+        `session_hub_tui.py` contains neither `expected_percent` nor `elapsed_fraction` (the two
+        names the one real computation in `usage_pace_text` uses), only a passthrough read of the
+        JSON `pace` field it already displays."""
+        import pathlib
+        tui_source = pathlib.Path(session_hub_tui.__file__).read_text()
+        self.assertNotIn("expected_percent", tui_source)
+        self.assertNotIn("elapsed_fraction", tui_source)
+        self.assertIn('window.get("pace")', tui_source)
 
     def test_claude_reset_rolls_into_next_year(self):
         self.assertEqual(
@@ -4573,8 +5000,8 @@ class SessionHubTests(unittest.TestCase):
     def test_all_sessions_table_restored_to_six_original_columns_running_unchanged(self):
         # task-2136: task-2114 added Status/Last message to All Sessions
         # without being asked, corrupting the saved widths/order of its
-        # original six columns. Running is a different table/widget
-        # entirely and keeps its own Status/Last message unchanged.
+        # original six columns. Running is a different table/widget entirely;
+        # task-2142 later reduced it to exactly Name/Status/Last message.
         metadata = {"sessions": {}, "settings": {}, "groups": {}}
         with patch("session_hub.read_metadata", return_value=metadata):
             window = session_hub.SessionHub()
@@ -4591,9 +5018,7 @@ class SessionHubTests(unittest.TestCase):
                 window.running_table.horizontalHeaderItem(i).text()
                 for i in range(window.running_table.columnCount())
             ]
-            self.assertEqual(
-                running_headers, ["Project", "Name", "Provider", "Status", "Last message"]
-            )
+            self.assertEqual(running_headers, ["Name", "Status", "Last message"])
         finally:
             window.close()
 
@@ -4974,6 +5399,93 @@ class SessionHubTests(unittest.TestCase):
             launch.assert_not_called()
         finally:
             window.close()
+
+    def test_launch_group_row_live_detached_falls_through_instead_of_already_running(self):
+        """task-2142: a tmux-alive row with saved history used to short-circuit on
+        {"status": "already_running"} before ever reaching resume_group_row, so
+        _focus_or_resume_session's no-window case (detached, live) opened nothing at
+        all. tmux_session_alive=True must no longer change the outcome from the
+        tmux_session_alive=False case already covered above."""
+        metadata = {
+            "sessions": {},
+            "settings": {},
+            "groups": {
+                "/tmp/vamp": {
+                    "cwd": "/tmp/vamp",
+                    "tmux": True,
+                    "rows": [{
+                        "name": "VAMP-worker4",
+                        "provider": "Codex",
+                        "override_key": "group:/tmp/vamp#VAMP-worker4",
+                        "session_key": "Codex:old-worker",
+                    }],
+                }
+            },
+        }
+        history = session_hub.Session(
+            "Codex", "old-worker", "worker", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/worker.jsonl"),
+        )
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        try:
+            with (
+                patch("session_hub.tmux_session_alive", return_value=True),
+                patch("session_hub.claude_sessions", return_value=[]),
+                patch("session_hub.codex_sessions", return_value=[history]),
+                patch("session_hub.antigravity_sessions", return_value=[]),
+                patch.object(
+                    window,
+                    "resume_group_row",
+                    return_value={"status": "resumed", "name": "VAMP-worker4"},
+                ) as resume,
+                patch.object(window, "launch") as launch,
+            ):
+                result = window.launch_group_row("/tmp/vamp", "VAMP-worker4")
+            self.assertEqual(result["status"], "resumed")
+            self.assertNotEqual(result["status"], "already_running")
+            resume.assert_called_once_with("/tmp/vamp", "VAMP-worker4")
+            launch.assert_not_called()
+        finally:
+            window.close()
+
+    def test_launch_group_row_live_detached_no_history_still_launches(self):
+        """Same live-detached case but with NO saved history: must still fall through
+        to self.launch() (whose tmux script safely attaches to the existing session)
+        rather than reporting already_running."""
+        with tempfile.TemporaryDirectory() as temp:
+            metadata = {
+                "sessions": {},
+                "settings": {},
+                "groups": {
+                    "/tmp/vamp": {
+                        "cwd": "/tmp/vamp",
+                        "tmux": True,
+                        "rows": [{
+                            "name": "vamp-s1",
+                            "override_key": "group:/tmp/vamp#vamp-s1",
+                            "transcripts": True,
+                        }],
+                    }
+                },
+            }
+            with patch("session_hub.read_metadata", return_value=metadata):
+                window = session_hub.SessionHub()
+            try:
+                with (
+                    patch("session_hub.tmux_session_alive", return_value=True),
+                    patch.object(session_hub.SessionHub, "launch") as launch,
+                    patch("session_hub.claude_sessions", return_value=[]),
+                    patch("session_hub.codex_sessions", return_value=[]),
+                    patch("session_hub.antigravity_sessions", return_value=[]),
+                    patch("session_hub.METADATA_PATH", Path(temp) / "metadata.json"),
+                ):
+                    result = window.launch_group_row("/tmp/vamp", "vamp-s1")
+                self.assertEqual(result, {"status": "launched", "name": "vamp-s1"})
+                self.assertNotEqual(result["status"], "already_running")
+                launch.assert_called_once()
+            finally:
+                window.close()
 
     def test_resume_group_row_uses_tmux_when_group_flagged(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -6753,7 +7265,49 @@ class SessionActivityTests(unittest.TestCase):
             "notification_type": "permission_prompt",
             "message": "approve?",
         })
-        self.assertEqual(mapped, ("needs_input", "approve?"))
+        self.assertEqual(mapped, ("needs_input", "approve?", "permission_prompt"))
+
+    def test_claude_idle_prompt_notification_maps_to_idle_not_needs_input(self):
+        mapped = session_hub.hook_event_to_status({
+            "hook_event_name": "Notification",
+            "notification_type": "idle_prompt",
+            "message": "waiting",
+        })
+        self.assertEqual(mapped, ("idle", "waiting", ""))
+
+    def test_needs_input_record_with_no_reason_fails_closed_to_idle(self):
+        session_id = "id-legacy-needs-input"
+        # Simulates a status file written before "reason" existed, or by any
+        # non-blocking path - state alone must never be trusted as evidence
+        # of a real blocker.
+        session_hub.write_session_status(session_id, "needs_input", "waiting")
+        session = session_hub.Session(
+            "Claude", session_id, "t", "/tmp", "/tmp", 0, Path("/tmp/x.jsonl")
+        )
+        with patch.object(session_hub, "session_is_tracked_alive", return_value=True):
+            state, _ = session_hub.session_activity(session)
+        self.assertEqual(state, "idle")
+
+    def test_needs_input_record_with_blocking_reason_stays_needs_input(self):
+        session_id = "id-real-needs-input"
+        session_hub.write_session_status(
+            session_id, "needs_input", "approve?", reason="permission_prompt"
+        )
+        session = session_hub.Session(
+            "Claude", session_id, "t", "/tmp", "/tmp", 0, Path("/tmp/x.jsonl")
+        )
+        with patch.object(session_hub, "session_is_tracked_alive", return_value=True):
+            state, _ = session_hub.session_activity(session)
+        self.assertEqual(state, "needs_input")
+
+    def test_live_claude_session_with_no_status_file_reads_idle(self):
+        session_id = "id-just-launched"
+        session = session_hub.Session(
+            "Claude", session_id, "t", "/tmp", "/tmp", 0, Path("/tmp/x.jsonl")
+        )
+        with patch.object(session_hub, "session_is_tracked_alive", return_value=True):
+            state, _ = session_hub.session_activity(session)
+        self.assertEqual(state, "idle")
 
     def test_codex_notify_never_produces_needs_input(self):
         # Documented, deliberate limitation (hook_event_to_status_codex):
@@ -6834,7 +7388,9 @@ class SessionActivityTests(unittest.TestCase):
     # --- two same-cwd sessions => exact ids, no cross-talk --------------
     def test_two_same_cwd_sessions_get_independent_activity_states(self):
         session_hub.write_session_status("id-a", "working", "")
-        session_hub.write_session_status("id-b", "needs_input", "pick one")
+        session_hub.write_session_status(
+            "id-b", "needs_input", "pick one", reason="permission_prompt"
+        )
         a = session_hub.Session("Claude", "id-a", "a", "/tmp/vamp", "/tmp/vamp", 100, Path("/tmp/a.jsonl"))
         b = session_hub.Session("Claude", "id-b", "b", "/tmp/vamp", "/tmp/vamp", 200, Path("/tmp/b.jsonl"))
         with patch.object(session_hub, "session_is_tracked_alive", return_value=True):
@@ -7279,7 +7835,9 @@ class SessionActivityTests(unittest.TestCase):
             "Claude", "id-shared", "shared", "/tmp/vamp", "/tmp/vamp", 100,
             Path("/tmp/shared.jsonl"),
         )
-        session_hub.write_session_status("id-shared", "needs_input", "approve the plan?")
+        session_hub.write_session_status(
+            "id-shared", "needs_input", "approve the plan?", reason="permission_prompt"
+        )
         row = {"name": "VAMP-shared", "provider": "Claude", "session_key": "Claude:id-shared"}
         session_hub.METADATA_PATH.write_text(
             json.dumps({
@@ -7303,94 +7861,65 @@ class SessionActivityTests(unittest.TestCase):
             with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
                 window = session_hub.SessionHub()
                 window.refresh_running_tab()
-                gui_label = window.running_table.item(0, 3).text()
+                gui_label = window.running_table.item(0, 1).text()
                 window.close()
 
         self.assertEqual(json_label, "Needs input")
         self.assertEqual(gui_label, "Needs input")
 
-    def test_activity_item_activation_focuses_the_exact_live_session(self):
-        # task-2135: mounts the REAL Recent-activity widget through the real
-        # refresh_running_tab()/_refresh_activity_list() pipeline (not a
-        # hand-built dict), then activates each item and asserts the exact
-        # (cwd, name, session_id) passed to the shared Running focus
-        # authority. Covers: a live exact-identity Claude event, a second
-        # Claude row sharing the SAME row name in a different cwd (duplicate
-        # names must never conflate), a repaired Codex link row (its
-        # session_key already points at the current active member, as
-        # row433's persistence guarantees), and a stale/historical entry
-        # whose session_id belongs to no currently-running row.
+    def test_running_table_appends_muted_project_suffix_only_on_name_collision(self):
+        # task-2142: Running's Name column shows the bare row name, and only
+        # appends a project suffix when two currently-running rows share the
+        # same name (across different projects) - identity itself (provider/
+        # project/cwd) lives in the tooltip, not in every row's visible text.
         claude_a = session_hub.Session(
-            "Claude", "id-a", "t", "/tmp/vamp2135a", "/tmp/vamp2135a", 100,
+            "Claude", "id-a", "t", "/tmp/vamp2142a", "/tmp/vamp2142a", 100,
             Path("/tmp/a.jsonl"), agent_name="vamp-shared",
         )
         claude_b = session_hub.Session(
-            "Claude", "id-b", "t", "/tmp/vamp2135b", "/tmp/vamp2135b", 100,
+            "Claude", "id-b", "t", "/tmp/vamp2142b", "/tmp/vamp2142b", 100,
             Path("/tmp/b.jsonl"), agent_name="vamp-shared",
         )
-        codex_new = session_hub.Session(
-            "Codex", "new-id", "t", "/tmp/vamp2135c", "/tmp/vamp2135c", 100,
-            Path("/tmp/c.jsonl"),
+        claude_c = session_hub.Session(
+            "Claude", "id-c", "t", "/tmp/vamp2142c", "/tmp/vamp2142c", 100,
+            Path("/tmp/c.jsonl"), agent_name="vamp-solo",
         )
         metadata = {
             "settings": {},
             "sessions": {},
             "groups": {
-                "/tmp/vamp2135a": {"tmux": True, "rows": [{"name": "vamp-shared"}]},
-                "/tmp/vamp2135b": {"tmux": True, "rows": [{"name": "vamp-shared"}]},
-                "/tmp/vamp2135c": {
-                    "tmux": True,
-                    "rows": [{
-                        "name": "vamp-codex", "provider": "Codex",
-                        "session_key": "Codex:new-id",
-                    }],
-                },
+                "/tmp/vamp2142a": {"tmux": True, "rows": [{"name": "vamp-shared"}]},
+                "/tmp/vamp2142b": {"tmux": True, "rows": [{"name": "vamp-shared"}]},
+                "/tmp/vamp2142c": {"tmux": True, "rows": [{"name": "vamp-solo"}]},
             },
         }
-        statuses = [
-            ("id-a", {"state": "working", "ts": 1000, "detail": "a"}),
-            ("id-b", {"state": "working", "ts": 1000, "detail": "b"}),
-            ("new-id", {"state": "idle", "ts": 1000, "detail": ""}),
-            ("stale-ghost", {"state": "done", "ts": 1000, "detail": "long finished"}),
-        ]
         with (
             patch.object(session_hub, "read_metadata", return_value=metadata),
-            patch.object(session_hub, "claude_sessions", return_value=[claude_a, claude_b]),
-            patch.object(session_hub, "codex_sessions", return_value=[codex_new]),
+            patch.object(
+                session_hub, "claude_sessions",
+                return_value=[claude_a, claude_b, claude_c],
+            ),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
             patch.object(session_hub, "antigravity_sessions", return_value=[]),
             patch.object(session_hub, "tmux_session_alive", return_value=True),
-            patch.object(session_hub, "all_session_statuses", return_value=statuses),
         ):
             window = session_hub.SessionHub()
             try:
                 window.refresh_running_tab()
-                self.assertEqual(window.activity_list.count(), 4)
-                with patch.object(window, "_focus_or_resume_session") as focus_mock:
-                    window.activate_activity_item(window.activity_list.item(0))
-                    focus_mock.assert_called_once_with(
-                        "/tmp/vamp2135a", "vamp-shared", "id-a")
-
-                    focus_mock.reset_mock()
-                    window.activate_activity_item(window.activity_list.item(1))
-                    focus_mock.assert_called_once_with(
-                        "/tmp/vamp2135b", "vamp-shared", "id-b")
-
-                    focus_mock.reset_mock()
-                    window.activate_activity_item(window.activity_list.item(2))
-                    focus_mock.assert_called_once_with(
-                        "/tmp/vamp2135c", "vamp-codex", "new-id")
-
-                    focus_mock.reset_mock()
-                    window.activate_activity_item(window.activity_list.item(3))
-                    focus_mock.assert_not_called()
+                names = {
+                    window.running_table.item(row, 0).text()
+                    for row in range(window.running_table.rowCount())
+                }
+                self.assertIn("vamp-shared  (vamp2142a)", names)
+                self.assertIn("vamp-shared  (vamp2142b)", names)
+                self.assertIn("vamp-solo", names)
             finally:
                 window.close()
 
-    def test_running_context_menu_bring_up_window_resolves_exact_duplicate_name_row(self):
-        # task-2137: right-click a Running row with a name shared by another
-        # row in a different cwd - "Bring up window" must resolve the exact
-        # row clicked, the same identity Running's own double-click uses,
-        # never a different same-name sibling.
+    def test_running_context_menu_open_externally_resolves_exact_duplicate_name_row(self):
+        # task-2137/task-2142: right-click a Running row with a name shared by another
+        # row in a different cwd - "Open externally" must resolve the exact
+        # row clicked, never a different same-name sibling.
         claude_a = session_hub.Session(
             "Claude", "id-a", "t", "/tmp/vamp2137a", "/tmp/vamp2137a", 100,
             Path("/tmp/2137a.jsonl"), agent_name="vamp-shared",
@@ -7430,7 +7959,7 @@ class SessionActivityTests(unittest.TestCase):
                     added = [call.args[0] for call in menu_instance.addAction.call_args_list]
                     self.assertEqual(
                         [action.text() for action in added],
-                        ["Bring up window", "Stop session"],
+                        ["Open externally", "Stop session"],
                     )
                     with patch.object(window, "_focus_or_resume_session") as focus_mock:
                         added[0].trigger()
@@ -7546,12 +8075,17 @@ class SessionActivityTests(unittest.TestCase):
             ):
                 self.assertTrue(session_hub.tmux_session_alive("VAMP-x"))
 
-    def test_refresh_running_tab_makes_one_tmux_subprocess_call_for_n_rows(self):
+    def test_refresh_running_tab_makes_o1_tmux_subprocess_calls_for_n_rows(self):
         """group_row_status and session_activity used to each call
         tmux_session_alive independently - 2 subprocess spawns per row, times
         N rows. refresh_running_tab must take one tmux_live_session_names()
         snapshot per refresh and every row reuses it (see the `live_names`
-        param threaded through group_row_status/session_activity)."""
+        param threaded through group_row_status/session_activity).
+
+        task-2142 adds a second bounded census (tmux_pane_activity_snapshot,
+        one list-panes -a call) and, on a cold cache where every row's pane
+        looks changed, ONE batched capture_changed_panes call covering all N
+        panes -- three tmux calls total for 5 rows, never 3*N."""
         rows = [
             {"name": f"VAMP-{i}", "provider": "Claude", "session_key": f"Claude:id-{i}"}
             for i in range(5)
@@ -7578,8 +8112,13 @@ class SessionActivityTests(unittest.TestCase):
             calls.append(list(argv))
             result = MagicMock()
             result.returncode = 0
+            result.stdout = ""
             if argv[1] == "list-sessions":
                 result.stdout = "\n".join(row["name"] for row in rows) + "\n"
+            elif argv[1] == "list-panes":
+                result.stdout = "".join(
+                    f"{row['name']}\t%{i}\t1788000000\n" for i, row in enumerate(rows)
+                )
             return result
 
         with (
@@ -7602,8 +8141,1283 @@ class SessionActivityTests(unittest.TestCase):
             window.close()
 
         tmux_calls = [c for c in calls if c and c[0] == "/usr/bin/tmux"]
-        self.assertEqual(len(tmux_calls), 1)
+        self.assertEqual(len(tmux_calls), 3)
         self.assertEqual(tmux_calls[0][1], "list-sessions")
+        self.assertEqual(tmux_calls[1][1], "list-panes")
+        # The third call is capture_changed_panes' single batched invocation, not
+        # 5 separate ones -- one "capture-pane" per pane inside it, chained by
+        # literal ';' argv tokens, still exactly one subprocess.run().
+        self.assertEqual(tmux_calls[2][1], "capture-pane")
+        self.assertEqual(tmux_calls[2].count("capture-pane"), 5)
+
+    def test_refresh_running_tab_second_call_captures_nothing_when_unchanged(self):
+        """A second refresh with identical window_activity values must add no
+        capture-pane call at all -- the cached block is reused untouched."""
+        rows = [{"name": "VAMP-0", "provider": "Claude", "session_key": "Claude:id-0"}]
+        session_hub.METADATA_PATH.write_text(
+            json.dumps({
+                "settings": {},
+                "sessions": {},
+                "groups": {"/tmp/vamp": {"tmux": True, "rows": rows}},
+            }),
+            encoding="utf-8",
+        )
+        sessions = [
+            session_hub.Session(
+                "Claude", "id-0", "s0", "/tmp/vamp", "/tmp/vamp", 100, Path("/tmp/s0.jsonl"),
+            )
+        ]
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            if argv[1] == "list-sessions":
+                result.stdout = "VAMP-0\n"
+            elif argv[1] == "list-panes":
+                result.stdout = "VAMP-0\t%0\t1788000000\n"
+            elif argv[1] == "capture-pane":
+                result.stdout = "● first meaningful message\n"
+            return result
+
+        with (
+            patch.object(session_hub, "claude_sessions", return_value=sessions),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.shutil, "which", return_value="/usr/bin/tmux"),
+            patch.object(session_hub.subprocess, "run", side_effect=fake_run),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            window.refresh_running_tab()
+            first_message = window._pane_block_cache.get("VAMP-0")
+            calls.clear()
+            window.refresh_running_tab()
+            second_message = window._pane_block_cache.get("VAMP-0")
+            window.close()
+
+        capture_calls = [c for c in calls if c and c[0] == "/usr/bin/tmux" and "capture-pane" in c]
+        self.assertEqual(capture_calls, [])
+        self.assertEqual(first_message, second_message)
+        self.assertIn("first meaningful message", first_message)
+
+    def test_status_tick_skips_the_census_when_running_tab_not_current(self):
+        """task-2142: the periodic 2s tick must do NOTHING -- not even the cheap
+        list-sessions census -- while Running isn't the visible tab."""
+        with (
+            patch.object(session_hub, "claude_sessions", return_value=[]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            try:
+                window.main_tabs.setCurrentIndex(0)  # All Sessions, not Running
+                with patch.object(window, "refresh_running_tab") as refresh:
+                    window._on_running_status_tick()
+                refresh.assert_not_called()
+            finally:
+                window.close()
+
+    def test_status_tick_skips_the_census_when_window_minimized(self):
+        with (
+            patch.object(session_hub, "claude_sessions", return_value=[]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            try:
+                window.main_tabs.setCurrentIndex(1)  # Running IS current...
+                with (
+                    patch.object(window, "isMinimized", return_value=True),  # ...but minimized
+                    patch.object(window, "refresh_running_tab") as refresh,
+                ):
+                    window._on_running_status_tick()
+                refresh.assert_not_called()
+            finally:
+                window.close()
+
+    def test_status_tick_runs_the_census_when_running_tab_visible(self):
+        with (
+            patch.object(session_hub, "claude_sessions", return_value=[]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            try:
+                window.main_tabs.setCurrentIndex(1)
+                with (
+                    patch.object(window, "isMinimized", return_value=False),
+                    patch.object(window, "refresh_running_tab") as refresh,
+                ):
+                    window._on_running_status_tick()
+                refresh.assert_called_once()
+            finally:
+                window.close()
+
+    def test_switching_to_running_tab_refreshes_immediately(self):
+        """Becoming visible must not wait up to 2s for the next timer tick."""
+        with (
+            patch.object(session_hub, "claude_sessions", return_value=[]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub.QApplication, "platformName", return_value="xcb"),
+        ):
+            window = session_hub.SessionHub()
+            try:
+                window.main_tabs.setCurrentIndex(0)
+                with patch.object(window, "refresh_running_tab") as refresh:
+                    window.main_tabs.setCurrentIndex(1)
+                refresh.assert_called_once()
+            finally:
+                window.close()
+
+
+# Real `tmux capture-pane -p -t VAMP-worker1` dump, 2026-08-29 -- a live Claude Code
+# session mid-tool-call. Ground truth for extract_last_meaningful_block, not a
+# hand-written approximation: the exact chrome shapes (border rules, bare prompt,
+# spinner-status line, permission footer, OSC8 hyperlink remnant) came from this pane.
+_CLAUDE_PANE_FIXTURE = (
+    "  Read 1 file, listed 1 directory, ran 3 shell commands\n"
+    "\n"
+    "● Gitignored build output isn't there; need to populate it and run import.\n"
+    "\n"
+    "● Running cd /tmp/vamp2149_old && XDG_DATA_HOME=$(mktemp -d… · 28s\n"
+    "  ⎿  $ cd /tmp/vamp2149_old && XDG_DATA_HOME=$(mktemp -d) timeout 180\n"
+    "     scripts/run_tool.sh --import 2>&1 | tail -15 (28s)\n"
+    "     (ctrl+b ctrl+b (twice) to run in background)\n"
+    "\n"
+    "· Bunning… (6m 41s · ↓ 22.0k tokens)\n"
+    "\n"
+    "● How is Claude doing this session? (optional)\n"
+    "  1: Bad    2: Fine   3: Good   0: Dismiss\n"
+    "\n"
+    "──────────────────────────────────────────────────────────────── VAMP-worker1 ─\n"
+    "❯\n"
+    "────────────────────────────────────────────────────────────────────────────────\n"
+    "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for ag…\n"
+    "                                                                           /rc\n"
+)
+
+# Real `tmux capture-pane -p -t %30` dump, 2026-08-29 -- a live Codex session
+# (VAMP-reviewer) mid-review, captured the same way as the Claude fixture above. Ground
+# truth for the border-rule-with-caption shape ("─ Worked for 2m 18s ─..."), the "›"
+# empty-prompt placeholder, and the "Context NN%…" footer -- none of which were
+# guessed.
+_CODEX_PANE_FIXTURE = (
+    '    18 +- `.claude/hooks/selftest_hooks.py:327-336` adds the required same-entry\n'
+    '         extra-process negative\n'
+    '    19 +  control; appending a second executable command to the dispatcher strin\n'
+    '        g is rejected, closing the\n'
+    '    20 +  prior substring-containment acceptance seam.\n'
+    '\n'
+    '    31 +ACCEPT\n'
+    '\n'
+    '────────────────────────────────────────────────────────────────────────────────\n'
+    '\n'
+    '• I cannot mark row458 through the existing gate: review_ctl.py refuses because\n'
+    '  its candidate is already contained in current main (“no commits ahead of\n'
+    '  main”). Directly editing the review ref would violate my read-only reviewer\n'
+    '  role.\n'
+    '\n'
+    '  Current state remains null verdicts with\n'
+    '  invalidated_by=worker_identity_changed; the gate needs an explicit obsolete/\n'
+    '  invalid-author retirement path to suppress watchdog escalation.\n'
+    '\n'
+    '─ Worked for 2m 18s ─────────────────────────────────────────────────────────────────\n'
+    '\n'
+    '\n'
+    '› Ask Codex to do anything\n'
+    '\n'
+    '  gpt-5.6-luna high · ~/projects/vampulse/worktrees/vamp-reviewer · Context 65%…\n'
+)
+
+
+class ExtractLastMeaningfulBlockTests(unittest.TestCase):
+    def test_claude_pane_returns_the_running_tool_block_not_chrome(self):
+        block = session_hub.extract_last_meaningful_block(_CLAUDE_PANE_FIXTURE)
+        self.assertIn("Running cd /tmp/vamp2149_old", block)
+        self.assertIn("run_tool.sh --import", block)
+
+    def test_claude_pane_excludes_footer_border_prompt_and_spinner(self):
+        block = session_hub.extract_last_meaningful_block(_CLAUDE_PANE_FIXTURE)
+        self.assertNotIn("bypass permissions", block)
+        self.assertNotIn("VAMP-worker1", block)
+        self.assertNotIn("❯", block)
+        self.assertNotIn("Bunning", block)
+        self.assertNotIn("/rc", block)
+
+    def test_claude_pane_excludes_the_optional_rating_survey(self):
+        block = session_hub.extract_last_meaningful_block(_CLAUDE_PANE_FIXTURE)
+        self.assertNotIn("How is Claude doing", block)
+        self.assertNotIn("1: Bad", block)
+
+    def test_codex_pane_returns_the_last_message_block_not_chrome(self):
+        block = session_hub.extract_last_meaningful_block(_CODEX_PANE_FIXTURE)
+        self.assertIn("invalidated_by=worker_identity_changed", block)
+        self.assertIn("watchdog escalation", block)
+
+    def test_codex_pane_excludes_footer_border_and_prompt(self):
+        block = session_hub.extract_last_meaningful_block(_CODEX_PANE_FIXTURE)
+        self.assertNotIn("Ask Codex to do anything", block)
+        self.assertNotIn("Worked for 2m 18s", block)
+        self.assertNotIn("Context 65%", block)
+        self.assertNotIn("─", block)
+
+    def test_empty_pane_returns_empty_string(self):
+        self.assertEqual(session_hub.extract_last_meaningful_block(""), "")
+
+    def test_chrome_only_pane_returns_empty_string(self):
+        chrome_only = "\n".join([
+            "────────────────────────────────────────────────────────────────",
+            "❯",
+            "────────────────────────────────────────────────────────────────",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt",
+        ])
+        self.assertEqual(session_hub.extract_last_meaningful_block(chrome_only), "")
+
+    def test_ansi_codes_are_stripped_before_filtering(self):
+        colored = "\x1b[38;5;231m● Something happened\x1b[39m\n\x1b[38;5;246m❯\x1b[39m\n"
+        block = session_hub.extract_last_meaningful_block(colored)
+        self.assertEqual(block, "● Something happened")
+
+
+class _FakeEmbedProcess:
+    """Stands in for the real `vte_embed_helper.py` subprocess.Popen handle. `.terminate()`/
+    `.kill()` only flip local flags -- there is nothing here that could ever reach tmux, which is
+    the point: any test asserting "no tmux kill" only has to prove this fake was never asked to
+    run a tmux command. `.stdout` is backed by a REAL pipe (not a plain fake with a bogus
+    `fileno() -> -1`) -- task-2142 row453 REWORK's widget path constructs a real QSocketNotifier
+    over this fd, and Qt's event dispatcher does not tolerate an invalid one."""
+
+    def __init__(self, argv, stdout_lines=("XID=555\n",)):
+        self.argv = argv
+        self._alive = True
+        self.terminated = False
+        self.killed = False
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(write_fd, "w") as w:
+            w.write("".join(stdout_lines))
+        self.stdout = os.fdopen(read_fd, "r")
+
+    def poll(self):
+        return None if self._alive else 0
+
+    def terminate(self):
+        self.terminated = True
+        self._alive = False
+
+    def kill(self):
+        self.killed = True
+        self._alive = False
+
+    def wait(self, timeout=None):
+        return 0
+
+
+class _FakeSize:
+    def __init__(self, width, height):
+        self._width = width
+        self._height = height
+
+    def width(self):
+        return self._width
+
+    def height(self):
+        return self._height
+
+
+class _FakeWinIdContainer:
+    def __init__(self, winid, width=640, height=480):
+        self._winid = winid
+        self._size = _FakeSize(width, height)
+
+    def winId(self):
+        return self._winid
+
+    def size(self):
+        return self._size
+
+    def resize(self, width, height):
+        self._size = _FakeSize(width, height)
+
+
+class _FakeEmbedder:
+    """Records every `resize()` call (target child window id, width, height) instead of touching
+    a real X server -- the "assert exact geometry every time" control for
+    EmbeddedTerminalControllerTests/RunningTabEmbeddedTerminalTests (task-2142 row453 REWORK)."""
+
+    def __init__(self, fail=False):
+        self.calls = []
+        self._fail = fail
+
+    def resize(self, child_winid, width, height):
+        self.calls.append((child_winid, width, height))
+        return not self._fail
+
+
+class EmbedPrecheckTests(unittest.TestCase):
+    """task-2142 row453 REWORK: _embed_precheck is pure -- table-tested with no Qt widget, X
+    server, helper subprocess or tmux session involved at all."""
+
+    def test_table(self):
+        cases = [
+            (("xcb", True, 999), None),
+            (("wayland", True, 999), "X11"),
+            (("offscreen", True, 999), "X11"),
+            (("xcb", False, 999), "helper"),
+            (("xcb", True, 0), "window id"),
+            (("xcb", True, None), "window id"),
+        ]
+        for args, expect_substr in cases:
+            reason = session_hub._embed_precheck(*args)
+            if expect_substr is None:
+                self.assertIsNone(reason, args)
+            else:
+                self.assertIsNotNone(reason, args)
+                self.assertIn(expect_substr, reason, args)
+
+
+class GnomeTerminalProfileResolutionTests(unittest.TestCase):
+    """task-2142 row453 REWORK: pure gsettings-parsing logic, table-tested against fake `run`
+    output -- proves the font/color resolution matches GNOME Terminal's own precedence
+    (use-system-font / use-theme-colors) rather than an xterm-default approximation."""
+
+    @staticmethod
+    def _fake_run(answers):
+        def run(argv, capture_output, text, timeout):
+            key = tuple(argv)
+            stdout = answers.get(key, "")
+            return subprocess.CompletedProcess(argv, 0 if key in answers else 1, stdout, "")
+        return run
+
+    def test_resolve_profile_uuid(self):
+        run = self._fake_run({
+            ("gsettings", "get", "org.gnome.Terminal.ProfilesList", "default"):
+                "'b1dcc9dd-5262-4d8d-a863-c897e6d979b9'\n",
+        })
+        self.assertEqual(
+            session_hub.resolve_gnome_terminal_profile_uuid(run=run),
+            "b1dcc9dd-5262-4d8d-a863-c897e6d979b9",
+        )
+
+    def test_resolve_profile_uuid_missing_gsettings_returns_none(self):
+        def raising_run(*a, **k):
+            raise OSError("gsettings not found")
+        self.assertIsNone(session_hub.resolve_gnome_terminal_profile_uuid(run=raising_run))
+
+    def test_font_falls_back_to_desktop_monospace_when_profile_uses_system_font(self):
+        # The live facts reported for this box (task-2148/2142 orchestrator, 2026-08-30):
+        # use-system-font=true, org.gnome.desktop.interface monospace-font-name='Liberation Mono 10'.
+        uuid = "b1dcc9dd-5262-4d8d-a863-c897e6d979b9"
+        path = f"/org/gnome/terminal/legacy/profiles:/:{uuid}/"
+        run = self._fake_run({
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "use-system-font"):
+                "true\n",
+            ("gsettings", "get", "org.gnome.desktop.interface", "monospace-font-name"):
+                "Liberation Mono 10\n",
+        })
+        self.assertEqual(session_hub.resolve_gnome_terminal_font(uuid, run=run), "Liberation Mono 10")
+
+    def test_font_uses_profile_font_when_system_font_is_off(self):
+        uuid = "uuid-1"
+        path = f"/org/gnome/terminal/legacy/profiles:/:{uuid}/"
+        run = self._fake_run({
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "use-system-font"):
+                "false\n",
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "font"):
+                "Fira Code 12\n",
+        })
+        self.assertEqual(session_hub.resolve_gnome_terminal_font(uuid, run=run), "Fira Code 12")
+
+    def test_style_omits_colors_when_theme_colors_are_used(self):
+        # Also the live default for this box: use-theme-colors=true -- hardcoding a color pair
+        # here would fight the GTK theme gnome-terminal itself renders with.
+        uuid = "uuid-1"
+        path = f"/org/gnome/terminal/legacy/profiles:/:{uuid}/"
+        run = self._fake_run({
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "use-system-font"):
+                "true\n",
+            ("gsettings", "get", "org.gnome.desktop.interface", "monospace-font-name"):
+                "Liberation Mono 10\n",
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "use-theme-colors"):
+                "true\n",
+        })
+        style = session_hub.gnome_terminal_profile_style(uuid, run=run)
+        self.assertEqual(style, {"font": "Liberation Mono 10"})
+
+    def test_style_includes_explicit_colors_when_theme_colors_are_off(self):
+        uuid = "uuid-1"
+        path = f"/org/gnome/terminal/legacy/profiles:/:{uuid}/"
+        run = self._fake_run({
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "use-system-font"):
+                "true\n",
+            ("gsettings", "get", "org.gnome.desktop.interface", "monospace-font-name"):
+                "Liberation Mono 10\n",
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "use-theme-colors"):
+                "false\n",
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "background-color"):
+                "#1E1E1E\n",
+            ("gsettings", "get", f"org.gnome.Terminal.Legacy.Profile:{path}", "foreground-color"):
+                "#DDDDDD\n",
+        })
+        style = session_hub.gnome_terminal_profile_style(uuid, run=run)
+        self.assertEqual(style["background"], "#1E1E1E")
+        self.assertEqual(style["foreground"], "#DDDDDD")
+
+    def test_shared_resolver_control_embedded_argv_uuid_matches_external_default(self):
+        """The determinism control the orchestrator asked for: whatever profile uuid the embedded
+        helper is launched with must be EXACTLY the uuid resolve_gnome_terminal_profile_uuid()
+        (the one function both paths consult) resolves -- not a hardcoded/duplicated string."""
+        run = self._fake_run({
+            ("gsettings", "get", "org.gnome.Terminal.ProfilesList", "default"):
+                "'b1dcc9dd-5262-4d8d-a863-c897e6d979b9'\n",
+        })
+        container = _FakeWinIdContainer(999)
+        calls = []
+
+        def fake_popen(argv, **kwargs):
+            calls.append(argv)
+            return _FakeEmbedProcess(argv)
+
+        ctl = session_hub.EmbeddedTerminalController(
+            container, popen=fake_popen, which=lambda name: "/usr/bin/python3",
+            platform_name=lambda: "xcb", embedder=_FakeEmbedder(),
+            read_xid_line=lambda proc, timeout: "XID=555\n",
+            helper_ready=lambda: True,
+            profile_uuid=lambda: session_hub.resolve_gnome_terminal_profile_uuid(run=run),
+        )
+        ctl.attach("a")
+        self.assertIn("--profile-uuid", calls[0])
+        self.assertEqual(
+            calls[0][calls[0].index("--profile-uuid") + 1],
+            session_hub.resolve_gnome_terminal_profile_uuid(run=run),
+        )
+
+
+class EmbeddedTerminalControllerTests(unittest.TestCase):
+    """task-2142 row453 REWORK: hermetic fake-helper/fake-tmux proof for exact argv/target,
+    one-child replacement, exact-geometry resizing, and that nothing here can ever touch tmux --
+    popen/which/platform_name/embedder/read_xid_line/helper_ready/profile_uuid are fully
+    injected, so none of this needs a real X server, GTK, tmux session or gsettings."""
+
+    def _controller(self, helper_ready=True, platform="xcb", winid=999, width=640, height=480,
+                     embedder=None, xid_line="XID=555\n", profile_uuid=None):
+        container = _FakeWinIdContainer(winid, width, height)
+        calls = []
+
+        def fake_popen(argv, **kwargs):
+            calls.append(argv)
+            return _FakeEmbedProcess(argv, stdout_lines=(xid_line,) if xid_line else ())
+
+        embedder = embedder if embedder is not None else _FakeEmbedder()
+        ctl = session_hub.EmbeddedTerminalController(
+            container, popen=fake_popen, which=lambda name: f"/usr/bin/{name}",
+            platform_name=lambda: platform, embedder=embedder,
+            read_xid_line=lambda proc, timeout: proc.stdout.readline() or None,
+            helper_ready=lambda: helper_ready,
+            profile_uuid=lambda: profile_uuid,
+        )
+        return ctl, calls, embedder, container
+
+    def test_attach_exact_argv_and_target(self):
+        ctl, calls, embedder, _container = self._controller(winid=999)
+        ok, _detail = ctl.attach("vamp-worker2")
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]
+        self.assertEqual(argv[0], "/usr/bin/python3")
+        self.assertTrue(argv[1].endswith("vte_embed_helper.py"))
+        self.assertEqual(argv[2:6], ["--socket-id", "999", "--tmux-session", "vamp-worker2"])
+        self.assertEqual(ctl.current_name, "vamp-worker2")
+        self.assertNotIn("--profile-uuid", argv)  # profile_uuid=None here -> omitted, not blank
+
+    def test_attach_includes_profile_uuid_when_resolved(self):
+        ctl, calls, _embedder, _container = self._controller(profile_uuid="uuid-xyz")
+        ctl.attach("a")
+        self.assertIn("--profile-uuid", calls[0])
+        self.assertEqual(calls[0][calls[0].index("--profile-uuid") + 1], "uuid-xyz")
+
+    def test_attach_resizes_the_reported_child_to_the_exact_container_size(self):
+        ctl, _calls, embedder, _container = self._controller(width=800, height=600)
+        ctl.attach("a")
+        self.assertEqual(embedder.calls, [(555, 800, 600)])
+
+    def test_switching_sessions_replaces_the_one_child_and_never_touches_tmux(self):
+        ctl, calls, _embedder, _container = self._controller()
+        ctl.attach("a")
+        first_proc = ctl.process
+        ctl.attach("b")
+        self.assertTrue(first_proc.terminated)
+        self.assertFalse(first_proc.killed)  # graceful terminate, not a hard kill
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(ctl.current_name, "b")
+        self.assertIsNot(ctl.process, first_proc)
+        for argv in calls:
+            self.assertNotIn("kill-session", argv)
+            self.assertNotIn("kill-server", argv)
+
+    def test_reattaching_the_same_alive_session_is_a_no_op_at_the_controller_level(self):
+        # (the widget-level no-op short-circuit lives in _switch_embedded_terminal; this proves
+        # the controller itself is safe to call attach() twice in a row regardless.)
+        ctl, calls, _embedder, _container = self._controller()
+        ctl.attach("a")
+        first_proc = ctl.process
+        ctl.attach("a")
+        self.assertTrue(first_proc.terminated)
+        self.assertEqual(len(calls), 2)
+
+    def test_not_x11_fails_closed_and_launches_nothing(self):
+        ctl, calls, _embedder, _container = self._controller(platform="offscreen")
+        ok, detail = ctl.attach("a")
+        self.assertFalse(ok)
+        self.assertIn("X11", detail)
+        self.assertEqual(calls, [])
+        self.assertIsNone(ctl.process)
+
+    def test_helper_unavailable_fails_closed_and_launches_nothing(self):
+        ctl, calls, _embedder, _container = self._controller(helper_ready=False)
+        ok, detail = ctl.attach("a")
+        self.assertFalse(ok)
+        self.assertIn("helper", detail)
+        self.assertEqual(calls, [])
+
+    def test_invalid_window_id_fails_closed_and_launches_nothing(self):
+        ctl, calls, _embedder, _container = self._controller(winid=0)
+        ok, detail = ctl.attach("a")
+        self.assertFalse(ok)
+        self.assertEqual(calls, [])
+
+    def test_no_xid_reported_fails_closed_and_terminates_the_helper(self):
+        ctl, calls, embedder, _container = self._controller(xid_line=None)
+        ok, detail = ctl.attach("a")
+        self.assertFalse(ok)
+        self.assertIn("window id", detail)
+        self.assertEqual(embedder.calls, [])  # never resized a child we never got an id for
+        self.assertIsNone(ctl.process)  # detach() already cleaned up the failed helper
+
+    def test_embedder_resize_failure_fails_closed(self):
+        ctl, _calls, _embedder, _container = self._controller(embedder=_FakeEmbedder(fail=True))
+        ok, detail = ctl.attach("a")
+        self.assertFalse(ok)
+        self.assertIn("size", detail)
+        self.assertIsNone(ctl.process)
+
+    def test_detach_terminates_the_helper_only_never_tmux(self):
+        ctl, _calls, _embedder, _container = self._controller()
+        ctl.attach("a")
+        proc = ctl.process
+        ctl.detach()
+        self.assertTrue(proc.terminated)
+        self.assertIsNone(ctl.process)
+        self.assertIsNone(ctl.current_name)
+
+    def test_detach_with_nothing_attached_is_a_safe_no_op(self):
+        ctl, _calls, _embedder, _container = self._controller()
+        ctl.detach()  # must not raise
+        self.assertIsNone(ctl.process)
+
+    def test_poll_alive_true_while_child_is_running(self):
+        ctl, _calls, _embedder, _container = self._controller()
+        ctl.attach("a")
+        self.assertTrue(ctl.poll_alive())
+        self.assertEqual(ctl.current_name, "a")  # unaffected by a live poll
+
+    def test_poll_alive_clears_state_without_touching_tmux_when_child_exits(self):
+        ctl, _calls, _embedder, _container = self._controller()
+        ctl.attach("a")
+        ctl.process._alive = False  # the child exited on its own (tmux session gone, crash, ...)
+        self.assertFalse(ctl.poll_alive())
+        self.assertIsNone(ctl.process)
+        self.assertIsNone(ctl.current_name)
+
+    def test_launch_oserror_fails_closed_without_raising(self):
+        container = _FakeWinIdContainer(999)
+
+        def raising_popen(argv, **kwargs):
+            raise OSError("python3 not executable")
+
+        ctl = session_hub.EmbeddedTerminalController(
+            container, popen=raising_popen, which=lambda name: f"/usr/bin/{name}",
+            platform_name=lambda: "xcb", embedder=_FakeEmbedder(),
+            helper_ready=lambda: True, profile_uuid=lambda: None,
+        )
+        ok, detail = ctl.attach("a")
+        self.assertFalse(ok)
+        self.assertIn("helper", detail)
+        self.assertIsNone(ctl.process)
+
+    def test_resize_to_container_is_a_no_op_before_any_attach(self):
+        ctl, _calls, embedder, _container = self._controller()
+        ctl.resize_to_container()  # must not raise
+        self.assertEqual(embedder.calls, [])
+
+    def test_resize_to_container_tracks_two_separate_resizes_exactly(self):
+        ctl, _calls, embedder, container = self._controller(width=640, height=480)
+        ctl.attach("a")
+        self.assertEqual(embedder.calls[-1], (555, 640, 480))  # initial fill, from attach()
+
+        container.resize(900, 500)
+        ctl.resize_to_container()
+        self.assertEqual(embedder.calls[-1], (555, 900, 500))  # resize #1: exact new size
+
+        container.resize(1024, 768)
+        ctl.resize_to_container()
+        self.assertEqual(embedder.calls[-1], (555, 1024, 768))  # resize #2: exact new size
+
+        container.resize(700, 768)  # simulates a splitter drag: width-only change
+        ctl.resize_to_container()
+        self.assertEqual(embedder.calls[-1], (555, 700, 768))  # splitter move: exact new size
+        self.assertEqual(len(embedder.calls), 4)  # one child, resized exactly each time
+
+    def test_resize_to_container_is_a_no_op_after_the_child_exits(self):
+        ctl, _calls, embedder, container = self._controller()
+        ctl.attach("a")
+        embedder.calls.clear()
+        ctl.process._alive = False
+        ctl.poll_alive()  # clears process/current_name, matching production's liveness check
+        container.resize(1200, 900)
+        ctl.resize_to_container()
+        self.assertEqual(embedder.calls, [])
+
+    def test_begin_attach_never_reads_stdout_itself(self):
+        """task-2142 row453 REWORK -- orchestrator audit, 2026-08-30: begin_attach must launch
+        and return WITHOUT touching stdout at all; only the caller-driven finish_attach (fed by a
+        real QSocketNotifier in production) reads the XID line, so the GUI thread is never
+        blocked waiting on it."""
+        def poisoned_read_xid_line(proc, timeout):
+            raise AssertionError("begin_attach must never read stdout itself")
+
+        container = _FakeWinIdContainer(999)
+        calls = []
+
+        def fake_popen(argv, **kwargs):
+            calls.append(argv)
+            return _FakeEmbedProcess(argv)
+
+        ctl = session_hub.EmbeddedTerminalController(
+            container, popen=fake_popen, which=lambda name: f"/usr/bin/{name}",
+            platform_name=lambda: "xcb", embedder=_FakeEmbedder(),
+            read_xid_line=poisoned_read_xid_line, helper_ready=lambda: True,
+            profile_uuid=lambda: None,
+        )
+        ok, detail = ctl.begin_attach("a")
+        self.assertTrue(ok)
+        self.assertEqual(detail, "launching")
+        self.assertEqual(len(calls), 1)
+
+    def test_begin_attach_then_finish_attach_completes_exactly_like_attach(self):
+        ctl, _calls, embedder, container = self._controller(width=800, height=600)
+        ok, detail = ctl.begin_attach("a")
+        self.assertTrue(ok)
+        self.assertEqual(detail, "launching")
+        self.assertIsNone(ctl.current_name)  # not attached yet -- awaiting the XID line
+        ok2, detail2 = ctl.finish_attach("XID=555\n")
+        self.assertTrue(ok2)
+        self.assertEqual(detail2, "attached")
+        self.assertEqual(ctl.current_name, "a")
+        self.assertEqual(embedder.calls, [(555, 800, 600)])
+
+    def test_finish_attach_timeout_line_none_fails_closed(self):
+        ctl, _calls, embedder, _container = self._controller()
+        ctl.begin_attach("a")
+        ok, detail = ctl.finish_attach(None)  # the bounded singleShot timeout case
+        self.assertFalse(ok)
+        self.assertIn("window id", detail)
+        self.assertIsNone(ctl.current_name)
+        self.assertEqual(embedder.calls, [])
+
+    def _stale_generation_controller(self):
+        """A->B selection before A's XID ever arrives (task-2142 row453 REWORK -- reviewer
+        rework: session_hub.py:7646-7677 stale notifier/timeout race). No `_controller()` fixture
+        reuse here -- this needs two independently-controlled fake processes, one per
+        begin_attach call, which the shared fixture's single `xid_line` can't express."""
+        container = _FakeWinIdContainer(999, 640, 480)
+        embedder = _FakeEmbedder()
+        ctl = session_hub.EmbeddedTerminalController(
+            container, popen=lambda argv, **kw: _FakeEmbedProcess(argv, stdout_lines=()),
+            which=lambda name: f"/usr/bin/{name}", platform_name=lambda: "xcb",
+            embedder=embedder, read_xid_line=lambda proc, timeout: None,
+            helper_ready=lambda: True, profile_uuid=lambda: None,
+        )
+        return ctl, embedder
+
+    def test_stale_generation_late_xid_never_overwrites_a_newer_attach(self):
+        """A's helper answers late, AFTER B is already attached -- A's XID must never be
+        recorded as B's (the "misattributes B" half of the reviewer finding)."""
+        ctl, embedder = self._stale_generation_controller()
+        ok, _detail = ctl.begin_attach("session-a")
+        self.assertTrue(ok)
+        generation_a = ctl.generation
+        ok, _detail = ctl.begin_attach("session-b")
+        self.assertTrue(ok)
+        generation_b = ctl.generation
+        self.assertNotEqual(generation_a, generation_b)
+        ok, _detail = ctl.finish_attach("XID=777\n", generation_b)
+        self.assertTrue(ok)
+        self.assertEqual(ctl.current_name, "session-b")
+        # A's late (and, in this scenario, otherwise-valid-looking) XID line arrives after B
+        # already attached -- stale generation must be silently ignored: no state mutation.
+        ok, _detail = ctl.finish_attach("XID=111\n", generation_a)
+        self.assertIsNone(ok)
+        self.assertEqual(ctl.current_name, "session-b")
+        self.assertEqual(embedder.calls, [(777, 640, 480)])
+
+    def test_stale_generation_late_timeout_never_detaches_a_newer_attach(self):
+        """A's timeout/EOF fires late, AFTER B is already attached -- it must never call
+        `detach()` and kill B's live process (the "detaches the live B process" half of the
+        reviewer finding)."""
+        ctl, embedder = self._stale_generation_controller()
+        ok, _detail = ctl.begin_attach("session-a")
+        self.assertTrue(ok)
+        generation_a = ctl.generation
+        ok, _detail = ctl.begin_attach("session-b")
+        self.assertTrue(ok)
+        generation_b = ctl.generation
+        ok, _detail = ctl.finish_attach("XID=777\n", generation_b)
+        self.assertTrue(ok)
+        b_process = ctl.process
+        self.assertIsNotNone(b_process)
+        ok, _detail = ctl.finish_attach(None, generation_a)  # A's stale timeout/EOF
+        self.assertIsNone(ok)
+        self.assertEqual(ctl.current_name, "session-b")
+        self.assertIs(ctl.process, b_process)
+        self.assertFalse(b_process.terminated)
+        self.assertEqual(embedder.calls, [(777, 640, 480)])
+
+    def test_stale_generation_survives_a_failed_replacement_launch(self):
+        """A pending, B's replacement launch itself raises OSError -- A's generation must
+        already be invalid by the time that failure is reported, so A's late XID/timeout
+        cannot resurrect A's state through B's just-failed transition (task-2142 row453
+        REWORK round 2 -- reviewer HIGH finding: generation was previously bumped only after
+        popen() succeeded, leaving a hole between detach()ing A and a failed B popen())."""
+        container = _FakeWinIdContainer(999, 640, 480)
+        embedder = _FakeEmbedder()
+        calls = []
+
+        def flaky_popen(argv, **kw):
+            calls.append(argv)
+            if len(calls) == 1:
+                return _FakeEmbedProcess(argv, stdout_lines=())
+            raise OSError("helper binary vanished")
+
+        ctl = session_hub.EmbeddedTerminalController(
+            container, popen=flaky_popen, which=lambda name: f"/usr/bin/{name}",
+            platform_name=lambda: "xcb", embedder=embedder,
+            read_xid_line=lambda proc, timeout: None, helper_ready=lambda: True,
+            profile_uuid=lambda: None,
+        )
+        ok, _detail = ctl.begin_attach("session-a")
+        self.assertTrue(ok)
+        generation_a = ctl.generation
+        ok, detail = ctl.begin_attach("session-b")
+        self.assertFalse(ok)
+        self.assertIn("failed to launch", detail)
+        # The failed replacement must already have invalidated A's generation and torn down
+        # A's process (detach() ran before the failing popen()) -- nothing is "current".
+        self.assertIsNone(ctl.process)
+        self.assertIsNone(ctl.current_name)
+        # A's late XID arrives after B's launch already failed -- must be silently ignored,
+        # never resurrected as a live attach and never reported through B's failure callback.
+        ok, _detail = ctl.finish_attach("XID=111\n", generation_a)
+        self.assertIsNone(ok)
+        self.assertIsNone(ctl.current_name)
+        self.assertIsNone(ctl.process)
+        self.assertEqual(embedder.calls, [])
+        # Same for A's late timeout/EOF instead of a late XID.
+        ok, _detail = ctl.finish_attach(None, generation_a)
+        self.assertIsNone(ok)
+        self.assertIsNone(ctl.current_name)
+        self.assertEqual(embedder.calls, [])
+
+
+class MetadataShrinkGuardTests(unittest.TestCase):
+    """task-2142 row453 incident, 2026-08-30: write_metadata must refuse to silently replace a
+    substantially-larger existing metadata.json with an implausibly small write -- see the
+    docstring at session_hub._refuse_drastic_metadata_shrink for the incident this backstops
+    (an ad-hoc unsandboxed debug script overwrote the real file via discover_sessions())."""
+
+    def test_fresh_install_no_existing_file_never_refuses(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(session_hub, "METADATA_PATH", Path(temp) / "metadata.json"):
+                session_hub._refuse_drastic_metadata_shrink({"sessions": {}})  # must not raise
+
+    def test_existing_file_below_min_bytes_never_refuses(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "metadata.json"
+            path.write_text("{}")
+            with patch.object(session_hub, "METADATA_PATH", path):
+                session_hub._refuse_drastic_metadata_shrink({"sessions": {}})  # must not raise
+
+    def test_drastic_shrink_refuses_and_leaves_the_file_untouched(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "metadata.json"
+            big = json.dumps({"sessions": {f"s{i}": {"x": "y" * 50} for i in range(200)}})
+            path.write_text(big)
+            before = path.read_text()
+            with patch.object(session_hub, "METADATA_PATH", path):
+                with self.assertRaises(RuntimeError):
+                    session_hub._refuse_drastic_metadata_shrink({"sessions": {}})
+            self.assertEqual(path.read_text(), before)
+
+    def test_modest_shrink_within_ratio_does_not_refuse(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "metadata.json"
+            data = {"sessions": {f"s{i}": {"x": "y" * 50} for i in range(20)}}
+            path.write_text(json.dumps(data))
+            with patch.object(session_hub, "METADATA_PATH", path):
+                trimmed = dict(data)
+                trimmed["sessions"] = dict(list(data["sessions"].items())[:16])  # ~80% remains
+                session_hub._refuse_drastic_metadata_shrink(trimmed)  # must not raise
+
+    def test_explicit_override_env_var_permits_a_drastic_shrink(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "metadata.json"
+            big = json.dumps({"sessions": {f"s{i}": {"x": "y" * 50} for i in range(200)}})
+            path.write_text(big)
+            with (
+                patch.object(session_hub, "METADATA_PATH", path),
+                patch.dict(os.environ, {"SESSION_HUB_ALLOW_METADATA_SHRINK": "1"}),
+            ):
+                session_hub._refuse_drastic_metadata_shrink({"sessions": {}})  # must not raise
+
+    def test_write_metadata_itself_refuses_end_to_end(self):
+        """Not just the pure helper -- write_metadata's real call path refuses too."""
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "metadata.json"
+            big = json.dumps({"sessions": {f"s{i}": {"x": "y" * 50} for i in range(200)}})
+            path.write_text(big)
+            before = path.read_text()
+            with (
+                patch.object(session_hub, "METADATA_PATH", path),
+                patch.object(session_hub, "DATA_DIR", Path(temp)),
+            ):
+                with self.assertRaises(RuntimeError):
+                    session_hub.write_metadata({"sessions": {}})
+            self.assertEqual(path.read_text(), before)
+
+
+class RunningTabEmbeddedTerminalTests(unittest.TestCase):
+    """task-2142 row453 REWORK: widget-level proof that single click, Enter and double-click all
+    converge on the same exact embedded switch; that a systemic embedding failure OR an unexpected
+    helper exit both show in-panel and fall back to external attachment; that the panel is resized
+    to the exact container size on every container resize and splitter drag (never just at attach
+    time); and that the fix for the reviewer's REWORK finding -- no dedicated poll timer beyond
+    the existing 2s status tick -- actually holds."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _window_with_one_running_session(self):
+        # Same fixture shape as the passing running_context_menu tests above: a tmux GROUP row
+        # (not a bare standalone Session) is what refresh_running_tab's group branch recognizes
+        # without a full self.sessions population.
+        session = session_hub.Session(
+            "Claude", "id-embed1", "t", "/tmp/vampembed", "/tmp/vampembed", 100,
+            Path("/tmp/vampembed.jsonl"), agent_name="vamp-embed",
+        )
+        metadata = {
+            "settings": {}, "sessions": {},
+            "groups": {"/tmp/vampembed": {"tmux": True, "rows": [{"name": "vamp-embed"}]}},
+        }
+        ctx = (
+            patch.object(session_hub, "read_metadata", return_value=metadata),
+            patch.object(session_hub, "claude_sessions", return_value=[session]),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub, "tmux_session_alive", return_value=True),
+        )
+        for c in ctx:
+            c.start()
+        window = session_hub.SessionHub()
+        window.refresh_running_tab()
+        self.addCleanup(window.close)
+        for c in ctx:
+            self.addCleanup(c.stop)
+        return window
+
+    def _wire_fake_embedding(self, window, embedder=None, xid_line="XID=555\n"):
+        # The controller instance already exists (built in SessionHub.__init__ with the real
+        # subprocess.Popen/shutil.which/etc bound as early-evaluated default arguments), so
+        # patching the subprocess/gsettings/Xlib MODULES here would never reach it -- substitute
+        # its own injected seams directly instead, exactly what production code would pass at
+        # construction time.
+        embedder = embedder if embedder is not None else _FakeEmbedder()
+        calls = []
+
+        def fake_popen(argv, **kwargs):
+            calls.append(argv)
+            return _FakeEmbedProcess(argv, stdout_lines=(xid_line,) if xid_line else ())
+
+        window._embedded_terminal._popen = fake_popen
+        window._embedded_terminal._which = lambda name: f"/usr/bin/{name}"
+        window._embedded_terminal._embedder = embedder
+        window._embedded_terminal._read_xid_line = lambda proc, timeout: proc.stdout.readline() or None
+        window._embedded_terminal._helper_ready = lambda: True
+        window._embedded_terminal._profile_uuid = lambda: None
+        # _await_embed_xid normally waits on a QSocketNotifier over the helper's REAL stdout fd,
+        # which a fake process has none of -- complete it synchronously instead, exercising the
+        # exact same _finish_embed_attach the real notifier callback calls.
+        window._await_embed_xid = lambda cwd, name, session_id: window._finish_embed_attach(
+            cwd, name, session_id, xid_line
+        )
+        return calls, embedder
+
+    def test_click_enter_and_double_click_all_embed_the_exact_same_target(self):
+        window = self._window_with_one_running_session()
+        item = window.running_table.item(0, 0)
+        calls, _embedder = self._wire_fake_embedding(window)
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            # single click (itemClicked)
+            window._activate_running_row(item)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][-1], "vamp-embed")
+            self.assertEqual(
+                window._running_terminal_stack.currentWidget(), window.running_terminal_container
+            )
+            # Enter/double-click on the SAME still-alive session (itemActivated) -- no new child
+            window._activate_running_row(item)
+            self.assertEqual(len(calls), 1)
+
+    def test_embedding_failure_shows_in_panel_and_falls_back_externally(self):
+        window = self._window_with_one_running_session()
+        item = window.running_table.item(0, 0)
+        with (
+            patch.object(session_hub.QApplication, "platformName", return_value="offscreen"),
+            patch.object(window, "_focus_or_resume_session") as focus_mock,
+        ):
+            window._activate_running_row(item)
+        self.assertEqual(
+            window._running_terminal_stack.currentWidget(), window.running_terminal_failure
+        )
+        self.assertIn("X11", window.running_terminal_failure.text())
+        focus_mock.assert_called_once_with("/tmp/vampembed", "vamp-embed", "id-embed1")
+
+    def test_unexpected_helper_exit_shows_in_panel_and_falls_back_externally(self):
+        """VAMP-reviewer REWORK finding (task2142-row453): child-exit detection showed the
+        failure label but never called the external fallback the way a failed attach does."""
+        window = self._window_with_one_running_session()
+        item = window.running_table.item(0, 0)
+        self._wire_fake_embedding(window)
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window._activate_running_row(item)
+        window._embedded_terminal.process._alive = False  # helper exited on its own
+        with patch.object(window, "_focus_or_resume_session") as focus_mock:
+            window._check_embedded_terminal_liveness()
+        self.assertEqual(
+            window._running_terminal_stack.currentWidget(), window.running_terminal_failure
+        )
+        self.assertIn("exited", window.running_terminal_failure.text())
+        focus_mock.assert_called_once_with("/tmp/vampembed", "vamp-embed", "id-embed1")
+
+    def test_no_dedicated_poll_timer_liveness_rides_the_existing_2s_status_tick(self):
+        """VAMP-reviewer REWORK finding: a prior version added its own 1s QTimer despite the
+        brief's explicit no-new-periodic-poll rule. Budget control: exactly the pre-existing
+        `_status_timer` (2000ms) exists; no second timer was reintroduced."""
+        window = self._window_with_one_running_session()
+        self.assertFalse(hasattr(window, "_embedded_terminal_poll"))
+        self.assertEqual(window._status_timer.interval(), 2000)
+
+    def test_switching_terminal_never_blocks_on_a_synchronous_stdout_read(self):
+        """task-2142 row453 REWORK -- orchestrator audit, 2026-08-30: the real widget path
+        (begin_attach + QSocketNotifier + finish_attach) must never call the blocking
+        `_read_xid_line` seam -- that one is only for the synchronous `attach()` test/non-GUI
+        convenience wrapper. Poison it and drive `_switch_embedded_terminal` for real (not via
+        the `_await_embed_xid` test override) to prove the production call graph never reaches
+        it."""
+        window = self._window_with_one_running_session()
+        item = window.running_table.item(0, 0)
+        calls, _embedder = self._wire_fake_embedding(window)
+
+        def poisoned(proc, timeout):
+            raise AssertionError("the widget path must never block reading stdout itself")
+        window._embedded_terminal._read_xid_line = poisoned
+        # Undo the test-only synchronous _await_embed_xid override from _wire_fake_embedding --
+        # this test wants the REAL begin_attach/_await_embed_xid split, driven by directly calling
+        # _finish_embed_attach the way the real QSocketNotifier callback would (never by touching
+        # the poisoned _read_xid_line).
+        del window._await_embed_xid
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window._activate_running_row(item)  # begin_attach only -- must not raise/block
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(window._embedded_terminal.current_name)  # not finished yet
+        window._finish_embed_attach("/tmp/vampembed", "vamp-embed", "id-embed1", "XID=555\n")
+        self.assertEqual(window._embedded_terminal.current_name, "vamp-embed")
+
+    def test_initial_attach_two_resizes_and_a_splitter_move_each_fill_the_container_exactly(self):
+        """Xvfb/widget geometry control (orchestrator ROW453 addenda): initial size, two resizes
+        and a splitter move each resize the ONE embedded child to the container's exact pixel
+        size -- never left at a stale/cropped size from a previous fill.
+
+        Drives the container's REAL `resizeEvent` override via `QApplication.sendEvent` (the
+        same delivery mechanism Qt itself uses, just invoked directly) rather than `window.show()`
+        -- a real `show()` under `QT_QPA_PLATFORM=offscreen` segfaults this process at interpreter
+        teardown for this splitter/stack widget tree (unrelated to correctness: the same exact-
+        geometry/one-child contract is also proven end-to-end against REAL X11/Gtk.Plug in
+        EmbeddedTerminalXvfbSmokeTest below, with no Qt widget tree involved at all)."""
+        window = self._window_with_one_running_session()
+        item = window.running_table.item(0, 0)
+        _calls, embedder = self._wire_fake_embedding(window)
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window._activate_running_row(item)
+        self.assertEqual(len(embedder.calls), 1)  # initial fill, one child
+        child_winid = embedder.calls[0][0]
+
+        container = window.running_terminal_container
+        for width, height in [(801, 601), (1024, 700)]:  # resize #1, resize #2
+            old_size = container.size()
+            container.resize(width, height)
+            QApplication.sendEvent(container, QResizeEvent(container.size(), old_size))
+            self.assertEqual(embedder.calls[-1], (child_winid, width, height))
+
+        # A splitter drag resizes the container the same way -- `_on_terminal_container_resize` is
+        # exactly what `running_splitter.splitterMoved` is wired to (see build_ui).
+        old_size = container.size()
+        container.resize(700, 768)
+        window._on_terminal_container_resize()
+        self.assertEqual(embedder.calls[-1], (child_winid, 700, 768))
+        self.assertEqual(len(embedder.calls), 4)  # one child, resized exactly each time
+        self.assertNotEqual(old_size, container.size())
+
+    def test_close_ends_only_the_embedded_client_never_tmux(self):
+        window = self._window_with_one_running_session()
+        fake = _FakeEmbedProcess(["python3"])
+        window._embedded_terminal.process = fake
+        window._embedded_terminal.current_name = "vamp-embed"
+        with patch.object(session_hub, "QApplication") as qapp_cls:
+            qapp_cls.platformName.return_value = "offscreen"
+            window.close()
+        self.assertTrue(fake.terminated)
+        self.assertFalse(fake.killed)
+
+
+class SearchFilterTests(unittest.TestCase):
+    """task-2142 row453 REWORK (orchestrator search REWORK): the search box filters whichever
+    tab is visible. Running gets a cached-data-only filter over its already-populated rows
+    (name/status/last-message plus hidden identity fields); All Sessions additionally surfaces
+    matching saved group members as their own directly-activatable rows."""
+
+    def _window(self, metadata=None):
+        metadata = metadata or {"sessions": {}, "settings": {}, "groups": {}}
+        with patch("session_hub.read_metadata", return_value=metadata):
+            window = session_hub.SessionHub()
+        self.addCleanup(window.close)
+        return window
+
+    def test_running_search_matches_name_status_last_message_and_hidden_identity_field(self):
+        window = self._window()
+        window.running_table.setRowCount(2)
+        item_a = session_hub.QTableWidgetItem("alpha")
+        item_a.setData(session_hub.Qt.ItemDataRole.UserRole, ("/tmp/alpha", "alpha", "sess-alpha-id"))
+        window.running_table.setItem(0, 0, item_a)
+        window.running_table.setItem(0, 1, session_hub.QTableWidgetItem("Working"))
+        window.running_table.setItem(0, 2, session_hub.QTableWidgetItem("building the widget"))
+        item_b = session_hub.QTableWidgetItem("beta")
+        item_b.setData(session_hub.Qt.ItemDataRole.UserRole, ("/tmp/beta", "beta", "sess-beta-id"))
+        window.running_table.setItem(1, 0, item_b)
+        window.running_table.setItem(1, 1, session_hub.QTableWidgetItem("Idle"))
+        window.running_table.setItem(1, 2, session_hub.QTableWidgetItem("waiting"))
+
+        window._apply_running_filter("beta")  # name
+        self.assertTrue(window.running_table.isRowHidden(0))
+        self.assertFalse(window.running_table.isRowHidden(1))
+
+        window._apply_running_filter("working")  # status
+        self.assertFalse(window.running_table.isRowHidden(0))
+        self.assertTrue(window.running_table.isRowHidden(1))
+
+        window._apply_running_filter("waiting")  # last message
+        self.assertTrue(window.running_table.isRowHidden(0))
+        self.assertFalse(window.running_table.isRowHidden(1))
+
+        window._apply_running_filter("sess-alpha-id")  # hidden identity field, never shown text
+        self.assertFalse(window.running_table.isRowHidden(0))
+        self.assertTrue(window.running_table.isRowHidden(1))
+
+        window._apply_running_filter("")  # cleared
+        self.assertFalse(window.running_table.isRowHidden(0))
+        self.assertFalse(window.running_table.isRowHidden(1))
+
+    def test_running_tab_search_never_triggers_a_rescan_per_keystroke(self):
+        # Exercises `_apply_running_filter` directly (never a real tab switch, which would
+        # itself trigger refresh_running_tab()'s own -- separate, expected -- discovery pass)
+        # so this control isolates exactly what the perf requirement covers: the search
+        # keystrokes themselves, not tab activation.
+        window = self._window()
+        window.running_table.setRowCount(1)
+        item = session_hub.QTableWidgetItem("alpha")
+        item.setData(session_hub.Qt.ItemDataRole.UserRole, ("/tmp/alpha", "alpha", None))
+        window.running_table.setItem(0, 0, item)
+        window.running_table.setItem(0, 1, session_hub.QTableWidgetItem("Idle"))
+        window.running_table.setItem(0, 2, session_hub.QTableWidgetItem(""))
+        with patch("session_hub.codex_sessions") as codex, \
+                patch("session_hub.claude_sessions") as claude, \
+                patch("session_hub.antigravity_sessions") as antigravity, \
+                patch("session_hub.tmux_live_session_names") as live_names, \
+                patch("session_hub.tmux_pane_activity_snapshot") as pane_snapshot:
+            window._apply_running_filter("a")
+            window._apply_running_filter("al")
+            window._apply_running_filter("alpha")
+        codex.assert_not_called()
+        claude.assert_not_called()
+        antigravity.assert_not_called()
+        live_names.assert_not_called()
+        pane_snapshot.assert_not_called()
+
+    def test_all_sessions_search_surfaces_matching_member_excludes_sibling_no_duplicate(self):
+        metadata = {
+            "sessions": {},
+            "settings": {"enable_codex": False, "enable_claude": False, "enable_antigravity": False},
+            "groups": {
+                "/tmp/proj": {
+                    "cwd": "/tmp/proj", "display_name": "proj",
+                    "rows": [
+                        {"name": "matching-row", "provider": "Claude"},
+                        {"name": "other-row", "provider": "Claude"},
+                    ],
+                }
+            },
+            "links": {},
+        }
+        window = self._window(metadata)
+        base_rows = window.table.rowCount()
+        self.assertEqual(base_rows, 1)  # the group's one collapsed summary row
+
+        window.search.setText("matching")
+        self.assertEqual(window.table.rowCount(), base_rows + 1)
+        self.assertTrue(window.table.isRowHidden(0))  # collapsed summary hides during search
+        self.assertFalse(window.table.isRowHidden(base_rows))
+        name_column = window.SESSION_TABLE_COLUMNS.index("Name")
+        names = [window.table.item(row, name_column).text() for row in range(window.table.rowCount())]
+        self.assertEqual(sum("matching-row" in n for n in names), 1)  # exactly once, no duplicate
+        self.assertFalse(any("other-row" in n for n in names))  # nonmatching sibling excluded
+
+        member_item = window.table.item(base_rows, 0)
+        self.assertEqual(
+            member_item.data(session_hub.Qt.ItemDataRole.UserRole + 2),
+            ("/tmp/proj", "matching-row", None),
+        )
+        window.table.setCurrentCell(base_rows, 0)
+        with patch.object(window, "_focus_or_resume_session") as focus_or_resume:
+            window.resume_selected()
+        focus_or_resume.assert_called_once_with("/tmp/proj", "matching-row", None)
+
+        window.search.setText("")  # cleared -- restores the ordinary grouped table exactly
+        self.assertEqual(window.table.rowCount(), base_rows)
+        self.assertFalse(window.table.isRowHidden(0))
+
+    def test_all_sessions_search_never_triggers_a_rescan_per_keystroke(self):
+        metadata = {
+            "sessions": {}, "settings": {}, "groups": {
+                "/tmp/proj": {"cwd": "/tmp/proj", "display_name": "proj",
+                              "rows": [{"name": "row-a", "provider": "Claude"}]},
+            },
+        }
+        window = self._window(metadata)
+        with patch("session_hub.codex_sessions") as codex, \
+                patch("session_hub.claude_sessions") as claude, \
+                patch("session_hub.antigravity_sessions") as antigravity:
+            window.search.setText("r")
+            window.search.setText("ro")
+            window.search.setText("row-a")
+        codex.assert_not_called()
+        claude.assert_not_called()
+        antigravity.assert_not_called()
+
+
+@unittest.skipUnless(shutil.which("Xvfb"), "Xvfb not installed")
+@unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
+class EmbeddedTerminalXvfbSmokeTest(unittest.TestCase):
+    """task-2142 row453 REWORK live smoke: a REAL vte_embed_helper.py subprocess, a REAL
+    Gtk.Plug embed, and REAL X11 resize calls, all confined to a private throw-away Xvfb display
+    -- never the user's live X session. Proves the actual integration point (not just the fakes
+    above): the helper's window really does end up as the socket's one child, and really does end
+    up at the exact requested pixel size after a fresh embed and two follow-up resizes."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import gi
+            gi.require_version("Gtk", "3.0")
+            gi.require_version("Vte", "2.91")
+            from gi.repository import Gtk, Vte  # noqa: F401
+            from Xlib import display as _xlib_display  # noqa: F401
+        except (ImportError, ValueError) as e:
+            raise unittest.SkipTest(f"embed helper dependencies unavailable: {e}")
+
+        cls.display_num = 97  # arbitrary, unlikely-to-collide private display
+        cls.xvfb = subprocess.Popen(
+            ["Xvfb", f":{cls.display_num}", "-screen", "0", "800x600x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        cls.env = dict(os.environ, DISPLAY=f":{cls.display_num}")
+        from Xlib import display as xlib_display
+
+        deadline = time.monotonic() + 5.0
+        cls.disp = None
+        while time.monotonic() < deadline:
+            try:
+                cls.disp = xlib_display.Display(f":{cls.display_num}")
+                break
+            except Exception:
+                time.sleep(0.1)
+        if cls.disp is None:
+            cls.xvfb.terminate()
+            raise unittest.SkipTest("Xvfb did not become ready in time")
+
+        cls.tmux_session = "row453-xvfb-smoke"
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", cls.tmux_session, "sleep 60"],
+            check=True, env=cls.env,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        subprocess.run(["tmux", "kill-session", "-t", cls.tmux_session],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if getattr(cls, "disp", None) is not None:
+            cls.disp.close()
+        cls.xvfb.terminate()
+        cls.xvfb.wait(timeout=5)
+
+    def test_real_embed_is_one_child_at_exact_geometry_across_two_resizes(self):
+        root = self.disp.screen().root
+        socket_win = root.create_window(
+            0, 0, 640, 480, 0, self.disp.screen().root_depth,
+        )
+        socket_win.map()
+        self.disp.sync()
+
+        helper = str(Path(__file__).resolve().parent / "vte_embed_helper.py")
+        proc = subprocess.Popen(
+            [sys.executable, helper, "--socket-id", str(socket_win.id),
+             "--tmux-session", self.tmux_session],
+            stdout=subprocess.PIPE, text=True, bufsize=1, env=self.env,
+        )
+        self.addCleanup(lambda: (proc.terminate(), proc.wait(timeout=5)))
+
+        ready, _, _ = select.select([proc.stdout], [], [], 10.0)
+        self.assertTrue(ready, "helper never reported an XID within 10s")
+        line = proc.stdout.readline().strip()
+        self.assertTrue(line.startswith("XID="), line)
+        child_id = int(line.split("=", 1)[1])
+
+        children = socket_win.query_tree().children
+        self.assertEqual(len(children), 1)  # exactly one embedded child
+        self.assertEqual(children[0].id, child_id)
+
+        embedder = session_hub._EmbedWindowResizer(display_factory=lambda: self.disp)
+        for width, height in [(640, 480), (900, 500), (1024, 768)]:
+            self.assertTrue(embedder.resize(child_id, width, height))
+            self.disp.sync()
+            geom = self.disp.create_resource_object("window", child_id).get_geometry()
+            self.assertEqual((geom.width, geom.height), (width, height))
+        self.assertEqual(len(socket_win.query_tree().children), 1)  # still exactly one child
 
 
 if __name__ == "__main__":
