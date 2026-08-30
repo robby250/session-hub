@@ -1036,8 +1036,6 @@ class SessionLaunchOptionsDialog(QDialog):
         flag_overrides: dict,
         parent=None,
         scope: str = "this session",
-        show_tmux: bool = False,
-        tmux_override: bool | None = None,
         provider: str = "Claude",
         model: str | None = None,
         reasoning_effort: str | None = None,
@@ -1092,28 +1090,6 @@ class SessionLaunchOptionsDialog(QDialog):
             )
         self.editor = LaunchOptionsEditor(env_overrides, flag_overrides)
         layout.addWidget(self.editor)
-        self.tmux_checkbox: QCheckBox | None = None
-        if show_tmux:
-            self.tmux_checkbox = QCheckBox("Launch in tmux")
-            self.tmux_checkbox.setTristate(True)
-            self.tmux_checkbox.setToolTip(
-                "Relaunches/resumes this session detached inside a tmux "
-                "session (named to match its --name flag, set in the CLI "
-                "flags tab above), with a terminal attached to it. Requires "
-                "tmux and gnome-terminal, and a --name flag set for this "
-                "session.\n\n"
-                "Three states: checked = always tmux, unchecked = never "
-                "tmux, dashed/partial = follow the global \"Launch every "
-                "session in tmux\" setting."
-            )
-            self.tmux_checkbox.setCheckState(
-                Qt.CheckState.PartiallyChecked
-                if tmux_override is None
-                else Qt.CheckState.Checked
-                if tmux_override
-                else Qt.CheckState.Unchecked
-            )
-            layout.addWidget(self.tmux_checkbox)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
             | QDialogButtonBox.StandardButton.Cancel
@@ -1127,14 +1103,6 @@ class SessionLaunchOptionsDialog(QDialog):
 
     def flags(self) -> dict:
         return self.editor.flags()
-
-    def tmux(self) -> bool | None:
-        if self.tmux_checkbox is None:
-            return None
-        state = self.tmux_checkbox.checkState()
-        if state == Qt.CheckState.PartiallyChecked:
-            return None
-        return state == Qt.CheckState.Checked
 
     def model(self) -> str | None:
         return codex_combo_value(self.codex_model_combo) if self.codex_model_combo else None
@@ -1647,7 +1615,7 @@ class _TerminalCacheEntry:
 
     __slots__ = (
         "container", "controller", "tmux_name", "meta", "state", "last_used",
-        "_await_notifier", "_await_timer",
+        "_await_notifier", "_await_timer", "paint_verified", "paint_verify_pending_generation",
     )
 
     def __init__(self, container, controller):
@@ -1659,6 +1627,15 @@ class _TerminalCacheEntry:
         self.last_used = 0.0
         self._await_notifier = None
         self._await_timer = None
+        # task-2172 fold-in (row504): whether `_verify_embed_painted` has ever confirmed this
+        # slot's current identity actually rendered. Reset on every new identity assignment (see
+        # `_assign_cache_slot`/`_evict_entry`) so a fresh attach is always reverified.
+        self.paint_verified = False
+        # REWORK (VAMP-reviewer HIGH-2, bbb2616): the controller.generation a paint-verify check
+        # is currently reserved/in-flight for, or None -- covers both the initial delayed check
+        # and its bounded retry, so a second promotion/re-entry before the callback fires cannot
+        # install a duplicate QTimer for the same attach. Reset alongside paint_verified.
+        self.paint_verify_pending_generation: int | None = None
 
 
 def format_reset_timestamp(timestamp: int | None) -> str:
@@ -3016,8 +2993,10 @@ def resolve_pending_codex_group_rows(metadata: dict, sessions: list[Session]) ->
     by_key = {session.native_key: session for session in sessions}
     changed = False
     for group in metadata.get("groups", {}).values():
-        if not group.get("tmux"):
-            continue
+        # REWORK (VAMP-reviewer HIGH-1, bbb2616): a group's "tmux" key is legacy debris from the
+        # removed per-group override control -- no code path writes it anymore, and every
+        # Codex launch is unconditionally tmux now, so a stale `tmux: false` here must never skip
+        # binding a genuinely live tmux-launched pending row to its transcript.
         for row in group.get("rows", []):
             if row.get("provider") != "Codex" or not row.get("codex_pending_since"):
                 continue
@@ -3326,6 +3305,16 @@ def tmux_group_launch_command(name: str, cwd: str, claude_args: list[str]) -> li
         '"$1" has-session -t "=$2" 2>/dev/null || "$1" new-session -d -s "$2" -c "$3" "$4";'
         ' "$1" set-option -g set-titles on >/dev/null;'
         ' "$1" set-option -g set-titles-string "#S" >/dev/null;'
+        # set-titles-string only reaches an OS window title bar, which the embedded pane has
+        # none of - the in-pane identity the user actually sees is tmux's OWN status line.
+        # status-left defaults to "[#S] " truncated at status-left-length 10, which is exactly
+        # the "VAMP-orch" truncation; status-right defaults to including #{pane_title}, which a
+        # shell/tool inside the pane can set via its own OSC title escape (e.g. to the project
+        # cwd), showing a stale project label instead of the session identity. `#S` is dynamic,
+        # so a rename propagates for free with no literal to keep in sync.
+        ' "$1" set-option -g status-left "#S " >/dev/null;'
+        ' "$1" set-option -g status-left-length 40 >/dev/null;'
+        ' "$1" set-option -g status-right "" >/dev/null;'
         ' "$1" set-option -g focus-events off >/dev/null',
         "session-hub",
         tmux,
@@ -4916,9 +4905,13 @@ def standalone_tmux_status(
     there is no tmux session to check. Pass a tmux_live_session_names()
     snapshot as `live_names` when calling this for more than one session per
     refresh.
+
+    REWORK (VAMP-reviewer HIGH-1, bbb2616): tmux_enabled comes from SESSION's own provider now,
+    never a legacy `overrides["tmux"]` override -- Claude/Codex are unconditionally tmux, and a
+    stale `false` used to report a genuinely live tmux session as not-tmux/stopped, also making
+    the standalone stop path refuse to stop it.
     """
-    explicit = overrides.get("tmux")
-    tmux_enabled = explicit if explicit is not None else settings.get("launch_in_tmux", False)
+    tmux_enabled = session.provider in ("Claude", "Codex")
     if not tmux_enabled:
         return False, None, None
     name = (overrides.get("flags") or {}).get("--name") or overrides.get("name") or session.title
@@ -5525,15 +5518,6 @@ class SettingsDialog(QDialog):
         )
         launch_note.setWordWrap(True)
         launch_layout.addWidget(launch_note)
-        self.launch_in_tmux = QCheckBox("Launch every session in tmux by default")
-        self.launch_in_tmux.setToolTip(
-            "Resumes and new group-row launches run detached inside tmux "
-            "unless a session's own \"Launch in tmux\" checkbox (right-click "
-            "a session → Launch options…, or a group's own checkbox) has "
-            "been explicitly set to override this."
-        )
-        self.launch_in_tmux.setChecked(bool(settings.get("launch_in_tmux", False)))
-        launch_layout.addWidget(self.launch_in_tmux)
         self.launch_options = LaunchOptionsEditor(
             settings.get("global_env") or {}, settings.get("global_flags") or {}
         )
@@ -5640,7 +5624,6 @@ class SettingsDialog(QDialog):
                 "global_flags": self.flags_editor.env(),
                 "claude_accounts_enabled": self.enable_accounts.isChecked(),
                 "claude_accounts": self.accounts_editor.env(),
-                "launch_in_tmux": self.launch_in_tmux.isChecked(),
                 "status_hooks_enabled": self.status_hooks_enabled.isChecked(),
             }
         )
@@ -5688,7 +5671,6 @@ class NewSessionDialog(QDialog):
         self.model: str | None = None
         self.reasoning_effort: str | None = None
         self.account_config_dir: str | None = None
-        self.use_tmux: bool = bool(settings.get("launch_in_tmux", False))
         self.claude_accounts = settings.get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS
         self.setWindowTitle(f"New {provider} Session")
         self.setMinimumWidth(600)
@@ -5756,17 +5738,6 @@ class NewSessionDialog(QDialog):
         self.existing_widget.setLayout(existing_row)
         form.addRow("Existing folder:", self.existing_widget)
         layout.addLayout(form)
-
-        self.tmux_checkbox = QCheckBox("Launch detached inside tmux")
-        self.tmux_checkbox.setChecked(self.use_tmux)
-        self.tmux_checkbox.setToolTip(
-            "Runs this session inside its own tmux session instead of "
-            "directly in a terminal, so tooling can drive it via "
-            "`tmux send-keys` with no focus impact. Requires tmux to be "
-            "installed. Defaults to the global Settings toggle, but can be "
-            "changed for this session only."
-        )
-        layout.addWidget(self.tmux_checkbox)
 
         self.preview = QLabel()
         self.preview.setWordWrap(True)
@@ -5867,7 +5838,6 @@ class NewSessionDialog(QDialog):
             if reason:
                 QMessageBox.warning(self, "Unsupported model/effort", reason)
                 return
-        self.use_tmux = self.tmux_checkbox.isChecked()
         super().accept()
 
 
@@ -6027,7 +5997,6 @@ class LaunchNewGroupSessionsDialog(QDialog):
         self,
         cwd: str,
         existing_names: set[str],
-        tmux: bool,
         parent=None,
         claude_accounts: dict[str, str] | None = None,
         accounts_enabled: bool = False,
@@ -6037,7 +6006,6 @@ class LaunchNewGroupSessionsDialog(QDialog):
         self.cwd = cwd
         self.existing_names = existing_names
         self.group_rows: list[dict] = []
-        self.use_tmux: bool = tmux
         self.claude_accounts = claude_accounts or DEFAULT_CLAUDE_ACCOUNTS
         self.accounts_enabled = accounts_enabled
         self.will_launch = will_launch
@@ -6048,23 +6016,6 @@ class LaunchNewGroupSessionsDialog(QDialog):
         directory_label = QLabel(f"Working directory: {cwd}")
         directory_label.setWordWrap(True)
         layout.addWidget(directory_label)
-
-        # will_launch=False ("Add new…"): the tmux choice has no effect here
-        # (register_group_row/add_new_rows_into_group never launches
-        # anything), so showing it would promise a behavior this dialog
-        # doesn't perform - it applies the next time the saved row is
-        # actually launched, via the group's own "Launch in tmux" checkbox.
-        self.tmux_checkbox = QCheckBox("Launch detached inside tmux")
-        self.tmux_checkbox.setChecked(tmux)
-        self.tmux_checkbox.setToolTip(
-            "Runs each session inside its own tmux session (named to match "
-            "--name) instead of directly in a terminal, so tooling can drive "
-            "it via `tmux send-keys` with no focus impact. Requires tmux to "
-            "be installed. /clear-detection isn't available yet for "
-            "tmux-launched sessions."
-        )
-        self.tmux_checkbox.setVisible(will_launch)
-        layout.addWidget(self.tmux_checkbox)
 
         layout.addWidget(QLabel("Sessions to launch:" if will_launch else "Sessions to add:"))
         self.table = QTableWidget(0, 5)
@@ -6276,7 +6227,6 @@ class LaunchNewGroupSessionsDialog(QDialog):
                     return
 
         self.group_rows = rows
-        self.use_tmux = self.tmux_checkbox.isChecked()
         super().accept()
 
 
@@ -6612,18 +6562,6 @@ class ManageGroupDialog(QDialog):
         )
         group_options_button.clicked.connect(self.edit_group_launch_options)
         controls.addWidget(group_options_button)
-        self.tmux_checkbox = QCheckBox("Launch in tmux")
-        self.tmux_checkbox.setToolTip(
-            "New launches of this group's members run detached inside tmux "
-            "instead of directly in a terminal. Already-running sessions "
-            "are unaffected until relaunched."
-        )
-        group = self.group()
-        self.tmux_checkbox.setChecked(
-            self.hub.effective_tmux(group.get("tmux") if group else None)
-        )
-        self.tmux_checkbox.toggled.connect(self.set_tmux)
-        controls.addWidget(self.tmux_checkbox)
         controls.addStretch(1)
         layout.addLayout(controls)
 
@@ -6811,7 +6749,7 @@ class ManageGroupDialog(QDialog):
             self.table.setCellWidget(index, self.TRANSCRIPTS_COLUMN, checkbox)
 
             status = group_row_status(
-                row, match, self.hub.effective_tmux(group.get("tmux")), live_names
+                row, match, self.hub.effective_tmux(row.get("provider", "Claude")), live_names
             )
             self.table.setItem(index, self.STATUS_COLUMN, QTableWidgetItem(status))
         if select_override_keys:
@@ -6828,13 +6766,6 @@ class ManageGroupDialog(QDialog):
         if not row:
             return
         row["transcripts"] = enabled
-        write_metadata(self.hub.metadata)
-
-    def set_tmux(self, enabled: bool) -> None:
-        group = self.group()
-        if not group:
-            return
-        group["tmux"] = enabled
         write_metadata(self.hub.metadata)
 
     def launch_row(self, name: str) -> None:
@@ -6927,7 +6858,6 @@ class ManageGroupDialog(QDialog):
         dialog = LaunchNewGroupSessionsDialog(
             self.cwd,
             existing_names,
-            self.tmux_checkbox.isChecked(),
             self,
             claude_accounts=self.hub.settings().get("claude_accounts") or DEFAULT_CLAUDE_ACCOUNTS,
             accounts_enabled=bool(self.hub.settings().get("claude_accounts_enabled")),
@@ -6993,8 +6923,8 @@ class ManageGroupDialog(QDialog):
                 continue
             if label == "Resume in new terminal":
                 # Not the generic bound slot: that calls hub.launch()
-                # directly with no use_tmux/tmux_name, so a tmux-enabled
-                # group silently resumed in a plain terminal instead.
+                # directly with no tmux_name, so a group row silently
+                # resumed with the wrong tmux session name instead.
                 # resume_group_row is the same tmux-aware path double-
                 # click already uses.
                 # 0-arg closure over `row` (fixed for this whole menu, not a
@@ -8396,17 +8326,18 @@ class SessionHub(QMainWindow):
         group = self.metadata.get("groups", {}).get(cwd) or {}
         return group.get("env") or {}, group.get("flags") or {}
 
-    def effective_tmux(self, explicit: bool | None) -> bool:
-        """Resolve a per-session/per-group tmux override against the global default.
+    def effective_tmux(self, provider: str) -> bool:
+        """The single canonical tmux authority for a row/session of PROVIDER.
 
-        `explicit` is whatever a "tmux" key currently holds: None means the
-        session/group has never been toggled and should follow the global
-        "launch_in_tmux" setting; True/False means it was explicitly set and
-        wins outright, per-item, over the global default.
+        REWORK (VAMP-reviewer HIGH-1, bbb2616): this used to resolve a legacy per-session/
+        per-group "tmux" metadata key, preserving an old `False` as if it still meant something.
+        It never did for a mixed-provider group -- `launch()` has always decided tmux-or-not per
+        ROW by provider, never by that group-level flag, and no code path writes the key anymore
+        (the control that used to was removed). Ignore it entirely: Claude/Codex are
+        unconditionally tmux now, Antigravity never is, and a stale `tmux: false` left over from
+        before mandatory tmux must never resurface as a decision.
         """
-        if explicit is None:
-            return bool(self.settings().get("launch_in_tmux", False))
-        return explicit
+        return provider in ("Claude", "Codex")
 
     def effective_model(self, session_key: str | None, provider: str = "Claude") -> str | None:
         """The model a session would (re)launch with, if any is set.
@@ -8612,11 +8543,12 @@ class SessionHub(QMainWindow):
         running: list[tuple[str, str, dict, Session | None, str]] = []
         claimed: set[str] = set()
         for cwd, group in self.metadata.get("groups", {}).items():
-            tmux_enabled = self.effective_tmux(group.get("tmux"))
-            if not tmux_enabled:
-                continue
             display_name = group.get("display_name") or Path(cwd).name or cwd
             for row in group.get("rows", []):
+                # REWORK (VAMP-reviewer HIGH-1, bbb2616): per-ROW now, not per-group -- a stale
+                # group-level "tmux" flag used to skip the WHOLE group (every row, any provider)
+                # from ever appearing here. tmux is decided by provider alone, same as launch().
+                tmux_enabled = self.effective_tmux(row.get("provider", "Claude"))
                 match = (
                     None
                     if id(row) in codex_losers
@@ -9036,6 +8968,12 @@ class SessionHub(QMainWindow):
         else:
             self._focused_entry = entry
             self._note_embed_focus_grabbed(attach_start_serial)
+        # task-2172 fold-in (row504): a background preload's own completion deliberately never
+        # verified paint while the pane sat hidden in the stacked widget (a hidden child is
+        # unviewable, so the sample could only ever be None -> bounded-retry -> evict) -- THIS is
+        # the first moment the pane is actually visible, so verify exactly once here.
+        if not entry.paint_verified:
+            self._schedule_paint_verify(entry)
         return True
 
     def _select_running_terminal(
@@ -9173,17 +9111,30 @@ class SessionHub(QMainWindow):
             else:
                 # A background preload finished while the user has SINCE selected this exact
                 # identity ("rapid selection during preload") -- promote it now, fail-closed on
-                # the focus grab the preload deliberately skipped.
-                if self._promote_entry(entry, attach_start_serial):
-                    self._schedule_paint_verify(entry)
-        else:
-            # Ordinary background preload completion, nobody is looking -- still schedule paint
-            # verification so a silently-blank preload gets evicted before it is ever selected.
-            self._schedule_paint_verify(entry)
+                # the focus grab the preload deliberately skipped. `_promote_entry` itself
+                # schedules paint verification exactly once, now that the pane is visible.
+                self._promote_entry(entry, attach_start_serial)
+        # else: ordinary background preload completion, nobody is looking -- task-2172 fold-in
+        # (row504): paint verification is deliberately DEFERRED, not skipped. The pane sits
+        # hidden in `_running_terminal_stack` (a QStackedWidget); a hidden child is unviewable, so
+        # `sample_non_background_pixels` could only ever read None here, and the bounded retry
+        # then failed closed and evicted a perfectly good ready cache entry -- the reported
+        # alternating instant/cold same-row switches. `_promote_entry` verifies once the pane
+        # actually becomes visible instead.
         self._advance_preload_queue(entry)
 
     def _schedule_paint_verify(self, entry: "_TerminalCacheEntry") -> None:
+        if entry.paint_verified:
+            return  # task-2172 fold-in (row504): dedupe -- already confirmed painted, don't re-arm
         generation_now = entry.controller.generation
+        if entry.paint_verify_pending_generation == generation_now:
+            # REWORK (VAMP-reviewer HIGH-2, bbb2616): a check for this exact attach generation is
+            # already reserved -- either the initial delayed check hasn't fired yet, or it fired
+            # `None` and is sitting in its bounded retry. Either way, a second promotion/re-entry
+            # (ready-cache-hit racing the preload-finishes-while-selected path, or a re-select
+            # before the timer fires) must not install a second QTimer for the same generation.
+            return
+        entry.paint_verify_pending_generation = generation_now
         # task-2156: a valid XID + successful resize is not proof anything ever actually painted
         # (the observed bug) -- verify once, a short bounded delay later (real render + tmux
         # attach latency needs a beat), never on a recurring timer.
@@ -9204,9 +9155,17 @@ class SessionHub(QMainWindow):
         finish_attach can race the X server; a still-uncheckable `None` after that retry is
         FAIL-CLOSED exactly like a confirmed `False` -- an unproven pane is not a painted one."""
         if entry.tmux_name is None or generation != entry.controller.generation:
-            return  # superseded by a newer attach on this slot -- this verdict is stale, ignore
+            # superseded by a newer attach on this slot -- this verdict is stale, ignore. Only
+            # clear the pending reservation if it still names THIS stale generation (a newer
+            # attach's own _schedule_paint_verify already overwrote it to its own generation
+            # otherwise, and that live reservation must not be clobbered).
+            if entry.paint_verify_pending_generation == generation:
+                entry.paint_verify_pending_generation = None
+            return
         painted = entry.controller.verify_painted()
         if painted is True:
+            entry.paint_verified = True
+            entry.paint_verify_pending_generation = None
             return
         if painted is None and retries_left > 0:
             QTimer.singleShot(
@@ -9267,6 +9226,8 @@ class SessionHub(QMainWindow):
         entry.tmux_name = None
         entry.meta = None
         entry.state = "empty"
+        entry.paint_verified = False
+        entry.paint_verify_pending_generation = None
         if entry in self._preload_queue:
             self._preload_queue.remove(entry)
         if self._preload_in_flight is entry:
@@ -9294,6 +9255,8 @@ class SessionHub(QMainWindow):
         entry.tmux_name = name
         entry.meta = (cwd, session_id, saved_name)
         entry.state = "assigned"
+        entry.paint_verified = False
+        entry.paint_verify_pending_generation = None
         return entry
 
     def _reconcile_terminal_cache(
@@ -9667,8 +9630,6 @@ class SessionHub(QMainWindow):
             {**(self.settings().get("global_flags") or {}), **group_flags},
             flag_overrides,
             self,
-            show_tmux=not self.is_group_session(session),
-            tmux_override=existing.get("tmux"),
             provider=session.provider,
             model=existing.get("model"),
             reasoning_effort=existing.get("reasoning_effort"),
@@ -9698,11 +9659,6 @@ class SessionHub(QMainWindow):
                     entry["reasoning_effort"] = effort
                 else:
                     entry.pop("reasoning_effort", None)
-            tmux = dialog.tmux()
-            if tmux is None:
-                entry.pop("tmux", None)
-            else:
-                entry["tmux"] = tmux
             write_metadata(self.metadata)
             self.refresh()
 
@@ -9872,7 +9828,7 @@ class SessionHub(QMainWindow):
         it, often onto an already-running server that does NOT inherit
         Popen's env=), so it needs these injected explicitly into the
         command tmux execs instead - see tmux_group_launch_command and
-        launch's use_tmux branch.
+        launch's tmux branch.
         """
         global_env = self.settings().get("global_env") or {}
         group_env, _ = self.group_launch_options(session_key)
@@ -9913,7 +9869,6 @@ class SessionHub(QMainWindow):
         focus: bool = True,
         strip_env: list[str] | None = None,
         wait_for_tracking: bool = False,
-        use_tmux: bool = False,
         tmux_name: str | None = None,
         reasoning_effort: str | None = None,
         initial_prompt: str | None = None,
@@ -9939,7 +9894,7 @@ class SessionHub(QMainWindow):
                     f"{config_error}\n\nFix that file, then launch or resume again.",
                 )
                 return
-        if use_tmux and self.settings().get("status_hooks_enabled", False):
+        if provider in ("Claude", "Codex") and self.settings().get("status_hooks_enabled", False):
             if provider == "Claude":
                 install_status_hooks(Path(cwd))
             elif provider == "Codex" and not install_status_hooks_codex() and not self._codex_notify_warned:
@@ -9952,7 +9907,7 @@ class SessionHub(QMainWindow):
                     "live status until you clear or replace that `notify` line yourself.",
                 )
         try:
-            if use_tmux and provider in ("Claude", "Codex"):
+            if provider in ("Claude", "Codex"):
                 # tmux_name, not flag_overrides["--name"]: resuming a group
                 # row (session_id set) never passes --name at all - Claude
                 # already knows which conversation to continue via --resume,
@@ -9975,7 +9930,7 @@ class SessionHub(QMainWindow):
                 if provider == "Claude"
                 else []
             )
-            if use_tmux and provider in ("Claude", "Codex"):
+            if provider in ("Claude", "Codex"):
                 if provider == "Codex":
                     # Codex has no --name; the tmux session name IS its address
                     # (VAMPULSE peers reach it with `session_ctl.py send <name>`).
@@ -10100,7 +10055,6 @@ class SessionHub(QMainWindow):
             # transcript saving off.
             strip_env=["CLAUDE_CODE_CHILD_SESSION"],
             wait_for_tracking=wait_for_tracking,
-            use_tmux=self.effective_tmux(overrides.get("tmux")),
             # --name is Claude-only; a Codex row's address is its display name
             # (the Hub rename, e.g. VAMP-worker4), else the session title.
             tmux_name=(overrides.get("flags") or {}).get("--name")
@@ -10448,16 +10402,19 @@ class SessionHub(QMainWindow):
                 None,
             )
         if group_row is not None:
-            use_tmux = self.effective_tmux(self.metadata["groups"][group_cwd].get("tmux"))
             tmux_name = group_row["name"]
         else:
             overrides = (self.metadata.get("sessions") or {}).get(session.key, {})
-            use_tmux = self.effective_tmux(overrides.get("tmux"))
             tmux_name = (
                 (overrides.get("flags") or {}).get("--name")
                 or overrides.get("name")
                 or session.title
             )
+        # REWORK (VAMP-reviewer HIGH-1, bbb2616): the SOURCE session's own provider decides tmux,
+        # never a legacy group/session-override "tmux" flag -- a stale `false` there used to skip
+        # stopping a session that (being Claude/Codex) is unconditionally tmux-launched now,
+        # leaking the tmux session past this Continue.
+        use_tmux = self.effective_tmux(session.provider)
 
         logical_key = session.key
         members = list(session.linked_keys or (session.native_key,))
@@ -10561,7 +10518,6 @@ class SessionHub(QMainWindow):
                 # the ANTHROPIC_MODEL env var) silently lost its model
                 # and launched with the CLI's bare default instead.
                 session_key=lookup_key,
-                use_tmux=use_tmux,
                 tmux_name=tmux_name,
             )
         elif target == "Claude":
@@ -10584,7 +10540,6 @@ class SessionHub(QMainWindow):
                 model=model,
                 session_key=target_key,
                 flag_overrides={"--name": session.title, "--session-id": target_id},
-                use_tmux=use_tmux,
                 tmux_name=tmux_name,
             )
         else:
@@ -10612,7 +10567,7 @@ class SessionHub(QMainWindow):
                     # process under that row exposes its exact rollout via an
                     # open fd, so resolve_pending_links never has to guess
                     # among sibling Codex sessions sharing the same cwd.
-                    "target_tmux_name": tmux_name if use_tmux else None,
+                    "target_tmux_name": tmux_name if target in ("Claude", "Codex") else None,
                 }
             )
             self.launch(
@@ -10621,7 +10576,6 @@ class SessionHub(QMainWindow):
                 session.cwd,
                 model=model,
                 reasoning_effort=reasoning_effort if target == "Codex" else None,
-                use_tmux=use_tmux,
                 tmux_name=tmux_name,
             )
 
@@ -10663,7 +10617,7 @@ class SessionHub(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.directory:
             tmux_name = (
                 suggest_session_name(dialog.directory, dialog.model, set())
-                if dialog.use_tmux
+                if provider in ("Claude", "Codex")
                 else None
             )
             self.launch(
@@ -10673,7 +10627,6 @@ class SessionHub(QMainWindow):
                 model=dialog.model,
                 reasoning_effort=dialog.reasoning_effort,
                 account_config_dir=dialog.account_config_dir,
-                use_tmux=dialog.use_tmux,
                 tmux_name=tmux_name,
             )
 
@@ -10778,7 +10731,6 @@ class SessionHub(QMainWindow):
         if not row:
             return {"status": "error", "message": f"No row named {name!r} in this group"}
         provider = row.get("provider", "Claude")
-        use_tmux = self.effective_tmux(group.get("tmux"))
         # No tmux-alive short-circuit here (task-2142): a live-but-detached row (no window open)
         # reaches this function through _focus_or_resume_session precisely because window_titled()
         # found nothing, and an early "already_running" return used to hand back a status dict
@@ -10852,7 +10804,6 @@ class SessionHub(QMainWindow):
             flag_overrides={"--name": row["name"]},
             strip_env=strip_env,
             wait_for_tracking=wait_for_tracking,
-            use_tmux=use_tmux,
         )
         return {"status": "launched", "name": name}
 
@@ -10936,7 +10887,6 @@ class SessionHub(QMainWindow):
             if provider == "Codex"
             else None,
             session_key=row["override_key"],
-            use_tmux=self.effective_tmux(group.get("tmux")),
             tmux_name=row["name"],
         )
         return {"status": "resumed", "name": name}
@@ -11311,10 +11261,11 @@ def sessions_json_cli() -> int:
     claimed: set[str] = set()
     groups = {}
     for cwd, group in metadata.get("groups", {}).items():
-        explicit = group.get("tmux")
-        tmux_enabled = explicit if explicit is not None else settings.get("launch_in_tmux", False)
         rows_out = []
         for row in group.get("rows", []):
+            # REWORK (VAMP-reviewer HIGH-1, bbb2616): per-row provider, not a legacy group-level
+            # "tmux" flag -- see refresh_running_tab's identical fix, same reasoning.
+            tmux_enabled = row.get("provider") in ("Claude", "Codex")
             match = (
                 None
                 if id(row) in codex_losers
@@ -11356,7 +11307,9 @@ def sessions_json_cli() -> int:
             )
         groups[cwd] = {
             "display_name": group.get("display_name") or Path(cwd).name or cwd,
-            "tmux": tmux_enabled,
+            # Informational aggregate only (no code reads this field back as authority) -- whether
+            # ANY row in this group is a provider that always tmux-launches.
+            "tmux": any(row.get("provider") in ("Claude", "Codex") for row in group.get("rows", [])),
             "rows": rows_out,
         }
 
@@ -11572,6 +11525,13 @@ def resume_session_cli(argv: list[str]) -> int:
 
 
 def main() -> int:
+    if shutil.which("tmux") is None:
+        print(
+            "Session Hub requires tmux (every Claude/Codex launch runs inside "
+            "it) - install tmux and try again.",
+            file=sys.stderr,
+        )
+        return 1
     if "--diagnose" in sys.argv:
         return diagnostic()
     if "--sessions-json" in sys.argv:
