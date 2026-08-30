@@ -47,7 +47,7 @@ os.environ["TMUX_TMPDIR"] = _TEST_TMUX_TMPDIR
 os.environ.pop("TMUX", None)
 atexit.register(shutil.rmtree, _TEST_TMUX_TMPDIR, ignore_errors=True)
 
-from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QSize, Qt
 from PyQt6.QtGui import QMouseEvent, QResizeEvent
 from PyQt6.QtWidgets import QApplication, QMenuBar
 
@@ -10831,7 +10831,12 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
     helper exit both show in-panel and fall back to external attachment; that the panel is resized
     to the exact container size on every container resize and splitter drag (never just at attach
     time); and that the fix for the reviewer's REWORK finding -- no dedicated poll timer beyond
-    the existing 2s status tick -- actually holds."""
+    the existing 2s status tick -- actually holds.
+
+    Extended task-2172 row491 (bounded preloaded-terminal cache): proves the pool -- up to 8
+    Running rows preload in the background (no focus grab, one handshake at a time), an already-
+    ready row is only ever a stack swap on selection, overflow beyond the cap and row removal each
+    evict the right (and only the right) slot, and none of it ever touches tmux."""
 
     @classmethod
     def setUpClass(cls):
@@ -10855,10 +10860,70 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
         which_patcher.start()
         self.addCleanup(which_patcher.stop)
 
-    def _window_with_one_running_session(self):
-        # Same fixture shape as the passing running_context_menu tests above: a tmux GROUP row
-        # (not a bare standalone Session) is what refresh_running_tab's group branch recognizes
+    def _window_with_running_sessions(self, names):
+        # This fixture's row count varies test to test (up to 10 for the overflow-cap test)
+        # against the SAME process-wide XDG_DATA_HOME sandbox every test in this file shares (see
+        # the module-level override near the top): discover_sessions' own write_metadata side
+        # effect would otherwise permanently grow the shared on-disk metadata.json, tripping
+        # _refuse_drastic_metadata_shrink for an UNRELATED later small-fixture test (own repro:
+        # test_qt_focus_changed_to_none_never_releases failing only when run after this one).
+        # Snapshot-and-restore, not just ALLOW_METADATA_SHRINK for this fixture's own write, so no
+        # contamination survives this test either way.
+        snapshot = (
+            session_hub.METADATA_PATH.read_bytes()
+            if session_hub.METADATA_PATH.exists() else None
+        )
+        def _restore_metadata():
+            if snapshot is None:
+                session_hub.METADATA_PATH.unlink(missing_ok=True)
+            else:
+                session_hub.METADATA_PATH.write_bytes(snapshot)
+        self.addCleanup(_restore_metadata)
+
+        # Same fixture shape as the passing running_context_menu tests above: tmux GROUP rows
+        # (not bare standalone Sessions) are what refresh_running_tab's group branch recognizes
         # without a full self.sessions population.
+        sessions = [
+            session_hub.Session(
+                "Claude", f"id-{name}", "t", f"/tmp/{name}", f"/tmp/{name}", 100,
+                Path(f"/tmp/{name}.jsonl"), agent_name=name,
+            )
+            for name in names
+        ]
+        metadata = {
+            "settings": {}, "sessions": {},
+            "groups": {
+                f"/tmp/{name}": {"tmux": True, "rows": [{"name": name}]} for name in names
+            },
+        }
+        ctx = (
+            patch.object(session_hub, "read_metadata", return_value=metadata),
+            patch.object(session_hub, "claude_sessions", return_value=sessions),
+            patch.object(session_hub, "codex_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub, "tmux_session_alive", return_value=True),
+            # This fixture's row count varies test to test (up to 10 for the overflow-cap test)
+            # against the SAME process-wide XDG_DATA_HOME sandbox every test in this file shares
+            # (see the module-level override near the top) -- without this, a bigger-fixture test
+            # followed by a smaller one can trip _refuse_drastic_metadata_shrink on an unrelated
+            # write discover_sessions makes as a side effect, exactly the noisy-not-a-real-purge
+            # case that guard exists to no-op on (same technique already used in
+            # MetadataShrinkGuardTests).
+            patch.dict(os.environ, {"SESSION_HUB_ALLOW_METADATA_SHRINK": "1"}),
+        )
+        for c in ctx:
+            c.start()
+        window = session_hub.SessionHub()
+        self.addCleanup(window.close)
+        for c in ctx:
+            self.addCleanup(c.stop)
+        return window
+
+    def _window_with_one_running_session(self):
+        # Kept as its own exact fixture (not derived from _window_with_running_sessions) so every
+        # pre-existing assertion below against the literal "/tmp/vampembed"/"id-embed1" values
+        # keeps matching -- _window_with_running_sessions derives cwd/session_id from the name
+        # itself, which is a different (and for these single-row tests, irrelevant) shape.
         session = session_hub.Session(
             "Claude", "id-embed1", "t", "/tmp/vampembed", "/tmp/vampembed", 100,
             Path("/tmp/vampembed.jsonl"), agent_name="vamp-embed",
@@ -10877,18 +10942,18 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
         for c in ctx:
             c.start()
         window = session_hub.SessionHub()
-        window.refresh_running_tab()
         self.addCleanup(window.close)
         for c in ctx:
             self.addCleanup(c.stop)
         return window
 
-    def _wire_fake_embedding(self, window, embedder=None, xid_line="XID=555\n"):
-        # The controller instance already exists (built in SessionHub.__init__ with the real
+    def _wire_fake_embedding(self, window, embedder=None, xid_line="XID=555\n", synchronous=True):
+        # The controller instances already exist (built in SessionHub.__init__ with the real
         # subprocess.Popen/shutil.which/etc bound as early-evaluated default arguments), so
-        # patching the subprocess/gsettings/Xlib MODULES here would never reach it -- substitute
-        # its own injected seams directly instead, exactly what production code would pass at
-        # construction time.
+        # patching the subprocess/gsettings/Xlib MODULES here would never reach them -- substitute
+        # their own injected seams directly instead, exactly what production code would pass at
+        # construction time. Wires EVERY pooled slot (task-2172 row491) since preload can attach
+        # any of them, not just whichever one a given test happens to select.
         embedder = embedder if embedder is not None else _FakeEmbedder()
         calls = []
 
@@ -10896,38 +10961,37 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
             calls.append(argv)
             return _FakeEmbedProcess(argv, stdout_lines=(xid_line,) if xid_line else ())
 
-        window._embedded_terminal._popen = fake_popen
-        window._embedded_terminal._which = lambda name: f"/usr/bin/{name}"
-        window._embedded_terminal._embedder = embedder
-        window._embedded_terminal._read_xid_line = lambda proc, timeout: proc.stdout.readline() or None
-        window._embedded_terminal._helper_ready = lambda: True
-        window._embedded_terminal._profile_uuid = lambda: None
-        # _await_embed_xid normally waits on a QSocketNotifier over the helper's REAL stdout fd,
-        # which a fake process has none of -- complete it synchronously instead, exercising the
-        # exact same _finish_embed_attach the real notifier callback calls.
-        window._await_embed_xid = (
-            lambda cwd, name, session_id, attach_start_serial, saved_name=None: (
+        for entry in window._terminal_cache:
+            entry.controller._popen = fake_popen
+            entry.controller._which = lambda name: f"/usr/bin/{name}"
+            entry.controller._embedder = embedder
+            entry.controller._read_xid_line = lambda proc, timeout: proc.stdout.readline() or None
+            entry.controller._helper_ready = lambda: True
+            entry.controller._profile_uuid = lambda: None
+        if synchronous:
+            # _await_embed_xid normally waits on a QSocketNotifier over the helper's REAL stdout
+            # fd, which a fake process has none of -- complete it synchronously instead,
+            # exercising the exact same _finish_embed_attach the real notifier callback calls.
+            def sync_await(entry, cwd, name, session_id, attach_start_serial,
+                            *, saved_name=None, grab_focus):
                 window._finish_embed_attach(
-                    cwd, name, session_id, xid_line,
-                    window._embedded_terminal.generation, attach_start_serial,
-                    saved_name=saved_name,
+                    entry, cwd, name, session_id, xid_line, entry.controller.generation,
+                    attach_start_serial, saved_name=saved_name, grab_focus=grab_focus,
                 )
-            )
-        )
+            window._await_embed_xid = sync_await
         return calls, embedder
 
     def test_click_enter_and_double_click_all_embed_the_exact_same_target(self):
         window = self._window_with_one_running_session()
-        item = window.running_table.item(0, 0)
         calls, _embedder = self._wire_fake_embedding(window)
+        item = window.running_table.item(0, 0)
         with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
             # single click (itemClicked)
             window._activate_running_row(item)
             self.assertEqual(len(calls), 1)
             self.assertEqual(calls[0][-1], "vamp-embed")
-            self.assertEqual(
-                window._running_terminal_stack.currentWidget(), window.running_terminal_container
-            )
+            entry = window._entry_for("vamp-embed")
+            self.assertEqual(window._running_terminal_stack.currentWidget(), entry.container)
             # Enter/double-click on the SAME still-alive session (itemActivated) -- no new child
             window._activate_running_row(item)
             self.assertEqual(len(calls), 1)
@@ -11025,8 +11089,9 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
         # real pending gap between begin_attach() returning and the XID/timeout notifier firing.
         pending = {}
 
-        def deferred_await(cwd, name, session_id, attach_start_serial, saved_name=None):
-            pending["args"] = (cwd, name, session_id, attach_start_serial, saved_name)
+        def deferred_await(entry, cwd, name, session_id, attach_start_serial,
+                            *, saved_name=None, grab_focus):
+            pending["args"] = (entry, cwd, name, session_id, attach_start_serial, saved_name, grab_focus)
 
         window._await_embed_xid = deferred_await
         with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
@@ -11037,10 +11102,11 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
         embedder.focus_calls.clear()
         # The attach now completes, using the serial captured at attach-START (what the real
         # notifier callback threads through) -- not a fresh live read.
-        cwd, name, session_id, attach_start_serial, saved_name = pending["args"]
+        entry, cwd, name, session_id, attach_start_serial, saved_name, grab_focus = pending["args"]
         window._finish_embed_attach(
-            cwd, name, session_id, "XID=555\n",
-            window._embedded_terminal.generation, attach_start_serial, saved_name=saved_name,
+            entry, cwd, name, session_id, "XID=555\n",
+            entry.controller.generation, attach_start_serial,
+            saved_name=saved_name, grab_focus=grab_focus,
         )
         # 555 = the embed's own grab (finish_attach's internal focus() call), immediately followed
         # by winId() = handing focus straight back, with no further _on_qt_focus_changed call.
@@ -11106,7 +11172,7 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
         self._wire_fake_embedding(window)
         with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
             window._activate_running_row(item)
-        window._embedded_terminal.process._alive = False  # helper exited on its own
+        window._entry_for("vamp-embed").controller.process._alive = False  # helper exited on its own
         with patch.object(window, "_focus_or_resume_session") as focus_mock:
             window._check_embedded_terminal_liveness()
         self.assertEqual(
@@ -11119,7 +11185,7 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
 
     def test_focus_grab_failure_shows_in_panel_and_falls_back_externally(self):
         """VAM-reviewer REWORK (task-2166 row482, finding 1): a failed X11 focus grab must fail
-        the attach through the SAME production path (window._embedded_terminal, the real
+        the attach through the SAME production path (the pooled entry's real
         EmbeddedTerminalController) and trigger the same external fallback a map/paint failure
         does -- not report success while leaving the embed unusable."""
         window = self._window_with_one_running_session()
@@ -11145,11 +11211,10 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
         self._wire_fake_embedding(window, embedder=_FakeEmbedder(painted=False))
         with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
             window._activate_running_row(item)
-        self.assertEqual(
-            window._running_terminal_stack.currentWidget(), window.running_terminal_container
-        )
+        entry = window._entry_for("vamp-embed")
+        self.assertEqual(window._running_terminal_stack.currentWidget(), entry.container)
         with patch.object(window, "_focus_or_resume_session") as focus_mock:
-            window._verify_embed_painted(window._embedded_terminal.generation)
+            window._verify_embed_painted(entry, entry.controller.generation)
         self.assertEqual(
             window._running_terminal_stack.currentWidget(), window.running_terminal_failure
         )
@@ -11168,14 +11233,13 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
         self._wire_fake_embedding(window, embedder=_FakeEmbedder(painted=None))
         with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
             window._activate_running_row(item)
-        generation = window._embedded_terminal.generation
+        entry = window._entry_for("vamp-embed")
+        generation = entry.controller.generation
         with patch.object(window, "_focus_or_resume_session") as focus_mock:
-            window._verify_embed_painted(generation)  # first sample: None -> bounded retry only
-            self.assertEqual(
-                window._running_terminal_stack.currentWidget(), window.running_terminal_container
-            )
+            window._verify_embed_painted(entry, generation)  # first sample: None -> bounded retry
+            self.assertEqual(window._running_terminal_stack.currentWidget(), entry.container)
             self.assertFalse(focus_mock.called)
-            window._verify_embed_painted(generation, retries_left=0)  # retry exhausted
+            window._verify_embed_painted(entry, generation, retries_left=0)  # retry exhausted
         self.assertEqual(
             window._running_terminal_stack.currentWidget(), window.running_terminal_failure
         )
@@ -11195,7 +11259,7 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
         """task-2142 row453 REWORK -- orchestrator audit, 2026-08-30: the real widget path
         (begin_attach + QSocketNotifier + finish_attach) must never call the blocking
         `_read_xid_line` seam -- that one is only for the synchronous `attach()` test/non-GUI
-        convenience wrapper. Poison it and drive `_switch_embedded_terminal` for real (not via
+        convenience wrapper. Poison it and drive `_select_running_terminal` for real (not via
         the `_await_embed_xid` test override) to prove the production call graph never reaches
         it."""
         window = self._window_with_one_running_session()
@@ -11204,7 +11268,8 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
 
         def poisoned(proc, timeout):
             raise AssertionError("the widget path must never block reading stdout itself")
-        window._embedded_terminal._read_xid_line = poisoned
+        for entry in window._terminal_cache:
+            entry.controller._read_xid_line = poisoned
         # Undo the test-only synchronous _await_embed_xid override from _wire_fake_embedding --
         # this test wants the REAL begin_attach/_await_embed_xid split, driven by directly calling
         # _finish_embed_attach the way the real QSocketNotifier callback would (never by touching
@@ -11213,23 +11278,28 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
         with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
             window._activate_running_row(item)  # begin_attach only -- must not raise/block
         self.assertEqual(len(calls), 1)
-        self.assertIsNone(window._embedded_terminal.current_name)  # not finished yet
+        assigned = window._entry_for("vamp-embed")
+        # tmux_name is set eagerly at ASSIGNMENT (task-2172 row491), so a still-pending attach is
+        # already visible to _entry_for -- but not yet "ready", proving it truly has not finished.
+        self.assertEqual(assigned.state, "preparing")
         window._finish_embed_attach(
-            "/tmp/vampembed", "vamp-embed", "id-embed1", "XID=555\n",
-            window._embedded_terminal.generation, window._qt_interaction_serial,
+            assigned, "/tmp/vampembed", "vamp-embed", "id-embed1", "XID=555\n",
+            assigned.controller.generation, window._qt_interaction_serial, grab_focus=True,
         )
-        self.assertEqual(window._embedded_terminal.current_name, "vamp-embed")
+        self.assertEqual(window._entry_for("vamp-embed"), assigned)
 
     def test_initial_attach_two_resizes_and_a_splitter_move_each_fill_the_container_exactly(self):
-        """Xvfb/widget geometry control (orchestrator ROW453 addenda): initial size, two resizes
-        and a splitter move each resize the ONE embedded child to the container's exact pixel
-        size -- never left at a stale/cropped size from a previous fill.
+        """Xvfb/widget geometry control (orchestrator ROW453 addenda; extended task-2172 row491):
+        initial size, two resizes and a splitter move each resize the selected embedded child to
+        the panel's exact pixel size -- never left at a stale/cropped size from a previous fill.
 
-        Drives the container's REAL `resizeEvent` override via `QApplication.sendEvent` (the
-        same delivery mechanism Qt itself uses, just invoked directly) rather than `window.show()`
-        -- a real `show()` under `QT_QPA_PLATFORM=offscreen` segfaults this process at interpreter
-        teardown for this splitter/stack widget tree (unrelated to correctness: the same exact-
-        geometry/one-child contract is also proven end-to-end against REAL X11/Gtk.Plug in
+        Resizes `window._running_terminal_page` (the panel `_on_terminal_container_resize` reads
+        as its authoritative size source, task-2172 row491 -- proven empirically that a
+        QStackedLayout does NOT propagate a page resize to a hidden stacked widget on its own) and
+        calls `_on_terminal_container_resize()` directly, rather than `window.show()` -- a real
+        `show()` under `QT_QPA_PLATFORM=offscreen` segfaults this process at interpreter teardown
+        for this splitter/stack widget tree (unrelated to correctness: the same exact-geometry/
+        one-child contract is also proven end-to-end against REAL X11/Gtk.Plug in
         EmbeddedTerminalXvfbSmokeTest below, with no Qt widget tree involved at all)."""
         window = self._window_with_one_running_session()
         item = window.running_table.item(0, 0)
@@ -11239,32 +11309,188 @@ class RunningTabEmbeddedTerminalTests(unittest.TestCase):
         self.assertEqual(len(embedder.calls), 1)  # initial fill, one child
         child_winid = embedder.calls[0][0]
 
-        container = window.running_terminal_container
         for width, height in [(801, 601), (1024, 700)]:  # resize #1, resize #2
-            old_size = container.size()
-            container.resize(width, height)
-            QApplication.sendEvent(container, QResizeEvent(container.size(), old_size))
+            window._running_terminal_page.resize(width, height)
+            window._on_terminal_container_resize()
             self.assertEqual(embedder.calls[-1], (child_winid, width, height))
 
-        # A splitter drag resizes the container the same way -- `_on_terminal_container_resize` is
+        # A splitter drag resizes the panel the same way -- `_on_terminal_container_resize` is
         # exactly what `running_splitter.splitterMoved` is wired to (see build_ui).
-        old_size = container.size()
-        container.resize(700, 768)
+        window._running_terminal_page.resize(700, 768)
         window._on_terminal_container_resize()
         self.assertEqual(embedder.calls[-1], (child_winid, 700, 768))
         self.assertEqual(len(embedder.calls), 4)  # one child, resized exactly each time
-        self.assertNotEqual(old_size, container.size())
 
     def test_close_ends_only_the_embedded_client_never_tmux(self):
         window = self._window_with_one_running_session()
         fake = _FakeEmbedProcess(["python3"])
-        window._embedded_terminal.process = fake
-        window._embedded_terminal.current_name = "vamp-embed"
+        entry = window._terminal_cache[0]
+        entry.controller.process = fake
+        entry.controller.current_name = "vamp-embed"
         with patch.object(session_hub, "QApplication") as qapp_cls:
             qapp_cls.platformName.return_value = "offscreen"
             window.close()
         self.assertTrue(fake.terminated)
         self.assertFalse(fake.killed)
+
+    # -- task-2172 row491: bounded preloaded-terminal cache --------------------------------------
+
+    def test_refresh_preloads_every_running_row_up_to_the_pool_cap(self):
+        """Up to 8 Running rows preload in the background -- ready, cached, and NOT visible (no
+        selection has happened) -- from a single refresh_running_tab() pass, with no relaunch on a
+        second identical refresh (no relaunch storm)."""
+        names = [f"vamp-pool-{i}" for i in range(5)]
+        window = self._window_with_running_sessions(names)
+        calls, embedder = self._wire_fake_embedding(window)
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window.refresh_running_tab()
+        for name in names:
+            entry = window._entry_for(name)
+            self.assertIsNotNone(entry, name)
+            self.assertEqual(entry.state, "ready", name)
+        self.assertEqual(len(calls), 5)  # exactly one handshake per row, never more
+        self.assertEqual(embedder.focus_calls, [])  # background preload never grabs real focus
+        self.assertIsNone(window._selected_tmux_name)
+        self.assertEqual(
+            window._running_terminal_stack.currentWidget(), window.running_terminal_placeholder,
+        )
+
+        # A second identical refresh must not relaunch anything already ready.
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window.refresh_running_tab()
+        self.assertEqual(len(calls), 5)
+
+    def test_preload_serializes_handshakes_one_at_a_time(self):
+        """Limits concurrent background handshakes to ONE in flight, to avoid a helper-launch
+        burst -- proven by leaving completion pending (never wiring the synchronous
+        _await_embed_xid override) and checking only one popen call happened despite several
+        rows being eligible."""
+        names = [f"vamp-burst-{i}" for i in range(4)]
+        window = self._window_with_running_sessions(names)
+        calls, _embedder = self._wire_fake_embedding(window, synchronous=False)
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window.refresh_running_tab()
+        self.assertEqual(len(calls), 1)  # only the first handshake launched; rest queued
+        self.assertEqual(
+            sum(1 for e in window._terminal_cache if e.state == "preparing"), 1,
+        )
+
+    def test_selecting_a_preloaded_ready_row_relaunches_nothing(self):
+        """EXIT: selection of a ready entry is only a stack/current-widget swap plus one explicit
+        focus grab -- no helper launch, no tmux subprocess."""
+        names = ["vamp-a", "vamp-b"]
+        window = self._window_with_running_sessions(names)
+        calls, embedder = self._wire_fake_embedding(window)
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window.refresh_running_tab()
+        self.assertEqual(len(calls), 2)
+        before = len(calls)
+        entry_b = window._entry_for("vamp-b")
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window._select_running_terminal("/tmp/vamp-b", "vamp-b", "id-vamp-b", saved_name="vamp-b")
+        self.assertEqual(len(calls), before)  # no relaunch
+        self.assertEqual(window._running_terminal_stack.currentWidget(), entry_b.container)
+        self.assertEqual(embedder.focus_calls, [555])  # the promotion's one explicit focus grab
+
+        # Alternating back to the first (also preloaded) row: still no relaunch, correct pane.
+        entry_a = window._entry_for("vamp-a")
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window._select_running_terminal("/tmp/vamp-a", "vamp-a", "id-vamp-a", saved_name="vamp-a")
+        self.assertEqual(len(calls), before)
+        self.assertEqual(window._running_terminal_stack.currentWidget(), entry_a.container)
+
+    def test_overflow_beyond_cap_does_not_preload_but_selection_still_works(self):
+        """Beyond the 8-row cap, the remaining rows are never preloaded -- they attach lazily on
+        selection instead, exactly like the pre-pool single-embed path did for every row."""
+        names = [f"vamp-cap-{i}" for i in range(10)]
+        window = self._window_with_running_sessions(names)
+        calls, _embedder = self._wire_fake_embedding(window)
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window.refresh_running_tab()
+        self.assertEqual(len(calls), session_hub._TERMINAL_CACHE_SIZE)
+        ready_names = {e.tmux_name for e in window._terminal_cache if e.tmux_name is not None}
+        self.assertEqual(len(ready_names), session_hub._TERMINAL_CACHE_SIZE)
+        overflow_name = next(n for n in names if n not in ready_names)
+        item = next(
+            window.running_table.item(row, 0)
+            for row in range(window.running_table.rowCount())
+            if window.running_table.item(row, 0).data(Qt.ItemDataRole.UserRole)[1] == overflow_name
+        )
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window._activate_running_row(item)
+        self.assertEqual(len(calls), session_hub._TERMINAL_CACHE_SIZE + 1)  # lazy attach on select
+        self.assertIsNotNone(window._entry_for(overflow_name))
+
+    def test_row_disappearing_evicts_its_slot_and_terminates_only_its_helper(self):
+        """A removed row (no longer Running) evicts and terminates only that row's helper -- never
+        stops/renames/respawns tmux or sends it input (never calls a tmux-mutating function)."""
+        window = self._window_with_running_sessions(["vamp-stays", "vamp-goes"])
+        calls, _embedder = self._wire_fake_embedding(window)
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window.refresh_running_tab()
+        stays = window._entry_for("vamp-stays")
+        goes = window._entry_for("vamp-goes")
+        self.assertIsNotNone(stays)
+        self.assertIsNotNone(goes)
+        goes_process = goes.controller.process
+
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window._reconcile_terminal_cache([
+                ("vamp-stays", "/tmp/vamp-stays", "id-vamp-stays", "vamp-stays"),
+            ])
+        self.assertIsNone(window._entry_for("vamp-goes"))
+        self.assertTrue(goes_process.terminated)
+        # The surviving row's own slot/process is untouched by the other row's eviction.
+        self.assertEqual(window._entry_for("vamp-stays"), stays)
+        self.assertFalse(stays.controller.process.terminated)
+
+    def test_rapid_selection_during_preload_promotes_on_completion_without_a_relaunch(self):
+        """A row selected WHILE its background preload is still mid-flight must promote (stack
+        swap + focus grab) the instant that SAME preload completes -- never a second, redundant
+        attach."""
+        window = self._window_with_running_sessions(["vamp-race"])
+        calls, embedder = self._wire_fake_embedding(window, synchronous=False)
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window.refresh_running_tab()
+        entry = window._entry_for("vamp-race")
+        self.assertEqual(entry.state, "preparing")
+        self.assertEqual(len(calls), 1)
+
+        # User selects the still-preparing row before its own preload finishes.
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window._select_running_terminal(
+                "/tmp/vamp-race", "vamp-race", "id-vamp-race", saved_name="vamp-race",
+            )
+        self.assertEqual(len(calls), 1)  # still no second attach
+        self.assertEqual(
+            window._running_terminal_stack.currentWidget(), window.running_terminal_placeholder,
+        )
+
+        # The ORIGINAL (background, grab_focus=False) preload now completes.
+        window._finish_embed_attach(
+            entry, "/tmp/vamp-race", "vamp-race", "id-vamp-race", "XID=555\n",
+            entry.controller.generation, window._qt_interaction_serial,
+            saved_name="vamp-race", grab_focus=False,
+        )
+        self.assertEqual(len(calls), 1)  # promotion never relaunches
+        self.assertEqual(window._running_terminal_stack.currentWidget(), entry.container)
+        self.assertEqual(embedder.focus_calls, [555])  # promotion's own explicit grab
+
+    def test_window_resize_updates_every_cached_slot_including_hidden_ones(self):
+        """Window/splitter resizing updates cached entries, including hidden ones -- so a
+        preloaded-but-not-yet-selected pane is already at final size before it is ever selected."""
+        window = self._window_with_running_sessions(["vamp-visible", "vamp-hidden"])
+        self._wire_fake_embedding(window)
+        with patch.object(session_hub.QApplication, "platformName", return_value="xcb"):
+            window.refresh_running_tab()
+        visible = window._entry_for("vamp-visible")
+        hidden = window._entry_for("vamp-hidden")
+        self.assertNotEqual(visible.container.size(), QSize(900, 700))
+
+        window._running_terminal_page.resize(900, 700)
+        window._on_terminal_container_resize()
+        self.assertEqual(hidden.container.size(), QSize(900, 700))
+        self.assertEqual(visible.container.size(), QSize(900, 700))
 
 
 class SearchFilterTests(unittest.TestCase):
@@ -11681,8 +11907,9 @@ ROW482_MODE = %%ROW482_MODE%%
 # embedder regression (interim interaction during a pending attach must not be lost/re-stolen).
 if ROW482_MODE:
     def _row482_on_qt_focus_changed(self, _old, now):
-        if now is not None:
-            self._embedded_terminal.release_focus(int(self.winId()))
+        if now is not None and self._focused_entry is not None:
+            self._focused_entry.controller.release_focus(int(self.winId()))
+            self._focused_entry = None
     sh.SessionHub._on_qt_focus_changed = _row482_on_qt_focus_changed
     # row482 has no eventFilter/interaction-serial concept at all -- neutering ours to a plain
     # pass-through means _finish_embed_attach's live-serial-vs-attach-start check (task-2170
@@ -11792,24 +12019,27 @@ try:
         # by finish_attach()/release_focus() regardless of whether the underlying X call's actual
         # server-side effect can be independently confirmed within this settle window, so it is
         # what proves the DECISION LOGIC under test -- exactly the boundary finding 1/2 concern.
-        window._switch_embedded_terminal(TMUX, TMUX, None, saved_name=TMUX)
+        window._select_running_terminal(TMUX, TMUX, None, saved_name=TMUX)
         table_center = window.running_table.mapToGlobal(window.running_table.rect().center())
         xdotool("mousemove", "--sync", str(table_center.x()), str(table_center.y()))
         xdotool("click", "1")
         pump(6.0)  # let the async attach actually complete
-        result["current_name"] = window._embedded_terminal.current_name
-        result["holds_focus_after_interim_click"] = bool(window._embedded_terminal._holds_focus)
+        entry = window._entry_for(TMUX)
+        result["current_name"] = entry.tmux_name if entry else None
+        result["holds_focus_after_interim_click"] = bool(entry and entry.controller._holds_focus)
         result["table_has_focus_after_interim_click"] = bool(window.running_table.hasFocus())
     else:
-        window._switch_embedded_terminal(TMUX, TMUX, None, saved_name=TMUX)
+        window._select_running_terminal(TMUX, TMUX, None, saved_name=TMUX)
         pump(6.0)  # async attach: begin_attach's popen + _await_embed_xid's QSocketNotifier read
-        result["attached"] = bool(window._embedded_terminal._holds_focus)
+        entry = window._entry_for(TMUX)
+        result["attached"] = bool(entry and entry.controller._holds_focus)
         simulate_wm_bounce(int(window.winId()))
 
         # "let queued Qt focus events drain" (the brief's own wording) -- exactly where the real
         # bounce-back above (or a real window manager's own equivalent) arrives.
         pump(2.0)
-        result["holds_focus_after_settle"] = bool(window._embedded_terminal._holds_focus)
+        entry = window._entry_for(TMUX)
+        result["holds_focus_after_settle"] = bool(entry and entry.controller._holds_focus)
 
         # Parked OUTSIDE the 500x400 window entirely (not merely away from the embed within it)
         # -- any coordinate still inside the window risks X's PointerRoot focus-follows-pointer
@@ -11830,7 +12060,8 @@ try:
         xdotool("mousemove", "--sync", str(table_center.x()), str(table_center.y()))
         xdotool("click", "1")
         pump(1.0)
-        result["holds_focus_after_outside_click"] = bool(window._embedded_terminal._holds_focus)
+        entry = window._entry_for(TMUX)
+        result["holds_focus_after_outside_click"] = bool(entry and entry.controller._holds_focus)
         result["table_has_focus"] = bool(window.running_table.hasFocus())
 
         marker2 = "VAMP_ROW489_MARKER_TWO"

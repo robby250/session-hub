@@ -1474,7 +1474,8 @@ class EmbeddedTerminalController:
         self._pending_name = name
         return True, "launching"
 
-    def finish_attach(self, line: str | None, generation: int | None = None) -> tuple[bool | None, str]:
+    def finish_attach(self, line: str | None, generation: int | None = None,
+                       grab_focus: bool = True) -> tuple[bool | None, str]:
         """Phase 2: complete (or fail) the attach `begin_attach` started, given ONE stdout line
         the caller already read (or None on timeout/EOF) (task-2142 row453 REWORK).
 
@@ -1510,10 +1511,14 @@ class EmbeddedTerminalController:
             return False, "failed to map the embedded terminal's window"
         self.current_name = name
         self._child_winid = child_winid
-        if not self.focus():
+        if grab_focus and not self.focus():
             # A mapped, painted child the user can never type into is as unusable as a failed
             # map/resize -- fail closed the same way (VAM-reviewer REWORK, task-2166 row482:
-            # this used to discard focus()'s result and report success regardless).
+            # this used to discard focus()'s result and report success regardless). Skipped
+            # entirely (task-2172 row491) for a background PRELOAD attach -- grabbing real X11
+            # keyboard focus for a terminal nobody has selected would steal it from whatever the
+            # user is actually doing; SessionHub grabs it explicitly, fail-closed, only at the
+            # moment an entry is promoted to visible (see SessionHub._promote_entry).
             self.detach()
             return False, "failed to focus the embedded terminal's window"
         return True, "attached"
@@ -1618,6 +1623,34 @@ class _EmbeddedTerminalContainer(QWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._on_resize()
+
+
+_TERMINAL_CACHE_SIZE = 8  # task-2172 row491: bounded preloaded-terminal pool, see _TerminalCacheEntry
+
+
+class _TerminalCacheEntry:
+    """One pooled Running-tab embedded-terminal slot (task-2172 row491). A fixed pool of these is
+    created once at construction and REUSED across identities as rows appear/disappear/rotate --
+    never destroyed and rebuilt -- so each owns a persistent container widget and controller for
+    the life of the window. `tmux_name` is the resolved live tmux identity (never a row index,
+    label, saved stale name, or transcript title) this slot is currently prepared for, or `None`
+    when the slot is free. Every other field belongs to THIS slot alone -- never share mutable
+    attach state between entries, or two rows can race each other's generation/focus bookkeeping."""
+
+    __slots__ = (
+        "container", "controller", "tmux_name", "meta", "state", "last_used",
+        "_await_notifier", "_await_timer",
+    )
+
+    def __init__(self, container, controller):
+        self.container = container
+        self.controller = controller
+        self.tmux_name: str | None = None
+        self.meta: tuple[str, str | None, str | None] | None = None  # cwd, session_id, saved_name
+        self.state = "empty"  # empty | assigned | preparing | ready | failed
+        self.last_used = 0.0
+        self._await_notifier = None
+        self._await_timer = None
 
 
 def format_reset_timestamp(timestamp: int | None) -> str:
@@ -7503,15 +7536,24 @@ class SessionHub(QMainWindow):
         self.running_terminal_failure = QLabel()
         self.running_terminal_failure.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.running_terminal_failure.setWordWrap(True)
-        self.running_terminal_container = _EmbeddedTerminalContainer(
-            self._on_terminal_container_resize
-        )
         running_terminal_stack.addWidget(self.running_terminal_placeholder)
         running_terminal_stack.addWidget(self.running_terminal_failure)
-        running_terminal_stack.addWidget(self.running_terminal_container)
         self._running_terminal_stack = running_terminal_stack
-        self._embedded_terminal = EmbeddedTerminalController(self.running_terminal_container)
-        self._embedded_terminal_meta: dict[str, tuple[str, str | None]] = {}
+        self._running_terminal_page = running_terminal_page
+        # task-2172 row491: a fixed pool of already-attachable slots, built once here and reused
+        # for the life of the window -- never destroyed/recreated per row. Each gets its own
+        # container widget (added to the stack now, so it is already laid out and can be resized
+        # while hidden) and its own controller instance.
+        self._terminal_cache: list[_TerminalCacheEntry] = []
+        for _ in range(_TERMINAL_CACHE_SIZE):
+            slot_container = _EmbeddedTerminalContainer(self._on_terminal_container_resize)
+            slot_controller = EmbeddedTerminalController(slot_container)
+            running_terminal_stack.addWidget(slot_container)
+            self._terminal_cache.append(_TerminalCacheEntry(slot_container, slot_controller))
+        self._selected_tmux_name: str | None = None
+        self._focused_entry: _TerminalCacheEntry | None = None
+        self._preload_queue: list[_TerminalCacheEntry] = []
+        self._preload_in_flight: _TerminalCacheEntry | None = None
         # task-2170 (reworked per reviewer REWORK on 62d4fd9f64e2): a deliberate user-action
         # BOUNDARY, not a timer. `_qt_interaction_serial` is bumped by eventFilter() ONLY for a
         # real, spontaneous mouse/key event Qt itself dispatches to some widget -- and a click or
@@ -7591,8 +7633,9 @@ class SessionHub(QMainWindow):
         QApplication.instance().removeEventFilter(self)
         # task-2142 row453: end only the embedded xterm CLIENT process -- detach() never touches
         # tmux, so the session it was attached to (if any) stays running headless exactly as if
-        # the user had detached it themselves.
-        self._embedded_terminal.detach()
+        # the user had detached it themselves. task-2172 row491: every pooled slot, not just one.
+        for entry in self._terminal_cache:
+            entry.controller.detach()
         if QApplication.platformName() != "offscreen":
             latest = read_metadata()
             latest.setdefault("settings", {}).update(self.settings())
@@ -8321,6 +8364,13 @@ class SessionHub(QMainWindow):
                     {"name": name, "provider": session.provider}, session, name,
                 ))
 
+        # task-2172 row491: preload event-driven off THIS census -- no new tmux subprocess or
+        # census pass, reuses exactly the `running` list just built above.
+        self._reconcile_terminal_cache([
+            (resolved_name, cwd, match.session_id if match else None, row["name"])
+            for _display_name, cwd, row, match, resolved_name in running
+        ])
+
         name_counts = collections.Counter(row["name"] for _dn, _cwd, row, _m, _rn in running)
         self.running_table.setRowCount(len(running))
         for index, (display_name, cwd, row, match, resolved_name) in enumerate(running):
@@ -8507,7 +8557,7 @@ class SessionHub(QMainWindow):
         cwd, name, session_id, tmux_name = name_item.data(Qt.ItemDataRole.UserRole)
         # The embed target is always the ACTUAL live tmux session (task-2156) -- embedding never
         # cares about the saved row name, only `name` is carried through for the fallback path.
-        self._switch_embedded_terminal(cwd, tmux_name, session_id, saved_name=name)
+        self._select_running_terminal(cwd, tmux_name, session_id, saved_name=name)
 
     def eventFilter(self, obj, event) -> bool:
         """task-2170: the deliberate-user-action boundary _on_qt_focus_changed gates release on.
@@ -8546,56 +8596,119 @@ class SessionHub(QMainWindow):
         this regardless of how many event-loop turns it takes to arrive; only a genuine
         subsequent click, keyboard navigation, dialog, or control activation can."""
         if now is not None and self._qt_interaction_serial > self._embed_focus_grab_serial:
-            self._embedded_terminal.release_focus(int(self.winId()))
+            if self._focused_entry is not None:
+                self._focused_entry.controller.release_focus(int(self.winId()))
+                self._focused_entry = None
 
     def _note_embed_focus_grabbed(self, attach_start_serial: int) -> None:
         """task-2170 (reworked per reviewer REWORK on f4e7fc9ab369 finding 2): called right after
-        a successful EmbeddedTerminalController.focus() grab -- either finish_attach's internal
-        call on a fresh attach, or the re-select short-circuit's direct call in
-        _switch_embedded_terminal. `attach_start_serial` is the interaction serial sampled at the
-        MOMENT the attach began (top of _switch_embedded_terminal), not the live serial read here.
-        The two differ on a fresh attach: begin_attach()/_await_embed_xid() is asynchronous (up to
-        the 3s XID timeout), so a genuine later click/key can land and bump the live serial WHILE
-        the attach is still pending, before this method ever runs. Snapshotting the live serial at
-        completion would silently absorb that interim interaction into the "grab" baseline and let
-        the attach steal focus back after it -- exactly the race the reviewer found. Using the
-        serial from attach-START instead means any interaction that happened after the initiating
-        click (including one mid-attach) is still STRICTLY LATER than this baseline and still
-        satisfies _on_qt_focus_changed's '>' comparison, so it still releases. The re-select path is
-        synchronous, so its start-of-call snapshot equals what completion would have read anyway."""
+        a successful EmbeddedTerminalController.focus() grab -- either a fresh attach's promotion,
+        or the re-select short-circuit's direct call in _select_running_terminal.
+        `attach_start_serial` is the interaction serial sampled at the MOMENT the attach/selection
+        began, not the live serial read here. The two differ on a fresh attach: begin_attach()/
+        _await_embed_xid() is asynchronous (up to the 3s XID timeout), so a genuine later click/key
+        can land and bump the live serial WHILE the attach is still pending, before this method
+        ever runs. Snapshotting the live serial at completion would silently absorb that interim
+        interaction into the "grab" baseline and let the attach steal focus back after it --
+        exactly the race the reviewer found. Using the serial from attach-START instead means any
+        interaction that happened after the initiating click (including one mid-attach) is still
+        STRICTLY LATER than this baseline and still satisfies _on_qt_focus_changed's '>'
+        comparison, so it still releases. The re-select path is synchronous, so its start-of-call
+        snapshot equals what completion would have read anyway."""
         self._embed_focus_grab_serial = attach_start_serial
 
-    def _switch_embedded_terminal(
+    def _entry_for(self, tmux_name: str) -> "_TerminalCacheEntry | None":
+        return next((e for e in self._terminal_cache if e.tmux_name == tmux_name), None)
+
+    def _promote_entry(self, entry: "_TerminalCacheEntry", attach_start_serial: int) -> bool:
+        """Make ENTRY the visible/focused terminal for the first time (task-2172 row491): the
+        ready-cache-hit fast path in `_select_running_terminal` for an entry that was NEVER
+        visible before (only ever preloaded in the background), or a background preload that
+        finishes while the user has since selected that exact identity. Fail-closed on a failed
+        focus grab -- the same contract `EmbeddedTerminalController.finish_attach` enforces for a
+        foreground attach (task-2166 EXIT): a terminal nobody can type into is as unusable as a
+        failed map/resize."""
+        if not entry.controller.focus():
+            cwd, session_id, saved_name = entry.meta or (None, None, None)
+            name = entry.tmux_name
+            self._evict_entry(entry)
+            self._show_embed_failure(
+                cwd, name, session_id, "failed to focus the embedded terminal's window",
+                saved_name=saved_name,
+            )
+            return False
+        entry.last_used = time.monotonic()
+        self._running_terminal_stack.setCurrentWidget(entry.container)
+        if self._qt_interaction_serial > attach_start_serial:
+            self._embed_focus_grab_serial = self._qt_interaction_serial
+            entry.controller.release_focus(int(self.winId()))
+        else:
+            self._focused_entry = entry
+            self._note_embed_focus_grabbed(attach_start_serial)
+        return True
+
+    def _select_running_terminal(
         self, cwd: str, name: str, session_id: str | None, *, saved_name: str | None = None,
     ) -> None:
+        """task-2172 row491: select NAME's (the resolved live tmux identity) cached terminal, if
+        any -- a ready, already-cached entry is only ever a stack swap plus one explicit focus
+        grab, never a relaunch. A cache miss (not yet preloaded, or evicted for overflow) falls
+        back to a fresh foreground attach exactly like the old single-embed path."""
         # Sampled BEFORE any async work starts -- see _note_embed_focus_grabbed's docstring for
         # why completion must use this value and not a later live read.
         attach_start_serial = self._qt_interaction_serial
-        if (self._embedded_terminal.current_name == name
-                and self._embedded_terminal.poll_alive()):
-            # Already attached -- no needless restart, but re-selecting/re-clicking an
-            # already-embedded row is itself a real "select/click it" gesture (task-2166 EXIT)
-            # and must re-grab keyboard focus the same as a fresh attach does.
-            if self._embedded_terminal.focus():
-                self._note_embed_focus_grabbed(attach_start_serial)
+        self._selected_tmux_name = name
+        entry = self._entry_for(name)
+        if entry is not None and entry.state == "ready" and entry.controller.poll_alive():
+            already_visible = self._running_terminal_stack.currentWidget() is entry.container
+            if already_visible:
+                # Already the visible embed -- no needless restart, but re-selecting/re-clicking
+                # an already-embedded row is itself a real "select/click it" gesture (task-2166
+                # EXIT) and must re-grab keyboard focus the same as a fresh attach does.
+                entry.last_used = time.monotonic()
+                if entry.controller.focus():
+                    self._focused_entry = entry
+                    self._note_embed_focus_grabbed(attach_start_serial)
+                return
+            # Ready from a background preload, never shown before -- promote it now.
+            self._promote_entry(entry, attach_start_serial)
             return
-        ok, detail = self._embedded_terminal.begin_attach(name)
+        if entry is not None and entry.state == "preparing":
+            # A background (or a prior selection's) attach is already in flight for this exact
+            # identity -- just show the placeholder and wait; its own completion promotes it
+            # (see _finish_embed_attach) if this identity is still selected by then.
+            self._running_terminal_stack.setCurrentWidget(self.running_terminal_placeholder)
+            return
+        entry = self._assign_cache_slot(name, cwd, session_id, saved_name)
+        if entry is None:
+            # Every slot is a different in-use identity and none evictable right now -- fail
+            # closed to the placeholder rather than crash; extremely unlikely at 8 slots.
+            self._running_terminal_stack.setCurrentWidget(self.running_terminal_placeholder)
+            return
+        ok, detail = entry.controller.begin_attach(name)
         if not ok:
+            entry.state = "failed"
+            entry.tmux_name = None
             self._show_embed_failure(cwd, name, session_id, detail, saved_name=saved_name)
             return
+        entry.state = "preparing"
+        self._running_terminal_stack.setCurrentWidget(self.running_terminal_placeholder)
         self._await_embed_xid(
-            cwd, name, session_id, attach_start_serial, saved_name=saved_name,
+            entry, cwd, name, session_id, attach_start_serial,
+            saved_name=saved_name, grab_focus=True,
         )
 
     def _await_embed_xid(
-        self, cwd: str, name: str, session_id: str | None, attach_start_serial: int,
-        *, saved_name: str | None = None,
+        self, entry: "_TerminalCacheEntry", cwd: str, name: str, session_id: str | None,
+        attach_start_serial: int, *, saved_name: str | None = None, grab_focus: bool,
     ) -> None:
         """Waits for the helper's one `XID=` stdout line EVENT-DRIVEN via QSocketNotifier, with a
         bounded 3s singleShot (never periodic/recurring) timeout fallback -- never a blocking read
-        on the GUI thread (task-2142 row453 REWORK -- orchestrator audit, 2026-08-30)."""
-        process = self._embedded_terminal.process
-        generation = self._embedded_terminal.generation
+        on the GUI thread (task-2142 row453 REWORK -- orchestrator audit, 2026-08-30). Notifier/
+        timer live on ENTRY (task-2172 row491), not `self` -- several can be in flight for
+        different pooled slots at once (a foreground select racing a background preload)."""
+        process = entry.controller.process
+        generation = entry.controller.generation
         notifier = QSocketNotifier(process.stdout.fileno(), QSocketNotifier.Type.Read, self)
         timeout_timer = QTimer(self)
         timeout_timer.setSingleShot(True)
@@ -8610,8 +8723,8 @@ class SessionHub(QMainWindow):
             timeout_timer.stop()
             timeout_timer.deleteLater()
             self._finish_embed_attach(
-                cwd, name, session_id, line, generation,
-                attach_start_serial, saved_name=saved_name,
+                entry, cwd, name, session_id, line, generation,
+                attach_start_serial, saved_name=saved_name, grab_focus=grab_focus,
             )
 
         notifier.activated.connect(lambda _fd: finish(process.stdout.readline()))
@@ -8619,51 +8732,78 @@ class SessionHub(QMainWindow):
         timeout_timer.start(3000)
         # Keep references alive -- an unreferenced QSocketNotifier/QTimer can be garbage
         # collected out from under Qt before it ever fires.
-        self._embed_await_notifier = notifier
-        self._embed_await_timer = timeout_timer
+        entry._await_notifier = notifier
+        entry._await_timer = timeout_timer
 
-    def _finish_embed_attach(self, cwd: str, name: str, session_id: str | None,
-                              line: str | None, generation: int | None,
-                              attach_start_serial: int,
-                              *, saved_name: str | None = None) -> None:
-        ok, detail = self._embedded_terminal.finish_attach(line, generation)
+    def _finish_embed_attach(self, entry: "_TerminalCacheEntry", cwd: str, name: str,
+                              session_id: str | None, line: str | None, generation: int | None,
+                              attach_start_serial: int, *, saved_name: str | None = None,
+                              grab_focus: bool) -> None:
+        ok, detail = entry.controller.finish_attach(line, generation, grab_focus=grab_focus)
         if ok is None:
-            # A newer attach (a different row clicked before this one's XID/timeout
-            # arrived) already superseded this generation -- the current controller
-            # state belongs to that newer attach; touch nothing here (task-2142
-            # row453 REWORK -- reviewer rework, stale-attach race).
+            # A newer attach on THIS slot (a different row clicked before this one's XID/timeout
+            # arrived, or the slot was evicted for a different identity) already superseded this
+            # generation -- the current controller state belongs to that newer attach; touch
+            # nothing here (task-2142 row453 REWORK -- reviewer rework, stale-attach race).
             return
-        if ok:
-            # finish_attach() already resized the child to the container's exact current size --
-            # no need for a second _on_terminal_container_resize() call here. It also already
-            # called focus() internally and only returns ok=True if that grab succeeded -- so by
-            # this point the embed unconditionally HOLDS real X11 keyboard focus, even if a real
-            # click/key landed on another Qt widget while this attach was still pending (task-2170
-            # REWORK finding 2). If the live serial has already moved past attach_start_serial,
-            # that interim interaction is real and must not be silently overridden by a grab that
-            # started before it -- hand focus straight back rather than waiting for some FUTURE
-            # focusChanged to notice the staleness (there may never be one). Otherwise this is an
-            # ordinary attach with no intervening interaction: record the grab baseline exactly
-            # like the re-select short-circuit's own direct focus() call in _switch_embedded_terminal.
-            if self._qt_interaction_serial > attach_start_serial:
-                self._embed_focus_grab_serial = self._qt_interaction_serial
-                self._embedded_terminal.release_focus(int(self.winId()))
+        if not ok:
+            entry.state = "failed"
+            entry.tmux_name = None
+            if self._selected_tmux_name == name:
+                self._show_embed_failure(cwd, name, session_id, detail, saved_name=saved_name)
+            self._advance_preload_queue(entry)
+            return
+        entry.state = "ready"
+        entry.tmux_name = name
+        entry.meta = (cwd, session_id, saved_name)
+        entry.last_used = time.monotonic()
+        if self._selected_tmux_name == name:
+            if grab_focus:
+                # finish_attach() already resized the child to the container's exact current
+                # size -- no need for a second resize call here. It also already called focus()
+                # internally and only returns ok=True if that grab succeeded -- so by this point
+                # the embed unconditionally HOLDS real X11 keyboard focus, even if a real
+                # click/key landed on another Qt widget while this attach was still pending
+                # (task-2170 REWORK finding 2). If the live serial has already moved past
+                # attach_start_serial, that interim interaction is real and must not be silently
+                # overridden by a grab that started before it -- hand focus straight back rather
+                # than waiting for some FUTURE focusChanged to notice the staleness (there may
+                # never be one). Otherwise this is an ordinary attach with no intervening
+                # interaction: record the grab baseline exactly like the re-select
+                # short-circuit's own direct focus() call in _select_running_terminal.
+                self._running_terminal_stack.setCurrentWidget(entry.container)
+                if self._qt_interaction_serial > attach_start_serial:
+                    self._embed_focus_grab_serial = self._qt_interaction_serial
+                    entry.controller.release_focus(int(self.winId()))
+                else:
+                    self._focused_entry = entry
+                    self._note_embed_focus_grabbed(attach_start_serial)
+                self._schedule_paint_verify(entry)
             else:
-                self._note_embed_focus_grabbed(attach_start_serial)
-            self._embedded_terminal_meta[name] = (cwd, session_id, saved_name)
-            self._running_terminal_stack.setCurrentWidget(self.running_terminal_container)
-            # task-2156: a valid XID + successful resize is not proof anything ever actually
-            # painted (the observed bug) -- verify once, a short bounded delay later (real render
-            # + tmux attach latency needs a beat), never on a recurring timer.
-            generation_now = self._embedded_terminal.generation
-            QTimer.singleShot(
-                _EMBED_PAINT_VERIFY_DELAY_MS,
-                lambda: self._verify_embed_painted(generation_now),
-            )
+                # A background preload finished while the user has SINCE selected this exact
+                # identity ("rapid selection during preload") -- promote it now, fail-closed on
+                # the focus grab the preload deliberately skipped.
+                if self._promote_entry(entry, attach_start_serial):
+                    self._schedule_paint_verify(entry)
         else:
-            self._show_embed_failure(cwd, name, session_id, detail, saved_name=saved_name)
+            # Ordinary background preload completion, nobody is looking -- still schedule paint
+            # verification so a silently-blank preload gets evicted before it is ever selected.
+            self._schedule_paint_verify(entry)
+        self._advance_preload_queue(entry)
 
-    def _verify_embed_painted(self, generation: int, retries_left: int = 1) -> None:
+    def _schedule_paint_verify(self, entry: "_TerminalCacheEntry") -> None:
+        generation_now = entry.controller.generation
+        # task-2156: a valid XID + successful resize is not proof anything ever actually painted
+        # (the observed bug) -- verify once, a short bounded delay later (real render + tmux
+        # attach latency needs a beat), never on a recurring timer.
+        QTimer.singleShot(
+            _EMBED_PAINT_VERIFY_DELAY_MS,
+            lambda: self._verify_embed_painted(entry, generation_now),
+        )
+
+    def _verify_embed_painted(
+        self, entry: "_TerminalCacheEntry", generation: int, retries_left: int = 1,
+    ) -> None:
         """Bounded follow-up to a successful `_finish_embed_attach` (task-2156, reworked per
         reviewer REWORK on 51cc5a6711c6 finding 1): a Gtk.Plug/Vte.Terminal that reports a valid
         XID and resizes cleanly can still never actually paint a frame -- proof method #5's
@@ -8672,27 +8812,27 @@ class SessionHub(QMainWindow):
         already gone) gets one short bounded retry, since a sample taken the instant after
         finish_attach can race the X server; a still-uncheckable `None` after that retry is
         FAIL-CLOSED exactly like a confirmed `False` -- an unproven pane is not a painted one."""
-        if generation != self._embedded_terminal.generation:
-            return  # superseded by a newer attach -- this verdict is stale, ignore it
-        painted = self._embedded_terminal.verify_painted()
+        if entry.tmux_name is None or generation != entry.controller.generation:
+            return  # superseded by a newer attach on this slot -- this verdict is stale, ignore
+        painted = entry.controller.verify_painted()
         if painted is True:
             return
         if painted is None and retries_left > 0:
             QTimer.singleShot(
                 _EMBED_PAINT_VERIFY_RETRY_DELAY_MS,
-                lambda: self._verify_embed_painted(generation, retries_left - 1),
+                lambda: self._verify_embed_painted(entry, generation, retries_left - 1),
             )
             return
-        name = self._embedded_terminal.current_name
-        if name is None:
-            return
-        cwd, session_id, saved_name = self._embedded_terminal_meta.get(name, (None, None, None))
-        self._embedded_terminal.detach()
-        self._show_embed_failure(
-            cwd, name, session_id,
-            "the embedded terminal never rendered visible content",
-            saved_name=saved_name,
-        )
+        name = entry.tmux_name
+        cwd, session_id, saved_name = entry.meta or (None, None, None)
+        was_selected = self._selected_tmux_name == name
+        self._evict_entry(entry)
+        if was_selected:
+            self._show_embed_failure(
+                cwd, name, session_id,
+                "the embedded terminal never rendered visible content",
+                saved_name=saved_name,
+            )
 
     def _show_embed_failure(self, cwd: str, name: str, session_id: str | None, detail: str,
                              *, saved_name: str | None = None) -> None:
@@ -8704,28 +8844,156 @@ class SessionHub(QMainWindow):
         self._focus_or_resume_session(cwd, saved_name or name, session_id, tmux_name=name)
 
     def _on_terminal_container_resize(self) -> None:
-        """Re-fill the panel on container resize AND splitter drag (task-2142 row453 REWORK) --
-        wired from `_EmbeddedTerminalContainer.resizeEvent` and `running_splitter.splitterMoved`.
-        A plain attribute lookup rather than a direct bound-method reference at construction time,
-        so this can be wired before `self._embedded_terminal` exists yet."""
-        if hasattr(self, "_embedded_terminal"):
-            self._embedded_terminal.resize_to_container()
+        """Re-fill EVERY pooled slot on container resize AND splitter drag (task-2142 row453,
+        extended task-2172 row491) -- wired from `_EmbeddedTerminalContainer.resizeEvent` and
+        `running_splitter.splitterMoved`. A plain attribute lookup rather than a direct
+        bound-method reference at construction time, so this can be wired before
+        `self._terminal_cache` exists yet. Every slot, including ones not currently visible, is
+        resized to the panel page's OWN size -- QStackedLayout only ever lays out its CURRENT
+        widget (proven empirically: a hidden stacked widget keeps its stale/default size after the
+        page is resized), so relying on Qt to dispatch resizeEvent to hidden stacked widgets would
+        leave every preloaded-but-hidden pane at the wrong size until it is selected. `size()`
+        reflects `resize()`/layout immediately, with no event-loop turn needed, so this needs no
+        real show() to be correct even in an offscreen unit test."""
+        if not hasattr(self, "_terminal_cache"):
+            return
+        size = self._running_terminal_page.size()
+        if size.isEmpty():
+            return
+        for entry in self._terminal_cache:
+            if entry.container.size() != size:
+                entry.container.resize(size)
+            entry.controller.resize_to_container()
+
+    def _evict_entry(self, entry: "_TerminalCacheEntry") -> None:
+        """Free ENTRY's slot: terminate only its own helper (never tmux itself) and clear its
+        identity so it can be reassigned. Never stops/renames/respawns tmux or sends it input."""
+        if self._focused_entry is entry:
+            self._focused_entry = None
+        if self._running_terminal_stack.currentWidget() is entry.container:
+            self._running_terminal_stack.setCurrentWidget(self.running_terminal_placeholder)
+        entry.controller.detach()
+        entry.tmux_name = None
+        entry.meta = None
+        entry.state = "empty"
+        if entry in self._preload_queue:
+            self._preload_queue.remove(entry)
+        if self._preload_in_flight is entry:
+            self._preload_in_flight = None
+
+    def _assign_cache_slot(
+        self, name: str, cwd: str, session_id: str | None, saved_name: str | None,
+    ) -> "_TerminalCacheEntry | None":
+        """Claim a free slot for NAME, or evict the least-recently-used slot that is neither the
+        currently selected identity nor already mid-attach for something else. Returns None only
+        if every one of the (8) slots is busy with another identity that cannot be evicted right
+        now -- essentially unreachable at the configured pool size, but never crashes on it."""
+        entry = next((e for e in self._terminal_cache if e.tmux_name is None), None)
+        if entry is None:
+            evictable = [
+                e for e in self._terminal_cache
+                if e.tmux_name != self._selected_tmux_name
+                and e is not self._preload_in_flight
+                and e not in self._preload_queue
+            ]
+            if not evictable:
+                return None
+            entry = min(evictable, key=lambda e: e.last_used)
+            self._evict_entry(entry)
+        entry.tmux_name = name
+        entry.meta = (cwd, session_id, saved_name)
+        entry.state = "assigned"
+        return entry
+
+    def _reconcile_terminal_cache(
+        self, identities: list[tuple[str, str, str | None, str]],
+    ) -> None:
+        """task-2172 row491: preload every currently Running row's terminal up to the pool cap,
+        keyed by resolved live tmux identity (`identities`, in table order: (tmux_name, cwd,
+        session_id, saved_name), exactly the rows `refresh_running_tab` already computed -- no
+        new tmux subprocess or census here). Selected + already-cached-ready rows always keep
+        their slot; the remaining cap is spent on the rest in table order. Anything beyond the
+        cap attaches lazily on selection instead (see `_select_running_terminal`)."""
+        running_names = {name for name, *_ in identities}
+        info_by_name = {name: (cwd, session_id, saved_name) for name, cwd, session_id, saved_name in identities}
+
+        for entry in self._terminal_cache:
+            if entry.tmux_name is not None and entry.tmux_name not in running_names:
+                self._evict_entry(entry)
+
+        cached_names = {e.tmux_name for e in self._terminal_cache if e.tmux_name is not None}
+        desired: list[str] = []
+        if self._selected_tmux_name in running_names:
+            desired.append(self._selected_tmux_name)
+        for entry in sorted(
+            (e for e in self._terminal_cache if e.tmux_name in running_names and e.tmux_name not in desired),
+            key=lambda e: e.last_used, reverse=True,
+        ):
+            desired.append(entry.tmux_name)
+        for name, *_rest in identities:
+            if len(desired) >= _TERMINAL_CACHE_SIZE:
+                break
+            if name not in desired:
+                desired.append(name)
+
+        for name in desired:
+            if name in cached_names:
+                continue
+            entry = self._assign_cache_slot(name, *info_by_name[name])
+            if entry is not None:
+                self._preload_queue.append(entry)
+        self._advance_preload_queue()
+
+    def _advance_preload_queue(self, completed_entry: "_TerminalCacheEntry | None" = None) -> None:
+        """Limit concurrent background handshakes to ONE in flight at a time (task-2172 row491),
+        to avoid a helper-launch burst -- a completion (COMPLETED_ENTRY, or None when called from
+        `_reconcile_terminal_cache` itself) starts the next queued entry. Never retries a `failed`
+        entry itself -- once popped it is gone from the queue for good; the identity gets a fresh
+        chance only via a later selection or by re-entering the Running census under a fresh
+        `_assign_cache_slot` call."""
+        if self._preload_in_flight is completed_entry:
+            self._preload_in_flight = None
+        if self._preload_in_flight is not None:
+            return
+        while self._preload_queue:
+            entry = self._preload_queue.pop(0)
+            if entry.tmux_name is None or entry.state != "assigned":
+                continue  # evicted, or already claimed by a foreground select, while queued
+            name = entry.tmux_name
+            cwd, session_id, saved_name = entry.meta
+            ok, detail = entry.controller.begin_attach(name)
+            if not ok:
+                entry.state = "failed"
+                entry.tmux_name = None
+                continue
+            entry.state = "preparing"
+            self._preload_in_flight = entry
+            self._await_embed_xid(
+                entry, cwd, name, session_id, self._qt_interaction_serial,
+                saved_name=saved_name, grab_focus=False,
+            )
+            return
 
     def _check_embedded_terminal_liveness(self) -> None:
-        """The embedded terminal's helper process can exit on its own (tmux session ended, the
+        """Any pooled terminal's helper process can exit on its own (tmux session ended, the
         helper crashed) -- caught here, folded into the EXISTING 2s `_status_timer` tick rather
         than a dedicated poll timer (task-2142 row453 REWORK; a prior version added its own 1s
         timer, which the brief's no-new-periodic-poll rule forbids), so the panel never silently
         keeps showing a dead terminal, and falls back to an external terminal window exactly like
-        a failed attach does."""
-        name = self._embedded_terminal.current_name
-        if name is None or self._embedded_terminal.poll_alive():
-            return
-        cwd, session_id, saved_name = self._embedded_terminal_meta.get(name, (None, None, None))
-        self.running_terminal_failure.setText(f"The embedded terminal for {name!r} exited.")
-        self._running_terminal_stack.setCurrentWidget(self.running_terminal_failure)
-        if cwd is not None:
-            self._focus_or_resume_session(cwd, saved_name or name, session_id, tmux_name=name)
+        a failed attach does. task-2172 row491: checks every ready pooled slot, not just one --
+        a dead BACKGROUND slot is evicted silently (nobody is looking at it)."""
+        for entry in list(self._terminal_cache):
+            if entry.tmux_name is None or entry.state != "ready" or entry.controller.poll_alive():
+                continue
+            was_selected = self._selected_tmux_name == entry.tmux_name
+            cwd, session_id, saved_name = entry.meta or (None, None, None)
+            name = entry.tmux_name
+            self._evict_entry(entry)
+            if was_selected:
+                self.running_terminal_failure.setText(f"The embedded terminal for {name!r} exited.")
+                self._running_terminal_stack.setCurrentWidget(self.running_terminal_failure)
+                if cwd is not None:
+                    self._focus_or_resume_session(cwd, saved_name or name, session_id, tmux_name=name)
 
     def running_context_menu(self, point) -> None:
         """Right-click a Running row: the same exact-identity focus/stop
