@@ -57,6 +57,18 @@ class RunningCardContractTests(unittest.TestCase):
         self.assertEqual(age_y, cell_top)
         self.assertEqual(age_height, name_height)
 
+    def test_oversized_age_reservation_stays_inside_narrow_cell(self):
+        geometry = session_hub.running_card_text_geometry(10, 3, 12, 14, 40)
+        for x, y, width, height in geometry.values():
+            self.assertGreaterEqual(width, 0)
+            self.assertGreaterEqual(height, 0)
+            self.assertGreaterEqual(x, 10)
+            self.assertGreaterEqual(y, 3)
+            self.assertLessEqual(x + width, 22)
+            self.assertLessEqual(y + height, 31)
+        self.assertEqual(geometry["name"][2], 0)
+        self.assertEqual(geometry["subtitle"][2], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

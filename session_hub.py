@@ -4727,8 +4727,9 @@ def running_card_text_geometry(
     This is deliberately Qt-free so the pure row542 contract can exercise the same reservation
     arithmetic without constructing a QApplication or opening the frozen Session Hub suite.
     """
-    age_width = max(0, age_width)
-    text_width = max(0, width - age_width)
+    width = max(0, width)
+    age_width = min(max(0, age_width), width)
+    text_width = width - age_width
     geometry = {
         "name": (left, top, text_width, line_height),
         "subtitle": (left, top + line_height, text_width, line_height),
