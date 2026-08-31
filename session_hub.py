@@ -301,6 +301,39 @@ def publish_activity_snapshot(records, *, runtime_dir: str | Path | None = None,
         "by_name": activity,
     }
     temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    previous = None
+    had_previous = False
+    try:
+        previous = path.read_bytes()
+        had_previous = True
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+
+    def restore_previous() -> None:
+        """Undo a replacement if post-replace durability confirmation fails."""
+        if had_previous:
+            restore = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.restore")
+            try:
+                with restore.open("xb") as handle:
+                    handle.write(previous)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(restore, 0o600)
+                os.replace(restore, path)
+            except OSError:
+                try:
+                    restore.unlink()
+                except OSError:
+                    pass
+        else:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    replaced = False
     try:
         with temp.open("x", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
@@ -308,6 +341,7 @@ def publish_activity_snapshot(records, *, runtime_dir: str | Path | None = None,
             os.fsync(handle.fileno())
         os.chmod(temp, 0o600)
         os.replace(temp, path)
+        replaced = True
         directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(directory_fd)
@@ -315,6 +349,8 @@ def publish_activity_snapshot(records, *, runtime_dir: str | Path | None = None,
             os.close(directory_fd)
         return True
     except (OSError, ValueError, TypeError):
+        if replaced:
+            restore_previous()
         try:
             temp.unlink()
         except OSError:

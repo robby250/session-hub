@@ -8468,6 +8468,30 @@ class SessionActivityTests(unittest.TestCase):
         ))
         self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel")
 
+    def test_activity_snapshot_directory_fsync_failure_restores_previous_bytes(self):
+        runtime = self.temp / "runtime"
+        runtime.mkdir(mode=0o700)
+        self.assertTrue(session_hub.publish_activity_snapshot(
+            [("Worker5", "working")], runtime_dir=runtime, created_at=1,
+        ))
+        path = runtime / "session-hub" / "activity-snapshot.json"
+        before = path.read_bytes()
+        real_fsync = session_hub.os.fsync
+        calls = 0
+
+        def fail_directory_fsync(fd):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected directory fsync failure")
+            return real_fsync(fd)
+
+        with patch.object(session_hub.os, "fsync", side_effect=fail_directory_fsync):
+            self.assertFalse(session_hub.publish_activity_snapshot(
+                [("Worker5", "done")], runtime_dir=runtime, created_at=2,
+            ))
+        self.assertEqual(path.read_bytes(), before)
+
     def test_activity_snapshot_publication_follows_standalone_collection(self):
         source = inspect.getsource(session_hub.sessions_json_cli)
         self.assertLess(
