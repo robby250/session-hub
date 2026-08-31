@@ -1161,6 +1161,45 @@ class Session:
         return f"{self.provider}:{self.session_id}"
 
 
+@dataclass(frozen=True)
+class RunningSelection:
+    """Event-order authority for the desktop Running-list highlight."""
+
+    identity: str | None = None
+    generation: int = 0
+
+
+def running_selection_clicked(state: RunningSelection, identity: str) -> RunningSelection:
+    """Record one exact Running-row selection at its event boundary."""
+    return RunningSelection(identity=identity, generation=state.generation + 1)
+
+
+def running_selection_after_snapshot(
+    state: RunningSelection,
+    snapshot_generation: int,
+    visible_identities: set[str] | frozenset[str],
+    snapshot_identity: str | None = None,
+) -> RunningSelection:
+    """Reconcile a snapshot without letting an older result rubberband selection.
+
+    A current snapshot may clear a genuinely missing identity.  An explicitly
+    authoritative newer snapshot may also select its own visible identity;
+    normal desktop refreshes pass no such candidate and therefore only retain
+    the exact click identity.
+    """
+    if snapshot_generation < state.generation:
+        return state
+    if (
+        snapshot_identity is not None
+        and snapshot_generation > state.generation
+        and snapshot_identity in visible_identities
+    ):
+        return RunningSelection(snapshot_identity, snapshot_generation)
+    if state.identity is not None and state.identity not in visible_identities:
+        return RunningSelection(generation=state.generation)
+    return state
+
+
 @dataclass
 class UsageWindow:
     name: str
@@ -7971,6 +8010,10 @@ class SessionHub(QMainWindow):
             running_terminal_stack.addWidget(slot_container)
             self._terminal_cache.append(_TerminalCacheEntry(slot_container, slot_controller))
         self._selected_tmux_name: str | None = None
+        # Keep exact identity separate from the table's transient row/current-index state. A
+        # refresh carries this bounded event generation so an older result cannot restore a prior
+        # highlight after a click (task-2223).
+        self._running_selection = RunningSelection()
         self._focused_entry: _TerminalCacheEntry | None = None
         self._preload_queue: list[_TerminalCacheEntry] = []
         self._preload_in_flight: _TerminalCacheEntry | None = None
@@ -8743,6 +8786,11 @@ class SessionHub(QMainWindow):
         ManageGroupDialog now shows per-group, just flattened across all of
         them here.
         """
+        # The live-data snapshot is synchronous today, but keeping its event boundary explicit
+        # also makes the authority correct if discovery is ever moved behind a queued callback.
+        # A click that re-enters during discovery advances this generation and makes this result
+        # stale at the apply boundary below.
+        snapshot_generation = self._running_selection.generation
         settings = self.metadata.get("settings", {})
         live: list[Session] = []
         if settings.get("enable_codex", True):
@@ -8855,6 +8903,13 @@ class SessionHub(QMainWindow):
             (resolved_name, cwd, match.session_id if match else None, row["name"])
             for _display_name, cwd, row, match, resolved_name in running
         ])
+
+        self._running_selection = running_selection_after_snapshot(
+            self._running_selection,
+            snapshot_generation,
+            {resolved_name for _display_name, _cwd, _row, _match, resolved_name in running},
+        )
+        self._selected_tmux_name = self._running_selection.identity
 
         name_counts = collections.Counter(row["name"] for _dn, _cwd, row, _m, _rn in running)
         view_rows = []
@@ -9160,6 +9215,8 @@ class SessionHub(QMainWindow):
         cwd, name, session_id, tmux_name = data
         # The embed target is always the ACTUAL live tmux session (task-2156) -- embedding never
         # cares about the saved row name, only `name` is carried through for the fallback path.
+        self._running_selection = running_selection_clicked(self._running_selection, tmux_name)
+        self._selected_tmux_name = self._running_selection.identity
         self._select_running_terminal(cwd, tmux_name, session_id, saved_name=name)
 
     def eventFilter(self, obj, event) -> bool:
