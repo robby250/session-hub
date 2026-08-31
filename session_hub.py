@@ -9015,6 +9015,18 @@ class SessionHub(QMainWindow):
             tmux_enabled, name, status = standalone_tmux_status(
                 session, session_overrides.get(session.key, {}), settings, live_names
             )
+            if tmux_enabled and session.provider == "Codex":
+                # standalone_tmux_status derives its name from the saved override/
+                # transcript title, which for a standalone App Server session (no
+                # session_key, e.g. a live orchestrator/reviewer) can differ from the
+                # tmux session it actually launched under once discovery finds the
+                # rollout's own auto-generated title. Same already-computed census the
+                # group-row loop above uses (task-2234) -- no new tmux subprocess.
+                census_name = tmux_name_by_native_key.get(session.native_key)
+                if census_name and census_name in live_names:
+                    # A live census owner is authoritative even when the saved-name
+                    # fallback happens to collide with another live session.
+                    name, status = census_name, "Running"
             if tmux_enabled and status == "Running":
                 running.append((
                     session.title, session.cwd,

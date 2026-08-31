@@ -11996,6 +11996,105 @@ class SearchFilterTests(unittest.TestCase):
         antigravity.assert_not_called()
 
 
+class RunningTabStandaloneCodexCensusTests(unittest.TestCase):
+    """task-2234: a standalone Codex App Server session (e.g. a live orchestrator/
+    reviewer) has no group row and no session_key, so standalone_tmux_status's saved-
+    override/transcript-title name guess can miss its actual live tmux name entirely.
+    refresh_running_tab must fall back to the same tmux_name_by_native_key census the
+    group-row loop already uses, or the session is wrongly reported Stopped."""
+
+    def _window(self, metadata):
+        with patch("session_hub.read_metadata", return_value=metadata):
+            return session_hub.SessionHub()
+
+    def test_standalone_codex_session_promoted_via_census_when_title_mismatches_live_name(self):
+        session = session_hub.Session(
+            "Codex", "id-orch", "Fix the login bug", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/orch.jsonl"),
+        )
+        metadata = {"sessions": {}, "settings": {}, "groups": {}}
+        with (
+            patch("session_hub.claude_sessions", return_value=[]),
+            patch("session_hub.codex_sessions", return_value=[session]),
+            patch("session_hub.antigravity_sessions", return_value=[]),
+            # The transcript-title-derived name ("fix-the-login-bug" or similar) is
+            # NOT live; only the actual launch-time tmux name is.
+            patch("session_hub.tmux_live_session_names",
+                  return_value=frozenset({"VAMP-orchestrator"})),
+            patch("session_hub.compute_codex_tmux_owner_census",
+                  return_value={session.native_key: "VAMP-orchestrator"}),
+        ):
+            window = self._window(metadata)
+        try:
+            found = [
+                window.running_table.item(row, 0).data(session_hub.Qt.ItemDataRole.UserRole)
+                for row in range(window.running_table.rowCount())
+                if window.running_table.item(row, 0) is not None
+                and window.running_table.item(row, 0).data(session_hub.Qt.ItemDataRole.UserRole)
+            ]
+            resolved_names = {data[3] for data in found}
+            self.assertIn("VAMP-orchestrator", resolved_names)
+        finally:
+            window.close()
+
+    def test_standalone_codex_session_without_a_census_entry_stays_whatever_status_it_already_was(self):
+        # Control: with no census entry at all (a real Codex session the App Server
+        # registry never saw), the fix must not invent a name -- standalone_tmux_status's
+        # own verdict (Stopped, since its guessed name isn't live either) stands.
+        session = session_hub.Session(
+            "Codex", "id-orch", "Fix the login bug", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/orch.jsonl"),
+        )
+        metadata = {"sessions": {}, "settings": {}, "groups": {}}
+        with (
+            patch("session_hub.claude_sessions", return_value=[]),
+            patch("session_hub.codex_sessions", return_value=[session]),
+            patch("session_hub.antigravity_sessions", return_value=[]),
+            patch("session_hub.tmux_live_session_names", return_value=frozenset()),
+            patch("session_hub.compute_codex_tmux_owner_census", return_value={}),
+        ):
+            window = self._window(metadata)
+        try:
+            found = [
+                window.running_table.item(row, 0).data(session_hub.Qt.ItemDataRole.UserRole)
+                for row in range(window.running_table.rowCount())
+                if window.running_table.item(row, 0) is not None
+                and window.running_table.item(row, 0).data(session_hub.Qt.ItemDataRole.UserRole)
+            ]
+            self.assertEqual(found, [])
+        finally:
+            window.close()
+
+    def test_standalone_codex_census_owner_wins_over_live_guessed_name_collision(self):
+        session = session_hub.Session(
+            "Codex", "id-orch", "Fix the login bug", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/orch.jsonl"),
+        )
+        metadata = {"sessions": {}, "settings": {}, "groups": {}}
+        with (
+            patch("session_hub.claude_sessions", return_value=[]),
+            patch("session_hub.codex_sessions", return_value=[session]),
+            patch("session_hub.antigravity_sessions", return_value=[]),
+            patch("session_hub.tmux_live_session_names",
+                  return_value=frozenset({"wrong-live", "VAMP-orchestrator"})),
+            patch("session_hub.standalone_tmux_status",
+                  return_value=(True, "wrong-live", "Running")),
+            patch("session_hub.compute_codex_tmux_owner_census",
+                  return_value={session.native_key: "VAMP-orchestrator"}),
+        ):
+            window = self._window(metadata)
+        try:
+            found = [
+                window.running_table.item(row, 0).data(session_hub.Qt.ItemDataRole.UserRole)
+                for row in range(window.running_table.rowCount())
+                if window.running_table.item(row, 0) is not None
+                and window.running_table.item(row, 0).data(session_hub.Qt.ItemDataRole.UserRole)
+            ]
+            self.assertEqual({data[3] for data in found}, {"VAMP-orchestrator"})
+        finally:
+            window.close()
+
+
 class RunningNameAgeDelegateTests(unittest.TestCase):
     """task-2191 REWORK (VAMP-reviewer): pure model/formatting controls for the delegate that
     replaced the Status column -- no SessionHub(), no tmux, just the item/delegate contract."""
