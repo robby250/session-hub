@@ -4724,7 +4724,7 @@ def bounded_tooltip(text: str) -> str:
 
 
 def running_card_text_geometry(
-    left: int, top: int, width: int, height: int, line_height: int, age_width: int
+    left: int, top: int, width: int, height: int, age_width: int
 ) -> dict[str, tuple[int, int, int, int]]:
     """Return the half-open text rectangles used by ``RunningNameAgeDelegate``.
 
@@ -4733,19 +4733,16 @@ def running_card_text_geometry(
     """
     width = max(0, width)
     height = max(0, height)
-    line_height = min(max(0, line_height), height)
     age_width = min(max(0, age_width), width)
     text_width = width - age_width
-    stack_height = min(height, line_height * 2)
-    stack_top = top + (height - stack_height) // 2
-    name_height = min(line_height, stack_height)
-    subtitle_height = max(0, stack_height - name_height)
+    name_height = height // 2
+    subtitle_height = height - name_height
     geometry = {
-        "name": (left, stack_top, text_width, name_height),
-        "subtitle": (left, stack_top + name_height, text_width, subtitle_height),
+        "name": (left, top, text_width, name_height),
+        "subtitle": (left, top + name_height, text_width, subtitle_height),
     }
     if age_width:
-        geometry["age"] = (left + width - age_width + 1, top, age_width - 1, line_height)
+        geometry["age"] = (left + width - age_width + 1, top, age_width - 1, name_height)
     return geometry
 
 
@@ -4770,12 +4767,11 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
         painter.save()
         rect = option.rect.adjusted(4, 2, -4, -2)
         fm = painter.fontMetrics()
-        line_h = fm.height()
         pen = opt.palette.highlightedText() if opt.state & QStyle.StateFlag.State_Selected else opt.palette.text()
         painter.setPen(pen.color())
         age_width = fm.horizontalAdvance(age) + 8 if age else 0
         geometry = running_card_text_geometry(
-            rect.left(), rect.top(), rect.width(), rect.height(), line_h, age_width
+            rect.left(), rect.top(), rect.width(), rect.height(), age_width
         )
         text_width = geometry["name"][2]
         # Clip the custom paint to the cell and elide each identity line independently.  In

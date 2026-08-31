@@ -32,7 +32,7 @@ class RunningCardContractTests(unittest.TestCase):
         age = "48m"
         age_width = 24  # representative QFontMetrics width plus the delegate's padding
         geometry = session_hub.running_card_text_geometry(
-            cell[0], cell[1], cell[2], cell[3], 14, age_width
+            cell[0], cell[1], cell[2], cell[3], age_width
         )
         self.assertEqual(age, "48m")
         self.assertGreater(len(name), 8)
@@ -56,10 +56,10 @@ class RunningCardContractTests(unittest.TestCase):
         self.assertEqual(name_y + name_height, sub_y)
         self.assertEqual(age_y, cell_top)
         self.assertEqual(age_height, name_height)
-        self.assertEqual(name_y, cell_top + (cell_height - name_height - sub_height) // 2)
+        self.assertEqual(name_height + sub_height, cell_height)
 
     def test_oversized_age_reservation_stays_inside_narrow_cell(self):
-        geometry = session_hub.running_card_text_geometry(10, 3, 12, 28, 14, 40)
+        geometry = session_hub.running_card_text_geometry(10, 3, 12, 28, 40)
         for x, y, width, height in geometry.values():
             self.assertGreaterEqual(width, 0)
             self.assertGreaterEqual(height, 0)
@@ -70,12 +70,13 @@ class RunningCardContractTests(unittest.TestCase):
         self.assertEqual(geometry["name"][2], 0)
         self.assertEqual(geometry["subtitle"][2], 0)
 
-    def test_identity_stack_is_centered_in_full_height_card(self):
-        geometry = session_hub.running_card_text_geometry(4, 2, 240, 58, 14, 28)
-        self.assertEqual(geometry["name"][1], 17)
-        self.assertEqual(geometry["subtitle"][1], 31)
+    def test_identity_stack_uses_the_full_height_card(self):
+        geometry = session_hub.running_card_text_geometry(4, 2, 240, 58, 28)
+        self.assertEqual(geometry["name"], (4, 2, 212, 29))
+        self.assertEqual(geometry["subtitle"], (4, 31, 212, 29))
         self.assertEqual(geometry["age"][1], 2)
-        self.assertEqual(geometry["name"][3] + geometry["subtitle"][3], 28)
+        self.assertEqual(geometry["age"][3], 29)
+        self.assertEqual(geometry["name"][3] + geometry["subtitle"][3], 58)
 
 
 if __name__ == "__main__":
