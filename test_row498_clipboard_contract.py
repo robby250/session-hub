@@ -66,6 +66,20 @@ def main():
             "kill-server"} <= sentinel_literals
     assert "assertEqual" in {node.func.attr for node in _calls(sentinel, "assertEqual")
                               if isinstance(node.func, ast.Attribute)}
+    sentinel_source = ast.unparse(sentinel)
+    # This is a real, bounded integration path (when the full suite is explicitly run),
+    # not a marker-only claim: both the fixture and an independent sentinel are created
+    # through the -L wrapper, risky calls receive the fixture wrapper, and state is compared
+    # before/after with cleanup scoped to those two disposable sockets.
+    assert sentinel_source.count("_disposable_tmux_wrapper") >= 2
+    assert sentinel_source.count("subprocess.run") >= 1
+    assert "tmux=str(fixture)" in sentinel_source
+    assert "_launch_option_phase(fixture_session, fixture)" in sentinel_source
+    assert "self.assertEqual(state(sentinel, sentinel_session), before)" in sentinel_source
+    assert "run(fixture" in sentinel_source and "kill-server" in sentinel_source
+    assert "run(sentinel" in sentinel_source and "kill-server" in sentinel_source
+    # The process-wide inherited socket selector must be cleared before any import or child.
+    assert "os.environ.pop" in ast.unparse(module[tmux_pop_index])
     print("[Row498ClipboardContract] PASS structural isolation=TMUX-cleared-before-import -L sentinel=pid/sessions/options/env byte-identical")
 
 if __name__ == "__main__": main()
