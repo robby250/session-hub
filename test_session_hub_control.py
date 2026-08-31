@@ -104,6 +104,51 @@ def test_remote_identity_validation_and_exact_creation_cleanup_are_pure():
             raise AssertionError(f"invalid remote identity was accepted: {invalid}")
 
 
+def test_dead_owned_remote_client_is_recreated_on_launch(tmp_path):
+    metadata = tmp_path / "metadata.json"
+    metadata.write_text(json.dumps({"groups": {"/tmp": {"rows": [
+        {"name": "worker", "provider": "Codex", "override_key": "group:/tmp#worker",
+         "session_key": "Codex:thread-1"}
+    ]}}}))
+    record_path = tmp_path / "registry" / "owner.json"
+    owner = {
+        "endpoint": str(record_path.with_suffix(".sock")), "thread_id": "thread-1",
+        "remote_window_id": "@7", "remote_pid": 123, "remote_start_time": "old-start",
+    }
+    controller = control.SessionHubController(metadata, registry_dir=record_path.parent)
+    controller._owner_path = lambda _row_id: record_path
+    controller._windows = lambda _session: []
+    created = []
+    controller._ensure_remote_window = lambda *args, **kwargs: (
+        created.append((args, kwargs)) or ("@9", True)
+    )
+    controller._remote_pid = lambda _session, _window: 456
+    controller._save_remote_identity = lambda _path, **kwargs: {
+        **owner, "remote_window_id": kwargs["window_id"], "remote_pid": kwargs["pid"],
+    }
+    with patch.object(control, "live_record", return_value=owner), \
+         patch.object(control, "_start_time", return_value=""):
+        result = controller.launch("/tmp", "worker", resume=True)
+
+    assert result["status"] == "resumed"
+    assert result["thread_id"] == "thread-1"
+    assert result["window_created"] is True
+    assert created[0][1]["allow_existing"] is False
+
+
+def test_live_or_ambiguous_remote_identity_is_not_recreated(tmp_path):
+    controller = control.SessionHubController(tmp_path / "metadata.json")
+    owner = {
+        "remote_window_id": "@7", "remote_pid": 123, "remote_start_time": "start-123",
+    }
+    controller._windows = lambda _session: [("@8", control.REMOTE_WINDOW)]
+    with patch.object(control, "_start_time", return_value=""):
+        assert controller._remote_identity_can_be_recreated("worker", owner) is False
+    controller._windows = lambda _session: []
+    with patch.object(control, "_start_time", return_value="start-123"):
+        assert controller._remote_identity_can_be_recreated("worker", owner) is False
+
+
 def test_exact_tmux_target_preserves_legacy_windows(tmp_path):
     metadata = tmp_path / "metadata.json"
     metadata.write_text(json.dumps({"groups": {"/tmp": {"rows": [

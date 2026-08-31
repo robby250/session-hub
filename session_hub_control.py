@@ -144,6 +144,34 @@ class SessionHubController:
         if current_pid != remote_pid or _start_time(current_pid) != remote_start:
             raise ControlError("owned Codex remote client is stale or PID was reused")
 
+    def _remote_identity_can_be_recreated(self, session: str, owner: dict) -> bool:
+        """True only when the previously-owned remote client is provably gone.
+
+        Ctrl+C in an attached Codex row exits the remote client.  When it was the
+        tmux session's last window, tmux removes the session too, while the detached
+        App Server correctly remains alive.  A later Launch must be able to recreate
+        that client without weakening the ownership checks for a still-live,
+        replaced, or ambiguous window.
+        """
+        window_id = owner.get("remote_window_id")
+        remote_pid = owner.get("remote_pid")
+        remote_start = owner.get("remote_start_time")
+        if (
+            not isinstance(window_id, str)
+            or not isinstance(remote_pid, int)
+            or isinstance(remote_pid, bool)
+            or not isinstance(remote_start, str)
+            or not remote_start
+        ):
+            return False
+        # Never adopt or replace an unbound reserved window.  Only the exact
+        # absence left by the dead owned client is recoverable.
+        if any(window_name == REMOTE_WINDOW for _wid, window_name in self._windows(session)):
+            return False
+        # A reused PID is not signalled or trusted; it merely proves that the old
+        # process identity no longer exists and its stale record may be replaced.
+        return _start_time(remote_pid) != remote_start
+
     def _remove_created_remote_window(self, session: str, window_id: str) -> None:
         """Kill only a newly-created reserved window after proving its exact identity."""
         windows = [(wid, wname) for wid, wname in self._windows(session)
@@ -216,10 +244,16 @@ class SessionHubController:
                     raise ControlError("Codex App Server owner record does not match this row")
                 existing = None
             else:
-                self._validate_remote_identity(name, owner)
+                try:
+                    self._validate_remote_identity(name, owner)
+                    allow_existing = True
+                except ControlError:
+                    if not self._remote_identity_can_be_recreated(name, owner):
+                        raise
+                    allow_existing = False
                 window_id, created = self._ensure_remote_window(
                     name, cwd, Path(owner["endpoint"]), owner.get("thread_id") or None,
-                    allow_existing=True,
+                    allow_existing=allow_existing,
                 )
                 owner = self._save_remote_identity(
                     existing, pid=self._remote_pid(name, window_id), window_id=window_id
