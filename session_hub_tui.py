@@ -40,27 +40,37 @@ from textual.widgets import (
     TabPane,
 )
 
-def _shim_textual_terminal_default_colors() -> None:
+def _install_textual_terminal_default_colors_shim():
     """textual-terminal 0.3.0 does `from textual.app import DEFAULT_COLORS` at module
     load, unconditionally, even though it only reads the value when a Terminal is
     constructed with default_colors="textual" (this file always uses the "system"
     default). Modern Textual dropped that name, so supply an inert stand-in only if
-    it is missing, private to this import boundary, never touched otherwise."""
+    it is missing, and only for the duration of the adapter import -- the caller must
+    remove it afterward via _remove_textual_terminal_default_colors_shim()."""
     import textual.app as _textual_app
 
-    if not hasattr(_textual_app, "DEFAULT_COLORS"):
+    already_present = hasattr(_textual_app, "DEFAULT_COLORS")
+    if not already_present:
         _textual_app.DEFAULT_COLORS = {"dark": None, "light": None}
+    return _textual_app, already_present
+
+
+def _remove_textual_terminal_default_colors_shim(textual_app_module, already_present) -> None:
+    if not already_present:
+        del textual_app_module.DEFAULT_COLORS
 
 
 _OssTerminal = None
 _textual_terminal_import_error: ImportError | None = None
+_textual_app_module, _default_colors_already_present = _install_textual_terminal_default_colors_shim()
 try:
-    _shim_textual_terminal_default_colors()
     from textual_terminal import Terminal as _OssTerminal
 except ModuleNotFoundError as exc:  # adapter package not installed at all
     _textual_terminal_import_error = exc
 except ImportError as exc:  # adapter present but incompatible with this Textual version
     _textual_terminal_import_error = exc
+finally:
+    _remove_textual_terminal_default_colors_shim(_textual_app_module, _default_colors_already_present)
 
 SESSION_HUB = Path(__file__).resolve().parent / "session_hub.py"
 PHONE_ROW_HEIGHT = 2
@@ -760,7 +770,10 @@ class SessionHubTUI(App):
 
 def main() -> int:
     if _OssTerminal is None:
-        if isinstance(_textual_terminal_import_error, ModuleNotFoundError):
+        # A ModuleNotFoundError for some OTHER transitive dependency (e.g. pyte, rich) is not
+        # "adapter missing" -- only the top-level textual_terminal package itself qualifies.
+        if (isinstance(_textual_terminal_import_error, ModuleNotFoundError)
+                and _textual_terminal_import_error.name == "textual_terminal"):
             print(
                 f"Session Hub Running terminal requires the maintained OSS adapter; install with: "
                 f"{TEXTUAL_TERMINAL_INSTALL}",
