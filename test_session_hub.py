@@ -8622,6 +8622,27 @@ class SessionActivityTests(unittest.TestCase):
             state, detail = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
         self.assertEqual(state, "working")
 
+    def test_codex_open_turn_beats_newer_reopen_idle_baseline(self):
+        """A reopen baseline is not completion evidence for an open Codex turn."""
+        session_id = "id-reopened-active"
+        path = self._rollout([self._event(time.time() - 5, "task_started")])
+        session_hub.write_session_status(session_id, "idle", "reopened")
+        session = session_hub.Session("Codex", session_id, "t", "/tmp", "/tmp", 0, path)
+        with patch.object(session_hub, "tmux_session_alive", return_value=True):
+            state, detail = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "working")
+        self.assertEqual(detail, "")
+
+    def test_codex_reopen_idle_without_open_turn_remains_idle(self):
+        session_id = "id-reopened-idle"
+        path = self._rollout([self._event(time.time() - 5, "task_complete")])
+        session_hub.write_session_status(session_id, "idle", "reopened")
+        session = session_hub.Session("Codex", session_id, "t", "/tmp", "/tmp", 0, path)
+        with patch.object(session_hub, "tmux_session_alive", return_value=True):
+            state, detail = session_hub.session_activity(session, tmux_enabled=True, tmux_name="x")
+        self.assertEqual(state, "idle")
+        self.assertEqual(detail, "reopened")
+
     # --- newer task_complete/turn_aborted beats a stale "working" status ---
     def test_codex_task_complete_newer_than_stale_working_status_wins(self):
         session_id = "id-stale-working"
