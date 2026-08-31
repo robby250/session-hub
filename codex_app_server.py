@@ -40,7 +40,10 @@ def remote_tui_argv(endpoint: Path, thread_id: str | None, cwd: str) -> list[str
     return argv
 
 
-def publish_record(path: Path, *, row_id: str, endpoint: Path, thread_id: str, process: subprocess.Popen) -> dict:
+def publish_record(
+    path: Path, *, row_id: str, endpoint: Path, thread_id: str, process: subprocess.Popen,
+    name: str | None = None, aliases: list[str] | None = None,
+) -> dict:
     if path.exists():
         raise RuntimeError("Codex App Server owner record already exists")
     if endpoint.parent != path.parent or endpoint.name != f"{path.stem}.sock":
@@ -50,6 +53,13 @@ def publish_record(path: Path, *, row_id: str, endpoint: Path, thread_id: str, p
         raise RuntimeError("Codex App Server has no process identity")
     record = {"schema": SCHEMA_VERSION, "row_id": row_id, "endpoint": str(endpoint),
               "thread_id": thread_id, "pid": process.pid, "start_time": start}
+    # ``row_id`` is the stable ownership key; ``name``/``aliases`` are the public managed-row
+    # addresses consumed by session_ctl's resolver. Keeping both in one record prevents a group
+    # row's private override key from becoming an unaddressable App Server owner.
+    if name:
+        record["name"] = name
+    if aliases:
+        record["aliases"] = sorted({alias for alias in aliases if alias})
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
     tmp.write_text(json.dumps(record, sort_keys=True) + "\n")

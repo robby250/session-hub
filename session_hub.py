@@ -10219,7 +10219,8 @@ class SessionHub(QMainWindow):
             if not wait_ready(endpoint):
                 raise RuntimeError("Codex App Server did not become ready")
             publish_record(record_path, row_id=row_id, endpoint=endpoint,
-                           thread_id=session_id or "", process=server)
+                           thread_id=session_id or "", process=server,
+                           name=tmux_name, aliases=[tmux_name] if tmux_name else [])
             terminal = shutil.which("gnome-terminal") or shutil.which("x-terminal-emulator")
             if not terminal:
                 raise RuntimeError("No supported terminal emulator was found.")

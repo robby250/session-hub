@@ -87,13 +87,18 @@ def _fake_lifecycle_control() -> None:
             observer = threading.Thread(target=observe_publication)
             observer.start()
             saved_a = publish_record(record_a, row_id="row-a", endpoint=endpoint_a,
-                                     thread_id="thread-a", process=server_a)
+                                     thread_id="thread-a", process=server_a,
+                                     name="VAMP-worker5", aliases=["VAMP-worker5"])
             observing = False
             observer.join(timeout=1)
             saved_b = publish_record(record_b, row_id="row-b", endpoint=endpoint_b,
                                      thread_id="thread-b", process=server_b)
             assert not observed_partial
             assert record_a.exists() and record_b.exists()
+            # Cross-component contract: the private stable row id and the public managed-row
+            # target coexist, so session_ctl can resolve the target name without guessing.
+            assert saved_a["name"] == "VAMP-worker5"
+            assert saved_a["aliases"] == ["VAMP-worker5"]
             assert not list(root.glob(".*.tmp")), "atomic publication leaked a temp record"
             assert remote_tui_argv(endpoint_a, saved_a["thread_id"], "/tmp")[-2:] == ["resume", "thread-a"]
             assert remote_tui_argv(endpoint_a, None, "/tmp") == [
@@ -189,7 +194,8 @@ def _fake_session_hub_launch_control() -> None:
 
         def fake_publish(path, **kwargs):
             events.append(("publish", kwargs["row_id"], kwargs["thread_id"]))
-            records.append(path)
+            records.append({"row_id": kwargs["row_id"], "name": kwargs.get("name"),
+                            "aliases": kwargs.get("aliases")})
             return {"row_id": kwargs["row_id"], "thread_id": kwargs["thread_id"]}
 
         def fake_remote(endpoint, thread_id, cwd):
@@ -220,6 +226,7 @@ def _fake_session_hub_launch_control() -> None:
                           "endpoint", "start", "ready", "publish", "remote"]
         assert events[3] == ("publish", "row-a", "thread-a")
         assert events[8] == ("publish", "row-a", "thread-a")
+        assert records[0]["name"] == "tmux-a" and records[0]["aliases"] == ["tmux-a"]
         assert hub.stopped == ["row-a", "row-a"]
         assert len(hub.spawned) == 2 and all(item[1] == "row-a" for item in hub.spawned)
 
