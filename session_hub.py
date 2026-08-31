@@ -31,6 +31,20 @@ from terminal_profile import (  # noqa: E402  (see terminal_profile.py -- shared
 )
 from datetime import date, datetime
 from pathlib import Path
+from codex_app_server import (
+    discard_stale_record, live_remote_owner_names, record_for_row, stop_owned,
+    stop_owned_for_row,
+)
+
+# Keep headless row control screen-inert: dispatch before importing PyQt6.  The controller is
+# deliberately a separate module so CLI callers never construct QApplication or SessionHub.
+_HEADLESS_ROW_FLAGS = {
+    "--launch-group-row", "--resume-group-row", "--stop-group-row", "--status-group-row",
+}
+if _HEADLESS_ROW_FLAGS.intersection(sys.argv):
+    from session_hub_control import cli as _headless_row_cli
+    _headless_data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+    raise SystemExit(_headless_row_cli(sys.argv, _headless_data_home / "session-hub" / "metadata.json"))
 
 from PyQt6.QtCore import (
     QByteArray, QEvent, QItemSelectionModel, QObject, QRect, QRunnable, QSocketNotifier,
@@ -4720,7 +4734,7 @@ def bounded_tooltip(text: str) -> str:
 
 
 def running_card_text_geometry(
-    left: int, top: int, width: int, line_height: int, age_width: int
+    left: int, top: int, width: int, height: int, age_width: int
 ) -> dict[str, tuple[int, int, int, int]]:
     """Return the half-open text rectangles used by ``RunningNameAgeDelegate``.
 
@@ -4728,14 +4742,14 @@ def running_card_text_geometry(
     arithmetic without constructing a QApplication or opening the frozen Session Hub suite.
     """
     width = max(0, width)
+    height = max(0, height)
     age_width = min(max(0, age_width), width)
     text_width = width - age_width
     geometry = {
-        "name": (left, top, text_width, line_height),
-        "subtitle": (left, top + line_height, text_width, line_height),
+        "identity": (left, top, text_width, height),
     }
     if age_width:
-        geometry["age"] = (left + width - age_width + 1, top, age_width - 1, line_height)
+        geometry["age"] = (left + width - age_width + 1, top, age_width - 1, height)
     return geometry
 
 
@@ -4752,38 +4766,40 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index) -> None:
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
-        age = index.data(Qt.ItemDataRole.UserRole + 5) or ""
-        lines = opt.text.split("\n")
+        age = str(index.data(Qt.ItemDataRole.UserRole + 5) or "").strip()
+        identity = opt.text
         opt.text = ""
         style = opt.widget.style() if opt.widget else QApplication.style()
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
         painter.save()
         rect = option.rect.adjusted(4, 2, -4, -2)
         fm = painter.fontMetrics()
-        line_h = fm.height()
         pen = opt.palette.highlightedText() if opt.state & QStyle.StateFlag.State_Selected else opt.palette.text()
         painter.setPen(pen.color())
-        age_width = fm.horizontalAdvance(age) + 8 if age else 0
-        geometry = running_card_text_geometry(rect.left(), rect.top(), rect.width(), line_h, age_width)
-        text_width = geometry["name"][2]
-        # Clip the custom paint to the cell and elide each identity line independently.  In
-        # particular, a long name must not paint underneath the age or into Last message.
-        painter.setClipRect(rect)
-        top_rect = QRect(*geometry["name"])
-        name = fm.elidedText(lines[0] if lines else "", Qt.TextElideMode.ElideRight, text_width)
-        painter.drawText(
-            top_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name
+        # Reserve the glyphs plus one minimal visual gap.  The old +8 padding left a conspicuous
+        # dead lane between short values such as ``1m`` and Last message.
+        age_width = fm.horizontalAdvance(age) + 3 if age else 0
+        geometry = running_card_text_geometry(
+            rect.left(), rect.top(), rect.width(), rect.height(), age_width
         )
+        # One wrapped identity block owns the card's full height and begins at its top. The
+        # age keeps its independent strip and remains centered vertically.
+        painter.setClipRect(rect)
+        identity_rect = QRect(*geometry["identity"])
+        painter.save()
+        painter.setClipRect(identity_rect, Qt.ClipOperation.IntersectClip)
+        painter.drawText(
+            identity_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+            | Qt.TextFlag.TextWordWrap,
+            identity,
+        )
+        painter.restore()
         if age:
             age_rect = QRect(*geometry["age"])
             painter.setPen(QColor("#9aa0a6"))
             painter.drawText(age_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, age)
             painter.setPen(pen.color())
-        if len(lines) > 1:
-            sub_rect = QRect(*geometry["subtitle"])
-            painter.setPen(QColor("#9aa0a6"))
-            subtitle = fm.elidedText(lines[1], Qt.TextElideMode.ElideRight, text_width)
-            painter.drawText(sub_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, subtitle)
         painter.restore()
 
 
@@ -5077,7 +5093,9 @@ def standalone_tmux_status(
     tmux_enabled = session.provider in ("Claude", "Codex")
     if not tmux_enabled:
         return False, None, None
-    name = (overrides.get("flags") or {}).get("--name") or overrides.get("name") or session.title
+    name = sanitize_tmux_session_name(
+        (overrides.get("flags") or {}).get("--name") or overrides.get("name") or session.title
+    )
     return True, name, ("Running" if tmux_session_alive(name, live_names) else "Stopped")
 
 
@@ -7110,6 +7128,9 @@ class ManageGroupDialog(QDialog):
             action.triggered.connect(slot)
             menu.addAction(action)
         menu.addSeparator()
+        stop_action = QAction("Stop session", self)
+        stop_action.triggered.connect(lambda: self.hub.stop_group_row(self.cwd, row["name"]))
+        menu.addAction(stop_action)
         remove_action = QAction("Remove from group", self)
         remove_action.triggered.connect(lambda: self.remove_row(row["name"]))
         menu.addAction(remove_action)
@@ -7488,6 +7509,8 @@ class SessionHub(QMainWindow):
         self.usage_compact_bars: dict[str, QProgressBar] = {}
         self.thread_pool = QThreadPool.globalInstance()
         self.group_dialogs: dict[str, "ManageGroupDialog"] = {}
+        # task-2194 row518: Session Hub owns Codex App Server processes and records.
+        self._codex_app_servers: dict[str, tuple[subprocess.Popen, Path]] = {}
         # task-2142 row453 REWORK (orchestrator search REWORK): every saved group row's
         # identity, rebuilt once per refresh() straight from already-loaded metadata (no
         # subprocess) -- what apply_filter's All Sessions branch searches to surface a
@@ -8010,6 +8033,9 @@ class SessionHub(QMainWindow):
             self.settings().pop("window_geometry", None)
 
     def closeEvent(self, event) -> None:
+        # task-2194 row518: the Hub owns every Codex App Server child; close tears down only
+        # records/endpoints it published, never an unrelated process or socket.
+        self.stop_all_codex_app_servers()
         # task-2170: undo installEventFilter(self) from __init__ -- an event filter installed on
         # the QApplication SINGLETON outlives this window unless explicitly removed, leaving a
         # dangling reference once this SessionHub instance is garbage collected (confirmed live:
@@ -8701,6 +8727,7 @@ class SessionHub(QMainWindow):
         # standalone session below shares it instead of each spawning its own
         # `tmux has-session` (was up to 2 subprocesses per row).
         live_names = tmux_live_session_names()
+        codex_owner_by_row_id = live_remote_owner_names()
 
         # task-2156: ONE shared batched identity view, computed before the group-row
         # loop below so it can decide EACH row's actual tmux target, not just its
@@ -8749,7 +8776,15 @@ class SessionHub(QMainWindow):
                 # still owns the exact rollout `match.native_key` names, and that
                 # is what every tmux-facing action below must target -- the saved
                 # name is kept only for the row registry lookup and the label.
-                if match and match.provider == "Codex":
+                row_provider = row.get("provider", "Claude")
+                row_id = row.get("override_key") or f"group:{cwd}#{row['name']}"
+                registry_name = codex_owner_by_row_id.get(row_id)
+                if row_provider == "Codex" and registry_name in live_names:
+                    # The private owner registry is the launch authority for App Server rows.
+                    # It is stronger than transcript FD discovery and makes a just-launched
+                    # row visible before (or even without) a rollout census match.
+                    resolved_name = registry_name
+                elif match and match.provider == "Codex":
                     resolved_name = tmux_name_by_native_key.get(match.native_key)
                     if resolved_name is None:
                         # task-2156 REWORK #2 (18be076): missing/ambiguous exact identity must
@@ -8932,8 +8967,49 @@ class SessionHub(QMainWindow):
         # can differ from its saved row name after an external restart -- stopping `name` here
         # would silently no-op (nothing tmux-alive under that name) and leave the real session
         # running headless forever.
-        stop_tmux_session(tmux_name)
+        row_id = self.codex_app_server_row_id(cwd, name, _session_id)
+        if row_id:
+            result = self.stop_group_row(cwd, name)
+            if result.get("status") == "error":
+                QMessageBox.critical(self, "Could not stop session", result["message"])
+                return
+        else:
+            stop_tmux_session(tmux_name)
         self.refresh_running_tab()
+
+    def stop_group_row(self, cwd: str, name: str) -> dict:
+        """Stop a managed row through its provider-aware lifecycle boundary."""
+        group = self.metadata.get("groups", {}).get(cwd) or {}
+        row = next((item for item in group.get("rows", []) if item.get("name") == name), None)
+        if not row:
+            return {"status": "error", "message": f"No row named {name!r} in this group"}
+        if row.get("provider") == "Codex":
+            from session_hub_control import ControlError, SessionHubController
+            try:
+                return SessionHubController(METADATA_PATH).stop(cwd, name)
+            except (ControlError, OSError, RuntimeError, ValueError) as error:
+                return {"status": "error", "message": str(error)}
+        stop_tmux_session(name)
+        return {"status": "stopped", "name": name}
+
+    def codex_app_server_row_id(
+        self, cwd: str | None, name: str | None, session_id: str | None = None
+    ) -> str | None:
+        """Resolve the stable row key used by the App Server registry."""
+        if cwd and name:
+            group = self.metadata.get("groups", {}).get(cwd) or {}
+            row = next((item for item in group.get("rows", []) if item.get("name") == name), None)
+            if row and row.get("provider") == "Codex":
+                return row.get("override_key") or row.get("session_key") or name
+        if session_id:
+            session = next(
+                (item for item in getattr(self, "sessions", [])
+                 if item.session_id == session_id and item.provider == "Codex"),
+                None,
+            )
+            if session:
+                return session.key
+        return None
 
     def _focus_or_resume_session(
         self, cwd: str, name: str, session_id: str | None, *, tmux_name: str | None = None,
@@ -10097,6 +10173,12 @@ class SessionHub(QMainWindow):
                     "live status until you clear or replace that `notify` line yourself.",
                 )
         try:
+            if provider == "Codex":
+                self._launch_codex_app_server(
+                    session_id, cwd, source_cwd, model, session_key, tmux_name,
+                    reasoning_effort, initial_prompt, focus,
+                )
+                return
             if provider in ("Claude", "Codex"):
                 # tmux_name, not flag_overrides["--name"]: resuming a group
                 # row (session_id set) never passes --name at all - Claude
@@ -10191,6 +10273,58 @@ class SessionHub(QMainWindow):
             )
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(self, "Could not launch session", str(error))
+
+    def _launch_codex_app_server(
+        self, session_id, cwd, source_cwd, model, session_key, tmux_name,
+        reasoning_effort, initial_prompt, focus,
+    ) -> None:
+        """Launch one private App Server with its remote TUI inside exact tmux."""
+        row_id = session_key or tmux_name or session_id
+        if not row_id:
+            raise RuntimeError("Codex App Server launch requires a stable row identity")
+        name = sanitize_tmux_session_name(tmux_name or "")
+        if not name:
+            raise RuntimeError("Codex App Server launch requires a tmux session name")
+        from session_hub_control import SessionHubController
+        SessionHubController(METADATA_PATH).launch_exact(
+            row_id=row_id, name=name, cwd=cwd, thread_id=session_id,
+            process_cwd=source_cwd or cwd,
+        )
+        self._announce_running_launch(name)
+
+    def stop_codex_app_server(self, row_id: str) -> None:
+        owned = self._codex_app_servers.pop(row_id, None)
+        if owned:
+            process, record_path = owned
+            try:
+                stop_owned(record_path, row_id=row_id)
+            except (OSError, RuntimeError, ValueError):
+                # A stale persisted identity must never be signalled.  Remove its
+                # record only after codex_app_server validates the row/path binding;
+                # the in-memory child is terminated only while its own PID is live.
+                discard_stale_record(record_path, row_id=row_id)
+                if getattr(process, "poll", lambda: 0)() is None:
+                    process.terminate()
+            return
+        try:
+            stop_owned_for_row(row_id)
+        except (OSError, RuntimeError, ValueError):
+            # A stale single record can be retired after binding validation; an
+            # ambiguous set remains untouched and fail-closed.
+            try:
+                record_path = record_for_row(row_id)
+            except RuntimeError:
+                # record_for_row raises for multiple owners.  Never turn that ambiguity into a
+                # replacement launch: the caller must see the fail-closed refusal.
+                raise
+            except (OSError, ValueError):
+                return
+            if record_path:
+                discard_stale_record(record_path, row_id=row_id)
+
+    def stop_all_codex_app_servers(self) -> None:
+        for row_id in list(self._codex_app_servers):
+            self.stop_codex_app_server(row_id)
 
     def _selected_search_member(self) -> tuple[str, str, str | None] | None:
         """(cwd, name, session_id) if the currently-selected All Sessions row is a search-
@@ -10694,6 +10828,10 @@ class SessionHub(QMainWindow):
             reasoning_effort = dialog.reasoning_effort
             account_config_dir = dialog.account_config_dir if target == "Claude" else None
 
+        if session.provider == "Codex":
+            self.stop_codex_app_server(
+                group_row.get("override_key") if group_row else session.key
+            )
         if use_tmux:
             stop_tmux_session(tmux_name)
 
@@ -10927,6 +11065,16 @@ class SessionHub(QMainWindow):
         if not row:
             return {"status": "error", "message": f"No row named {name!r} in this group"}
         provider = row.get("provider", "Claude")
+        if provider == "Codex":
+            from session_hub_control import ControlError, SessionHubController
+            try:
+                result = SessionHubController(METADATA_PATH).launch(
+                    cwd, name, resume=bool(row.get("session_key"))
+                )
+                self._announce_running_launch(result.get("name") or name)
+                return result
+            except (ControlError, OSError, RuntimeError) as error:
+                return {"status": "error", "message": str(error)}
         # No tmux-alive short-circuit here (task-2142): a live-but-detached row (no window open)
         # reaches this function through _focus_or_resume_session precisely because window_titled()
         # found nothing, and an early "already_running" return used to hand back a status dict
@@ -11001,6 +11149,9 @@ class SessionHub(QMainWindow):
             else None,
             session_key=row["override_key"],
             flag_overrides={"--name": row["name"]},
+            # Fresh managed rows have no saved thread yet, but their public row name is still
+            # the address consumed by session_ctl's App Server resolver.
+            tmux_name=row["name"],
             strip_env=strip_env,
             wait_for_tracking=wait_for_tracking,
         )
@@ -11044,6 +11195,14 @@ class SessionHub(QMainWindow):
         row = next((r for r in group.get("rows", []) if r["name"] == name), None)
         if not row:
             return {"status": "error", "message": f"No row named {name!r} in this group"}
+        if row.get("provider", "Claude") == "Codex":
+            from session_hub_control import ControlError, SessionHubController
+            try:
+                result = SessionHubController(METADATA_PATH).launch(cwd, name, resume=True)
+                self._announce_running_launch(result.get("name") or name)
+                return result
+            except (ControlError, OSError, RuntimeError) as error:
+                return {"status": "error", "message": str(error)}
         # group_row_candidates(), not a same-provider-only claude_sessions()/
         # codex_sessions() call: an unlinked, single-provider pool matches
         # the row's stored (possibly stale) native key literally instead of
@@ -11240,6 +11399,14 @@ class SessionHub(QMainWindow):
             )
 
     def move_session_to_trash(self, session: Session) -> None:
+        if session.provider == "Codex":
+            self.stop_codex_app_server(session.key)
+            for group in self.metadata.get("groups", {}).values():
+                for row in group.get("rows", []):
+                    if row.get("provider") == "Codex" and row.get("session_key") == session.key:
+                        self.stop_codex_app_server(
+                            row.get("override_key") or row.get("session_key") or row.get("name")
+                        )
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         destination = TRASH_DIR / session.provider.lower() / f"{stamp}-{session.session_id}"
         destination.mkdir(parents=True, exist_ok=False)
@@ -11651,9 +11818,17 @@ def stop_group_row_cli(argv: list[str]) -> int:
     if not row:
         print(json.dumps({"status": "error", "message": f"No row named {name!r} in group {cwd!r}."}))
         return 1
-    stop_tmux_session(name)
-    print(json.dumps({"status": "ok"}))
-    return 0
+    if row.get("provider") == "Codex":
+        from session_hub_control import ControlError, SessionHubController
+        try:
+            result = SessionHubController(METADATA_PATH).stop(cwd, name)
+        except (ControlError, OSError, RuntimeError, ValueError) as error:
+            result = {"status": "error", "message": str(error)}
+    else:
+        stop_tmux_session(name)
+        result = {"status": "stopped", "name": name}
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result.get("status") != "error" else 1
 
 
 def stop_session_cli(argv: list[str]) -> int:
@@ -11681,59 +11856,22 @@ def stop_session_cli(argv: list[str]) -> int:
     if not tmux_enabled:
         print(json.dumps({"status": "error", "message": f"{key!r} is not launched in tmux."}))
         return 1
+    if session.provider == "Codex":
+        stop_owned_for_row(session.key)
     stop_tmux_session(name)
     print(json.dumps({"status": "ok"}))
     return 0
 
 
 def launch_group_row_cli(argv: list[str]) -> int:
-    """Headless `--launch-group-row <cwd> <name>`, for an orchestrator's own Bash tool.
-
-    Builds a real (but never shown) SessionHub so the launch goes through
-    the exact same tracked path (PID capture, launch_env/launch_flags
-    overrides) a GUI click uses - see SessionHub.launch_group_row. Blocks
-    briefly (wait_for_tracking) since this process exits right after, unlike
-    the GUI where a background daemon thread has the app's whole lifetime to
-    finish capturing the launched PID.
-    """
-    try:
-        index = argv.index("--launch-group-row")
-        cwd, name = argv[index + 1], argv[index + 2]
-    except (ValueError, IndexError):
-        print(json.dumps({
-            "status": "error",
-            "message": "usage: session_hub.py --launch-group-row <cwd> <name>",
-        }))
-        return 1
-    app = QApplication.instance() or QApplication(argv[:1])
-    window = SessionHub()
-    result = window.launch_group_row(cwd, name, wait_for_tracking=True)
-    print(json.dumps(result))
-    return 0 if result.get("status") != "error" else 1
+    from session_hub_control import cli
+    return cli(argv, METADATA_PATH)
 
 
 def resume_session_cli(argv: list[str]) -> int:
-    """Headless `--resume-session <name|key|id>`, for an orchestrator's own Bash.
-
-    The single-session counterpart to --launch-group-row: same never-shown
-    SessionHub, so the resume goes through the exact tracked path (PID
-    capture, launch_env/launch_flags overrides) a GUI double-click uses.
-    Blocks briefly (wait_for_tracking) since this process exits right after.
-    """
-    try:
-        index = argv.index("--resume-session")
-        wanted = argv[index + 1]
-    except (ValueError, IndexError):
-        print(json.dumps({
-            "status": "error",
-            "message": "usage: session_hub.py --resume-session <name|key|session-id>",
-        }))
-        return 1
-    app = QApplication.instance() or QApplication(argv[:1])
-    window = SessionHub()
-    result = window.resume_session_by_name(wanted, wait_for_tracking=True)
-    print(json.dumps(result))
-    return 0 if result.get("status") != "error" else 1
+    print(json.dumps({"status": "error", "message":
+                      "use --resume-group-row <cwd> <name> for exact managed-row control"}))
+    return 1
 
 
 def main() -> int:
@@ -11758,6 +11896,9 @@ def main() -> int:
         return launch_group_row_cli(sys.argv)
     if "--resume-session" in sys.argv:
         return resume_session_cli(sys.argv)
+    if "--resume-group-row" in sys.argv or "--status-group-row" in sys.argv:
+        from session_hub_control import cli
+        return cli(sys.argv, METADATA_PATH)
     if "--hook-notify" in sys.argv:
         return hook_notify_cli()
     if "--hook-notify-codex" in sys.argv:

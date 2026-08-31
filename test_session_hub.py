@@ -5015,6 +5015,55 @@ class SessionHubTests(unittest.TestCase):
             self.assertNotIn("session_key", row)
             self.assertIn("codex_pending_since", row)
 
+    def test_discover_sessions_shares_one_codex_owner_census_across_pending_rows(self):
+        """task-2201 rework: discovery is a refresh-wide authority, so multiple pending
+        Codex rows must consume the one owner census and never fall back to one native-key
+        lookup per row."""
+        rows = [
+            {"name": "VAMP-worker4", "provider": "Codex", "codex_pending_since": 200},
+            {"name": "VAMP-worker5", "provider": "Codex", "codex_pending_since": 201},
+        ]
+        sessions = [
+            session_hub.Session(
+                "Codex", "worker4", "worker4", "/tmp/vamp", "/tmp/vamp", 500,
+                Path("/tmp/worker4.jsonl"),
+            ),
+            session_hub.Session(
+                "Codex", "worker5", "worker5", "/tmp/vamp", "/tmp/vamp", 501,
+                Path("/tmp/worker5.jsonl"),
+            ),
+        ]
+        metadata = {
+            "settings": {"enable_codex": True, "enable_claude": False, "enable_antigravity": False},
+            "sessions": {},
+            "groups": {"/tmp/vamp": {"rows": rows}},
+        }
+        census = {
+            "Codex:worker4": "VAMP-worker4",
+            "Codex:worker5": "VAMP-worker5",
+        }
+        with (
+            patch.object(session_hub, "codex_sessions", return_value=sessions),
+            patch.object(session_hub, "compute_codex_tmux_owner_census", return_value=census) as census_call,
+            patch.object(session_hub, "codex_tmux_native_key", side_effect=AssertionError("per-row lookup")) as lookup,
+            patch.object(session_hub, "claude_sessions", return_value=[]),
+            patch.object(session_hub, "antigravity_sessions", return_value=[]),
+            patch.object(session_hub, "sync_group_row_names", return_value=False),
+            patch.object(session_hub, "resolve_pending_links", return_value=False),
+            patch.object(session_hub, "adopt_untracked_sessions"),
+            patch.object(session_hub, "resolve_clear_continuations", return_value=False),
+            patch.object(session_hub, "write_metadata"),
+            patch.object(session_hub, "flush_persistent_scan_index"),
+        ):
+            session_hub.discover_sessions(metadata)
+        census_call.assert_called_once_with()
+        self.assertEqual(lookup.call_count, 0)
+        self.assertEqual(
+            [row["session_key"] for row in rows],
+            ["Codex:worker4", "Codex:worker5"],
+        )
+        self.assertTrue(all("codex_pending_since" not in row for row in rows))
+
     def test_discover_sessions_collapses_group_members_into_one_row(self):
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp) / "-tmp-vamp"

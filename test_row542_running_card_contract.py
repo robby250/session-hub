@@ -1,5 +1,6 @@
 """Pure row542 contract checks; deliberately outside the frozen Session Hub test suite."""
 
+import inspect
 import unittest
 
 import session_hub
@@ -32,7 +33,7 @@ class RunningCardContractTests(unittest.TestCase):
         age = "48m"
         age_width = 24  # representative QFontMetrics width plus the delegate's padding
         geometry = session_hub.running_card_text_geometry(
-            cell[0], cell[1], cell[2], 14, age_width
+            cell[0], cell[1], cell[2], cell[3], age_width
         )
         self.assertEqual(age, "48m")
         self.assertGreater(len(name), 8)
@@ -41,24 +42,22 @@ class RunningCardContractTests(unittest.TestCase):
         cell_left, cell_top, cell_width, cell_height = cell
         cell_right = cell_left + cell_width
         cell_bottom = cell_top + cell_height
-        name_x, name_y, name_width, name_height = geometry["name"]
-        sub_x, sub_y, sub_width, sub_height = geometry["subtitle"]
+        identity_x, identity_y, identity_width, identity_height = geometry["identity"]
         age_x, age_y, age_rect_width, age_height = geometry["age"]
-        self.assertLessEqual(name_x + name_width, age_x)
-        self.assertLessEqual(sub_x + sub_width, age_x)
+        self.assertLessEqual(identity_x + identity_width, age_x)
         for x, y, width, height in geometry.values():
             self.assertGreaterEqual(x, cell_left)
             self.assertGreaterEqual(y, cell_top)
             self.assertLessEqual(x + width, cell_right)
             self.assertLessEqual(y + height, cell_bottom)
         self.assertGreater(age_rect_width, 0)
-        self.assertEqual(name_height, sub_height)
-        self.assertEqual(name_y + name_height, sub_y)
         self.assertEqual(age_y, cell_top)
-        self.assertEqual(age_height, name_height)
+        self.assertEqual(identity_y, cell_top)
+        self.assertEqual(age_height, cell_height)
+        self.assertEqual(identity_height, cell_height)
 
     def test_oversized_age_reservation_stays_inside_narrow_cell(self):
-        geometry = session_hub.running_card_text_geometry(10, 3, 12, 14, 40)
+        geometry = session_hub.running_card_text_geometry(10, 3, 12, 28, 40)
         for x, y, width, height in geometry.values():
             self.assertGreaterEqual(width, 0)
             self.assertGreaterEqual(height, 0)
@@ -66,8 +65,23 @@ class RunningCardContractTests(unittest.TestCase):
             self.assertGreaterEqual(y, 3)
             self.assertLessEqual(x + width, 22)
             self.assertLessEqual(y + height, 31)
-        self.assertEqual(geometry["name"][2], 0)
-        self.assertEqual(geometry["subtitle"][2], 0)
+        self.assertEqual(geometry["identity"][2], 0)
+
+    def test_identity_stack_uses_the_full_height_card(self):
+        geometry = session_hub.running_card_text_geometry(4, 2, 240, 58, 28)
+        self.assertEqual(geometry["identity"], (4, 2, 212, 58))
+        self.assertEqual(geometry["age"][1], 2)
+        self.assertEqual(geometry["age"][3], 58)
+
+    def test_subtitle_is_clipped_at_the_real_cell_not_pre_elided(self):
+        source = inspect.getsource(session_hub.RunningNameAgeDelegate.paint)
+        self.assertNotIn("elidedText", source)
+        self.assertIn("horizontalAdvance(age) + 3", source)
+        self.assertIn('geometry["identity"]', source)
+        self.assertIn("Qt.TextFlag.TextWordWrap", source)
+        self.assertNotIn("Qt.TextFlag.TextSingleLine", source)
+        self.assertNotIn('geometry["subtitle"]', source)
+        self.assertIn("painter.setClipRect(rect)", source)
 
 
 if __name__ == "__main__":
