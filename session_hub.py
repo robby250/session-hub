@@ -2830,34 +2830,19 @@ def find_group_member_session(
        already-claimed sibling with the same (often both-blank) agent_name/cwd
        must never resolve to that sibling's session - the absent row stays
        unmatched rather than borrowing another row's live identity.
-    3. Codex only, and only for a row this session itself just launched
-       (`row["codex_pending_since"]`, stamped by launch_group_row): the
-       newest live Codex session in this cwd updated since then, not already
-       claimed by a sibling row this same pass (`exclude_keys`). Codex has no
-       exact identity for a brand-new session the way --name/--resume give
-       Claude one, so this is a scoped guess - same risk class
-       adopt_untracked_sessions already accepts for the analogous
-       no-identifying-flags Claude case, narrowed here to only ever fire for
-       a row this session actually just launched, and only until it matches
-       once (session_key then sticks).
+    3. A Codex row carrying `codex_pending_since` is deliberately unmatched
+       here until `resolve_pending_codex_group_rows` binds it from that row's
+       exact live tmux name.  A same-cwd/newer-than-marker transcript is not
+       identity evidence: another Codex row can receive that turn, which was
+       the 00:24 Worker4/orchestrator borrowing incident (task-2171).
     """
     provider = row.get("provider", "Claude")
     session_key = row.get("session_key")
-    pending_since = row.get("codex_pending_since") if provider == "Codex" else None
-    if pending_since:
-        candidates = [
-            session
-            for session in sessions
-            if session.provider == "Codex"
-            and session.cwd == cwd
-            and session.updated_ms >= pending_since
-            and session.native_key not in exclude_keys
-        ]
-        # A pending launch explicitly asks for a NEW transcript. It must win
-        # over the row's historical session_key; otherwise the old file is
-        # found on disk first forever and the new conversation can never be
-        # adopted. More than one candidate is ambiguous, not "pick newest".
-        return candidates[0] if len(candidates) == 1 else None
+    if provider == "Codex" and row.get("codex_pending_since"):
+        # Pending Codex identity is resolved only by resolve_pending_codex_group_rows,
+        # which asks the exact row-named tmux session for its open rollout fd.  Never
+        # borrow another row's transcript by cwd or timestamp (task-2171, 00:24 incident).
+        return None
     if session_key:
         match = next(
             (
@@ -2997,22 +2982,42 @@ def resolve_pending_codex_group_rows(metadata: dict, sessions: list[Session]) ->
     disambiguates simultaneous Codex workers sharing one project directory.
     """
     by_key = {session.native_key: session for session in sessions}
-    changed = False
+    pending: list[tuple[dict, str, str | None]] = []
+    existing_owners: dict[str, list[dict]] = {}
     for group in metadata.get("groups", {}).values():
-        # REWORK (VAMP-reviewer HIGH-1, bbb2616): a group's "tmux" key is legacy debris from the
-        # removed per-group override control -- no code path writes it anymore, and every
-        # Codex launch is unconditionally tmux now, so a stale `tmux: false` here must never skip
-        # binding a genuinely live tmux-launched pending row to its transcript.
         for row in group.get("rows", []):
-            if row.get("provider") != "Codex" or not row.get("codex_pending_since"):
+            if row.get("provider") != "Codex":
                 continue
-            native_key = codex_tmux_native_key(row["name"])
-            match = by_key.get(native_key)
-            if match is None or match.updated_ms < int(row["codex_pending_since"]):
-                continue
-            row["session_key"] = native_key
-            row.pop("codex_pending_since", None)
-            changed = True
+            if row.get("codex_pending_since"):
+                # Resolve every pending row before mutating metadata.  This makes duplicate
+                # exact-name/key claims a cluster we can reject as a unit, never a row-order race.
+                name = sanitize_tmux_session_name(row.get("name", ""))
+                pending.append((row, name, codex_tmux_native_key(name)))
+            elif row.get("session_key"):
+                existing_owners.setdefault(row["session_key"], []).append(row)
+
+    pending_key_counts = collections.Counter(
+        key for _row, _name, key in pending if key is not None
+    )
+    pending_name_counts = collections.Counter(name for _row, name, _key in pending)
+    changed = False
+    for row, name, native_key in pending:
+        if native_key is None:
+            continue
+        # Multiple pending rows resolving to one exact tmux name/native key are ambiguous;
+        # leave every marker intact so no metadata write can assign one live rollout twice.
+        if pending_name_counts[name] > 1 or pending_key_counts[native_key] > 1:
+            continue
+        prior = existing_owners.get(native_key, [])
+        if any(owner is not row for owner in prior):
+            # A pending launch cannot steal a key already owned by another saved row.
+            continue
+        match = by_key.get(native_key)
+        if match is None or match.updated_ms < int(row["codex_pending_since"]):
+            continue
+        row["session_key"] = native_key
+        row.pop("codex_pending_since", None)
+        changed = True
     return changed
 
 
