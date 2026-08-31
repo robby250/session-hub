@@ -35,6 +35,8 @@ def remote_tui_argv(endpoint: Path, thread_id: str, cwd: str) -> list[str]:
 def publish_record(path: Path, *, row_id: str, endpoint: Path, thread_id: str, process: subprocess.Popen) -> dict:
     if path.exists():
         raise RuntimeError("Codex App Server owner record already exists")
+    if endpoint.parent != path.parent or endpoint.name != f"{path.stem}.sock":
+        raise RuntimeError("Codex App Server endpoint is not bound to its owner record")
     start = process_start_time(process.pid)
     if not start:
         raise RuntimeError("Codex App Server has no process identity")
@@ -63,7 +65,7 @@ def live_record(path: Path, *, row_id: str) -> dict:
     if not record.get("start_time") or process_start_time(pid) != record.get("start_time"):
         raise RuntimeError("Codex App Server owner is stale or PID was reused")
     endpoint = Path(record["endpoint"])
-    if endpoint.parent != REGISTRY_DIR and endpoint.parent != path.parent:
+    if endpoint.parent != path.parent or endpoint.name != f"{path.stem}.sock":
         raise RuntimeError("Codex App Server endpoint is outside the owned registry")
     if not endpoint.exists():
         raise RuntimeError("Codex App Server endpoint is unavailable")
@@ -75,6 +77,30 @@ def stop_owned(path: Path, *, row_id: str) -> None:
     os.kill(int(record["pid"]), signal.SIGTERM)
     Path(record["endpoint"]).unlink(missing_ok=True)
     path.unlink(missing_ok=True)
+
+
+def record_for_row(row_id: str, registry_dir: Path = REGISTRY_DIR) -> Path | None:
+    """Return the sole owner record for ``row_id``; ambiguity fails closed."""
+    matches = []
+    for path in registry_dir.glob("*.json"):
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if record.get("schema") == SCHEMA_VERSION and record.get("row_id") == row_id:
+            matches.append(path)
+    if len(matches) > 1:
+        raise RuntimeError("Multiple Codex App Server owner records for row")
+    return matches[0] if matches else None
+
+
+def stop_owned_for_row(row_id: str, registry_dir: Path = REGISTRY_DIR) -> bool:
+    """Stop only the uniquely registered owner for a row; missing is a no-op."""
+    path = record_for_row(row_id, registry_dir)
+    if path is None:
+        return False
+    stop_owned(path, row_id=row_id)
+    return True
 
 
 def wait_ready(endpoint: Path, timeout: float = 5.0) -> bool:

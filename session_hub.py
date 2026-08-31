@@ -33,7 +33,7 @@ from datetime import date, datetime
 from pathlib import Path
 from codex_app_server import (
     REGISTRY_DIR, app_server_argv, endpoint_for, publish_record, remote_tui_argv,
-    stop_owned, wait_ready,
+    stop_owned, stop_owned_for_row, wait_ready,
 )
 
 from PyQt6.QtCore import (
@@ -8906,8 +8906,30 @@ class SessionHub(QMainWindow):
         # can differ from its saved row name after an external restart -- stopping `name` here
         # would silently no-op (nothing tmux-alive under that name) and leave the real session
         # running headless forever.
+        row_id = self.codex_app_server_row_id(cwd, name, _session_id)
+        if row_id:
+            self.stop_codex_app_server(row_id)
         stop_tmux_session(tmux_name)
         self.refresh_running_tab()
+
+    def codex_app_server_row_id(
+        self, cwd: str | None, name: str | None, session_id: str | None = None
+    ) -> str | None:
+        """Resolve the stable row key used by the App Server registry."""
+        if cwd and name:
+            group = self.metadata.get("groups", {}).get(cwd) or {}
+            row = next((item for item in group.get("rows", []) if item.get("name") == name), None)
+            if row and row.get("provider") == "Codex":
+                return row.get("override_key") or row.get("session_key") or name
+        if session_id:
+            session = next(
+                (item for item in getattr(self, "sessions", [])
+                 if item.session_id == session_id and item.provider == "Codex"),
+                None,
+            )
+            if session:
+                return session.key
+        return None
 
     def _focus_or_resume_session(
         self, cwd: str, name: str, session_id: str | None, *, tmux_name: str | None = None,
@@ -10186,6 +10208,9 @@ class SessionHub(QMainWindow):
         if not row_id:
             raise RuntimeError("Codex App Server launch requires a stable row identity")
         REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
+        # A restart/replacement first tears down this row's previous owner, if any;
+        # stop_owned validates the persisted PID/start-time/record binding before killing.
+        self.stop_codex_app_server(row_id)
         endpoint = endpoint_for(row_id)
         record_path = REGISTRY_DIR / f"{endpoint.stem}.json"
         server = subprocess.Popen(app_server_argv(endpoint, cwd), cwd=source_cwd or cwd)
@@ -10202,22 +10227,30 @@ class SessionHub(QMainWindow):
             command = [terminal, "--window", "--", *args] if Path(terminal).name == "gnome-terminal" else [terminal, "-e", shlex.join(args)]
             self.spawn(command, session_key, cwd=cwd, focus=focus)
         except Exception:
-            server.terminate()
-            record_path.unlink(missing_ok=True)
-            endpoint.unlink(missing_ok=True)
+            try:
+                self.stop_codex_app_server(row_id)
+            except Exception:
+                server.terminate()
+                record_path.unlink(missing_ok=True)
+                endpoint.unlink(missing_ok=True)
             self._codex_app_servers.pop(row_id, None)
             raise
 
     def stop_codex_app_server(self, row_id: str) -> None:
         owned = self._codex_app_servers.pop(row_id, None)
-        if not owned:
+        if owned:
+            process, record_path = owned
+            try:
+                stop_owned(record_path, row_id=row_id)
+            except (OSError, RuntimeError, ValueError):
+                process.terminate()
+                record_path.unlink(missing_ok=True)
             return
-        process, record_path = owned
         try:
-            stop_owned(record_path, row_id=row_id)
+            stop_owned_for_row(row_id)
         except (OSError, RuntimeError, ValueError):
-            process.terminate()
-            record_path.unlink(missing_ok=True)
+            # A stale/ambiguous record is fail-closed: do not kill an arbitrary PID.
+            return
 
     def stop_all_codex_app_servers(self) -> None:
         for row_id in list(self._codex_app_servers):
@@ -10725,6 +10758,10 @@ class SessionHub(QMainWindow):
             reasoning_effort = dialog.reasoning_effort
             account_config_dir = dialog.account_config_dir if target == "Claude" else None
 
+        if session.provider == "Codex":
+            self.stop_codex_app_server(
+                group_row.get("override_key") if group_row else session.key
+            )
         if use_tmux:
             stop_tmux_session(tmux_name)
 
@@ -11271,6 +11308,14 @@ class SessionHub(QMainWindow):
             )
 
     def move_session_to_trash(self, session: Session) -> None:
+        if session.provider == "Codex":
+            self.stop_codex_app_server(session.key)
+            for group in self.metadata.get("groups", {}).values():
+                for row in group.get("rows", []):
+                    if row.get("provider") == "Codex" and row.get("session_key") == session.key:
+                        self.stop_codex_app_server(
+                            row.get("override_key") or row.get("session_key") or row.get("name")
+                        )
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         destination = TRASH_DIR / session.provider.lower() / f"{stamp}-{session.session_id}"
         destination.mkdir(parents=True, exist_ok=False)
@@ -11682,6 +11727,8 @@ def stop_group_row_cli(argv: list[str]) -> int:
     if not row:
         print(json.dumps({"status": "error", "message": f"No row named {name!r} in group {cwd!r}."}))
         return 1
+    if row.get("provider") == "Codex":
+        stop_owned_for_row(row.get("override_key") or row.get("session_key") or name)
     stop_tmux_session(name)
     print(json.dumps({"status": "ok"}))
     return 0
@@ -11712,6 +11759,8 @@ def stop_session_cli(argv: list[str]) -> int:
     if not tmux_enabled:
         print(json.dumps({"status": "error", "message": f"{key!r} is not launched in tmux."}))
         return 1
+    if session.provider == "Codex":
+        stop_owned_for_row(session.key)
     stop_tmux_session(name)
     print(json.dumps({"status": "ok"}))
     return 0
