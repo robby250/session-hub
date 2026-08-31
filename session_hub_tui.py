@@ -13,12 +13,9 @@ import asyncio
 import json
 import os
 import re
-import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Protocol
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -40,42 +37,9 @@ from textual.widgets import (
     TabPane,
 )
 
-def _install_textual_terminal_default_colors_shim():
-    """textual-terminal 0.3.0 does `from textual.app import DEFAULT_COLORS` at module
-    load, unconditionally, even though it only reads the value when a Terminal is
-    constructed with default_colors="textual" (this file always uses the "system"
-    default). Modern Textual dropped that name, so supply an inert stand-in only if
-    it is missing, and only for the duration of the adapter import -- the caller must
-    remove it afterward via _remove_textual_terminal_default_colors_shim()."""
-    import textual.app as _textual_app
-
-    already_present = hasattr(_textual_app, "DEFAULT_COLORS")
-    if not already_present:
-        _textual_app.DEFAULT_COLORS = {"dark": None, "light": None}
-    return _textual_app, already_present
-
-
-def _remove_textual_terminal_default_colors_shim(textual_app_module, already_present) -> None:
-    if not already_present:
-        del textual_app_module.DEFAULT_COLORS
-
-
-_OssTerminal = None
-_textual_terminal_import_error: ImportError | None = None
-_textual_app_module, _default_colors_already_present = _install_textual_terminal_default_colors_shim()
-try:
-    from textual_terminal import Terminal as _OssTerminal
-except ModuleNotFoundError as exc:  # adapter package not installed at all
-    _textual_terminal_import_error = exc
-except ImportError as exc:  # adapter present but incompatible with this Textual version
-    _textual_terminal_import_error = exc
-finally:
-    _remove_textual_terminal_default_colors_shim(_textual_app_module, _default_colors_already_present)
-
 SESSION_HUB = Path(__file__).resolve().parent / "session_hub.py"
 PHONE_ROW_HEIGHT = 2
 RUNNING_CARD_HEIGHT = 3
-TEXTUAL_TERMINAL_INSTALL = "pip3 install --user --break-system-packages textual-terminal==0.3.0"
 
 
 def compact_running_age(value: object) -> str:
@@ -186,76 +150,6 @@ def resume_session(wanted: str) -> dict:
     # Same offscreen-QApplication path as launch_group_row - --resume-session
     # is the standalone counterpart to --launch-group-row.
     return run_cli(["--resume-session", wanted], offscreen=True)
-
-
-class TerminalAdapter(Protocol):
-    """Small lifecycle boundary between RunningPane and the terminal emulator."""
-
-    identity: str
-    widget: object
-
-    def start(self) -> None: ...
-    def resize(self, width: int, height: int) -> None: ...
-    def close(self) -> None: ...
-
-
-def tmux_attach_argv(name: str) -> list[str]:
-    """Build the exact argv passed to textual-terminal's shlex parser.
-
-    textual-terminal 0.3.0 accepts a command string but immediately shlex-splits it and
-    calls execvpe; shlex.join therefore preserves argv boundaries without a shell. The child
-    environment is rebuilt by the OSS adapter (so inherited TMUX is absent), and the exact
-    `=name` target avoids tmux prefix matching.
-    """
-    tmux = shutil.which("tmux")
-    if not tmux:
-        raise RuntimeError("tmux is required for the Running terminal")
-    if not name or name.startswith("="):
-        raise ValueError("empty or malformed tmux session name")
-    return [tmux, "attach", "-t", f"={name}"]
-
-
-class OssTmuxTerminalAdapter:
-    """One retained textual-terminal widget attached to exactly one live tmux session."""
-
-    def __init__(self, name: str, terminal_factory=None) -> None:
-        factory = terminal_factory or _OssTerminal
-        if factory is None:
-            raise RuntimeError(f"Install the terminal adapter first: {TEXTUAL_TERMINAL_INSTALL}")
-        self.identity = name
-        self.argv = tmux_attach_argv(name)
-        self.active = False
-        # textual-terminal parses this with shlex.split then execvpe (no shell), preserving the
-        # exact argv and rebuilding an environment without the parent's TMUX marker.
-        self.widget = factory(command=shlex.join(self.argv), id="running-terminal")
-
-    def start(self) -> None:
-        if self.active:
-            return
-        self.widget.start()
-        self.active = True
-
-    def switch(self, name: str) -> None:
-        """Retarget the existing terminal surface to another exact tmux client."""
-        if name == self.identity and self.active:
-            return
-        self.close()
-        self.identity = name
-        self.argv = tmux_attach_argv(name)
-        self.widget.command = shlex.join(self.argv)
-        self.start()
-
-    def resize(self, width: int, height: int) -> None:
-        # textual-terminal forwards resize events to its PTY; keep this call behind
-        # the adapter so the pane never reaches into the emulator implementation.
-        resize = getattr(self.widget, "resize", None)
-        if resize is not None:
-            resize(width, height)
-
-    def close(self) -> None:
-        if self.active:
-            self.widget.stop()
-        self.active = False
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -466,7 +360,8 @@ class MainPane(Vertical):
 
 
 class RunningPane(Vertical):
-    """Compact scrolling activity list above one retained exact-identity terminal."""
+    """Compact scrolling activity list; selecting a live row exits the TUI and hands
+    the terminal to a separate `tmux attach`, rather than embedding one."""
 
     # DataTable claims Enter itself (RowSelected) - see on_data_table_row_selected.
     BINDINGS = [
@@ -476,28 +371,20 @@ class RunningPane(Vertical):
     ]
 
     CSS = """
-    # Hug one/few cards with only a small intentional gap; overflow past the cap scrolls
-    # here instead of growing. The terminal owns whatever height this list does not need.
+    # Hug one/few cards with only a small intentional gap; overflow past the cap scrolls.
     #running-list { height: auto; max-height: 12; min-height: 3; border: round $panel; }
-    #terminal-host { height: 1fr; min-height: 4; border: round $panel; }
-    #terminal-empty { height: 1fr; content-align: center middle; color: $text-muted; }
     .running-row { height: 3; padding: 0 1; }
     .running-card { height: 2; content-align: left middle; }
     .running-group { height: 1; padding: 0 1; color: $text-muted; text-style: bold; }
     """
 
-    def __init__(self, adapter_factory=OssTmuxTerminalAdapter) -> None:
+    def __init__(self) -> None:
         super().__init__()
         self.rows: list[dict] = []
         self._visible_rows: list[dict | None] = []
-        self.selected_key: str | None = None
-        self.adapter_factory = adapter_factory
-        self.adapter: TerminalAdapter | None = None
 
     def compose(self) -> ComposeResult:
         yield ListView(id="running-list")
-        with Vertical(id="terminal-host"):
-            yield Static("Select a running session", id="terminal-empty")
 
     def on_mount(self) -> None:
         self.query_one("#running-list", ListView).focus()
@@ -558,28 +445,6 @@ class RunningPane(Vertical):
             for row in rows:
                 list_view.append(self._render_item(row))
                 self._visible_rows.append(row)
-        # Activity labels remain in each compact row; preserve a stable order
-        # while avoiding a second widget hierarchy that could steal height.
-        # (The status is deliberately data, not inferred from transcript text.)
-        keys = {self._identity(row) for row in self.rows}
-        if self.selected_key not in keys:
-            self.selected_key = None
-            self._close_adapter()
-        elif self.selected_key:
-            list_view.index = next(i for i, row in enumerate(self._visible_rows) if row and self._identity(row) == self.selected_key)
-
-    def _close_adapter(self) -> None:
-        if self.adapter is not None:
-            self.adapter.close()
-        # Keep the retained terminal surface mounted, but make a disappeared selection visibly
-        # empty.  The list and host stay alive so a later activation can reuse this one surface.
-        try:
-            empty = self.query_one("#terminal-empty", Static)
-            empty.update("Select a running session")
-        except Exception:
-            # Pure adapter controls use a host stub without Textual's Static; real panes always
-            # have the mounted widget and therefore take the update path above.
-            pass
 
     def selected(self) -> dict | None:
         list_view = self.query_one("#running-list", ListView)
@@ -587,50 +452,18 @@ class RunningPane(Vertical):
             return None
         return self._visible_rows[list_view.index]
 
-    async def on_list_view_selected(self, _event: ListView.Selected) -> None:
+    def on_list_view_selected(self, _event: ListView.Selected) -> None:
         picked = self.selected()
         if not picked:
             return
-        await self._switch_terminal(picked)
-
-    async def _switch_terminal(self, picked: dict) -> None:
-        identity = self._identity(picked)
-        target = picked.get("tmux_name") or picked["name"]
-        if self.selected_key == identity and self.adapter is not None:
+        target = picked.get("tmux_name")
+        if not target:
+            self.notify("No exact tmux session to attach to.", severity="error")
             return
-        try:
-            if self.adapter is None:
-                adapter = self.adapter_factory(target)
-                host = self.query_one("#terminal-host", Vertical)
-                await host.mount(adapter.widget)
-                self.adapter = adapter
-                adapter.start()
-            else:
-                self.adapter.switch(target)
-                adapter = self.adapter
-        except (RuntimeError, ValueError) as exc:
-            self.notify(str(exc), severity="error")
-            return
-        self.selected_key = identity
-        try:
-            self.query_one("#terminal-empty", Static).update("")
-        except Exception:
-            pass
-        adapter.widget.focus()
+        self.app.exit((picked.get("cwd"), target))
 
     def action_focus_list(self) -> None:
         self.query_one("#running-list", ListView).focus()
-
-    def on_resize(self, event: Resize) -> None:
-        # RunningCard recalculates its two lines from its actual content width.
-        if self.adapter is not None:
-            host = self.query_one("#terminal-host", Vertical)
-            size = host.content_size
-            self.adapter.resize(size.width, size.height)
-
-    def on_unmount(self) -> None:
-        # App/pane teardown owns the terminal client, never the tmux session itself.
-        self._close_adapter()
 
     @work
     async def action_stop(self) -> None:
@@ -644,9 +477,6 @@ class RunningPane(Vertical):
             await asyncio.to_thread(stop_group_row, picked["cwd"], picked["name"])
         else:
             await asyncio.to_thread(stop_session, picked["key"])
-        if self.selected_key == self._identity(picked):
-            self._close_adapter()
-            self.selected_key = None
         self.app.fetch_sessions()
 
     def action_refresh(self) -> None:
@@ -767,23 +597,6 @@ class SessionHubTUI(App):
 
 
 def main() -> int:
-    if _OssTerminal is None:
-        # A ModuleNotFoundError for some OTHER transitive dependency (e.g. pyte, rich) is not
-        # "adapter missing" -- only the top-level textual_terminal package itself qualifies.
-        if (isinstance(_textual_terminal_import_error, ModuleNotFoundError)
-                and _textual_terminal_import_error.name == "textual_terminal"):
-            print(
-                f"Session Hub Running terminal requires the maintained OSS adapter; install with: "
-                f"{TEXTUAL_TERMINAL_INSTALL}",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                "Session Hub Running terminal adapter is installed but failed to import "
-                f"against this Textual version: {_textual_terminal_import_error}",
-                file=sys.stderr,
-            )
-        return 2
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         # A non-PTY SSH command (e.g. a phone client's default exec) hands Textual an
         # immediate stdin EOF, which app.run() ends normally with -- not a crash, just a
@@ -803,8 +616,9 @@ def main() -> int:
         # Exec-replace: the terminal IS the tmux session from here on
         # (decided over suspend-and-resume - simpler, standard tmux/SSH
         # behavior; detaching ends the SSH connection, re-run the Terminus
-        # snippet to see the menu again).
-        os.execvp("tmux", ["tmux", "attach", "-t", name])
+        # snippet to see the menu again). The exact `=name` target avoids
+        # tmux prefix-matching a different live session.
+        os.execvp("tmux", ["tmux", "attach", "-t", f"={name}"])
     return 0
 
 
