@@ -4719,6 +4719,25 @@ def bounded_tooltip(text: str) -> str:
     return f'<div style="width: 400px; white-space: normal;">{escaped}</div>' if escaped else ""
 
 
+def running_card_text_geometry(
+    left: int, top: int, width: int, line_height: int, age_width: int
+) -> dict[str, tuple[int, int, int, int]]:
+    """Return the half-open text rectangles used by ``RunningNameAgeDelegate``.
+
+    This is deliberately Qt-free so the pure row542 contract can exercise the same reservation
+    arithmetic without constructing a QApplication or opening the frozen Session Hub suite.
+    """
+    age_width = max(0, age_width)
+    text_width = max(0, width - age_width)
+    geometry = {
+        "name": (left, top, text_width, line_height),
+        "subtitle": (left, top + line_height, text_width, line_height),
+    }
+    if age_width:
+        geometry["age"] = (left + width - age_width + 1, top, age_width - 1, line_height)
+    return geometry
+
+
 class RunningNameAgeDelegate(QStyledItemDelegate):
     """Paints the Running tab's Name cell as a two-line identity stack with a
     compact relative-age string pinned to the row's upper-right (task-2191) --
@@ -4744,22 +4763,23 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
         pen = opt.palette.highlightedText() if opt.state & QStyle.StateFlag.State_Selected else opt.palette.text()
         painter.setPen(pen.color())
         age_width = fm.horizontalAdvance(age) + 8 if age else 0
-        text_width = max(0, rect.width() - age_width)
+        geometry = running_card_text_geometry(rect.left(), rect.top(), rect.width(), line_h, age_width)
+        text_width = geometry["name"][2]
         # Clip the custom paint to the cell and elide each identity line independently.  In
         # particular, a long name must not paint underneath the age or into Last message.
         painter.setClipRect(rect)
-        top_rect = QRect(rect.left(), rect.top(), text_width, line_h)
+        top_rect = QRect(*geometry["name"])
         name = fm.elidedText(lines[0] if lines else "", Qt.TextElideMode.ElideRight, text_width)
         painter.drawText(
             top_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name
         )
         if age:
-            age_rect = QRect(rect.right() - age_width + 1, rect.top(), age_width - 1, line_h)
+            age_rect = QRect(*geometry["age"])
             painter.setPen(QColor("#9aa0a6"))
             painter.drawText(age_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, age)
             painter.setPen(pen.color())
         if len(lines) > 1:
-            sub_rect = QRect(rect.left(), rect.top() + line_h, text_width, line_h)
+            sub_rect = QRect(*geometry["subtitle"])
             painter.setPen(QColor("#9aa0a6"))
             subtitle = fm.elidedText(lines[1], Qt.TextElideMode.ElideRight, text_width)
             painter.drawText(sub_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, subtitle)

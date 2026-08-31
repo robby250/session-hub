@@ -1,7 +1,6 @@
 """Pure row542 contract checks; deliberately outside the frozen Session Hub test suite."""
 
 import unittest
-from pathlib import Path
 
 import session_hub
 
@@ -25,14 +24,38 @@ class RunningCardContractTests(unittest.TestCase):
             self.assertNotIn("just", expected)
 
     def test_delegate_contract_reserves_age_before_both_identity_lines(self):
-        # The delegate's paint path derives this same reservation for both lines.  Keep the
-        # geometry assertion pure and deterministic without constructing SessionHub or a view.
+        # Exercise the same pure helper called by the production delegate.  This is a deliberately
+        # narrow cell with the long identity that previously painted underneath the age label.
+        cell = (4, 2, 88, 32)
+        name = "VAMP-orchestrator"
+        subtitle = "gpt-5.6-luna · /home/user/projects/vampulse"
         age = "48m"
-        self.assertLess(len(age), 8)  # fixed-width reservation remains bounded on a phone cell
-        source = Path(session_hub.__file__).read_text(encoding="utf-8")
-        self.assertIn("text_width = max(0, rect.width() - age_width)", source)
-        self.assertIn("fm.elidedText(lines[0]", source)
-        self.assertIn("fm.elidedText(lines[1]", source)
+        age_width = 24  # representative QFontMetrics width plus the delegate's padding
+        geometry = session_hub.running_card_text_geometry(
+            cell[0], cell[1], cell[2], 14, age_width
+        )
+        self.assertEqual(age, "48m")
+        self.assertGreater(len(name), 8)
+        self.assertGreater(len(subtitle), 8)
+
+        cell_left, cell_top, cell_width, cell_height = cell
+        cell_right = cell_left + cell_width
+        cell_bottom = cell_top + cell_height
+        name_x, name_y, name_width, name_height = geometry["name"]
+        sub_x, sub_y, sub_width, sub_height = geometry["subtitle"]
+        age_x, age_y, age_rect_width, age_height = geometry["age"]
+        self.assertLessEqual(name_x + name_width, age_x)
+        self.assertLessEqual(sub_x + sub_width, age_x)
+        for x, y, width, height in geometry.values():
+            self.assertGreaterEqual(x, cell_left)
+            self.assertGreaterEqual(y, cell_top)
+            self.assertLessEqual(x + width, cell_right)
+            self.assertLessEqual(y + height, cell_bottom)
+        self.assertGreater(age_rect_width, 0)
+        self.assertEqual(name_height, sub_height)
+        self.assertEqual(name_y + name_height, sub_y)
+        self.assertEqual(age_y, cell_top)
+        self.assertEqual(age_height, name_height)
 
 
 if __name__ == "__main__":
