@@ -4793,10 +4793,16 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
         if len(lines) > 1:
             sub_rect = QRect(*geometry["subtitle"])
             painter.setPen(QColor("#9aa0a6"))
-            subtitle = fm.elidedText(
-                lines[1], Qt.TextElideMode.ElideRight, geometry["subtitle"][2]
+            # The subtitle owns the whole lower band and is already clipped to the cell above.
+            # Paint its source text directly: pre-eliding here can bake a transiently narrow
+            # style rect into ``Cod…`` even though the actual lower band has recovered its full
+            # width after the saved header state settles.
+            painter.drawText(
+                sub_rect,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                | Qt.TextFlag.TextSingleLine,
+                lines[1],
             )
-            painter.drawText(sub_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, subtitle)
         painter.restore()
 
 

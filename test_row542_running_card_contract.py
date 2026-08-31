@@ -1,5 +1,6 @@
 """Pure row542 contract checks; deliberately outside the frozen Session Hub test suite."""
 
+import inspect
 import unittest
 
 import session_hub
@@ -77,6 +78,13 @@ class RunningCardContractTests(unittest.TestCase):
         self.assertEqual(geometry["age"][1], 2)
         self.assertEqual(geometry["age"][3], 29)
         self.assertEqual(geometry["name"][3] + geometry["subtitle"][3], 58)
+
+    def test_subtitle_is_clipped_at_the_real_cell_not_pre_elided(self):
+        source = inspect.getsource(session_hub.RunningNameAgeDelegate.paint)
+        subtitle_block = source[source.index("if len(lines) > 1:") :]
+        self.assertNotIn("elidedText", subtitle_block)
+        self.assertIn("Qt.TextFlag.TextSingleLine", subtitle_block)
+        self.assertIn("painter.setClipRect(rect)", source)
 
 
 if __name__ == "__main__":
