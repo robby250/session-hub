@@ -11086,6 +11086,9 @@ class SessionHub(QMainWindow):
             else None,
             session_key=row["override_key"],
             flag_overrides={"--name": row["name"]},
+            # Fresh managed rows have no saved thread yet, but their public row name is still
+            # the address consumed by session_ctl's App Server resolver.
+            tmux_name=row["name"],
             strip_env=strip_env,
             wait_for_tracking=wait_for_tracking,
         )

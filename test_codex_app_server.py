@@ -359,6 +359,18 @@ def main() -> int:
         for call in ast.walk(funcs[name])
         if isinstance(call, ast.Call)
     )
+    # Fresh managed-group launches must carry the same public row name as resume launches; an
+    # override key alone is private and cannot be resolved by the dependent sender.
+    fresh = funcs["launch_group_row"]
+    fresh_calls = [call for call in ast.walk(fresh)
+                   if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                   and call.func.attr == "launch"]
+    assert any(
+        any(k.arg == "tmux_name" and isinstance(k.value, ast.Subscript)
+            and isinstance(k.value.slice, ast.Constant) and k.value.slice.value == "name"
+            for k in call.keywords)
+        for call in fresh_calls
+    ), "fresh managed launch dropped its public row name"
     assert "stop_all_codex_app_servers" in hub_source
     print("[CodexAppServerCheck] PASS fake readiness/failure unique-endpoint restart-thread atomic-publication stale-cleanup fresh-row-client lifecycle-owned")
     return 0
