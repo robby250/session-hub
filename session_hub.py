@@ -4724,7 +4724,7 @@ def bounded_tooltip(text: str) -> str:
 
 
 def running_card_text_geometry(
-    left: int, top: int, width: int, height: int, age_width: int
+    left: int, top: int, width: int, height: int, age_width: int, line_height: int
 ) -> dict[str, tuple[int, int, int, int]]:
     """Return the half-open text rectangles used by ``RunningNameAgeDelegate``.
 
@@ -4735,12 +4735,14 @@ def running_card_text_geometry(
     height = max(0, height)
     age_width = min(max(0, age_width), width)
     text_width = width - age_width
-    name_height = height // 2
+    # The first line needs only one font line.  Give every remaining pixel to the
+    # wrapping provider/project subtitle instead of leaving the lower card empty.
+    name_height = min(max(0, line_height), height)
     subtitle_height = height - name_height
     geometry = {
         "name": (left, top, text_width, name_height),
-        # The age occupies only the upper band.  The provider/project line is vertically
-        # disjoint from it and therefore owns the full lower-band width.
+        # The age occupies only the first line.  The provider/project text owns the full
+        # width and all remaining height, so narrow identity cells can wrap vertically.
         "subtitle": (left, top + name_height, width, subtitle_height),
     }
     if age_width:
@@ -4775,10 +4777,10 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
         # dead lane between short values such as ``1m`` and Last message.
         age_width = fm.horizontalAdvance(age) + 3 if age else 0
         geometry = running_card_text_geometry(
-            rect.left(), rect.top(), rect.width(), rect.height(), age_width
+            rect.left(), rect.top(), rect.width(), rect.height(), age_width, fm.height()
         )
-        # Clip the custom paint to the cell and elide each identity line independently.  In
-        # particular, a long name must not paint underneath the age or into Last message.
+        # Clip the custom paint to the cell.  In particular, a long name must not paint
+        # underneath the age or into Last message.
         painter.setClipRect(rect)
         top_rect = QRect(*geometry["name"])
         painter.drawText(
@@ -4795,14 +4797,12 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
         if len(lines) > 1:
             sub_rect = QRect(*geometry["subtitle"])
             painter.setPen(QColor("#9aa0a6"))
-            # The subtitle owns the whole lower band and is already clipped to the cell above.
-            # Paint its source text directly: pre-eliding here can bake a transiently narrow
-            # style rect into ``Cod…`` even though the actual lower band has recovered its full
-            # width after the saved header state settles.
+            # Wrap the subtitle through the rest of the card.  Forcing TextSingleLine here
+            # clipped provider/project halfway across while leaving the lower half blank.
             painter.drawText(
                 sub_rect,
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-                | Qt.TextFlag.TextSingleLine,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+                | Qt.TextFlag.TextWordWrap,
                 lines[1],
             )
         painter.restore()
