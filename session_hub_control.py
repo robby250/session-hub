@@ -88,11 +88,14 @@ class SessionHubController:
         return [tuple(line.split("\t", 1)) for line in result.stdout.splitlines() if "\t" in line]
 
     def _ensure_remote_window(self, name: str, cwd: str, endpoint: Path,
-                              thread_id: str | None) -> tuple[str, bool]:
+                              thread_id: str | None, *, allow_existing: bool = False) -> tuple[str, bool]:
         windows = self._windows(name)
+        prior_ids = {wid for wid, _ in windows}
         existing = [(wid, wname) for wid, wname in windows if wname == REMOTE_WINDOW]
         if len(existing) > 1:
             raise ControlError("ambiguous Session Hub remote-client windows for row")
+        if existing and not allow_existing:
+            raise ControlError("reserved Codex remote window exists without an owner record")
         args = remote_tui_argv(endpoint, thread_id, cwd)
         if existing:
             return existing[0][0], False
@@ -110,6 +113,9 @@ class SessionHubController:
         windows = self._windows(name)
         created = [(wid, wname) for wid, wname in windows if wname == REMOTE_WINDOW]
         if len(created) != 1:
+            new_reserved = [(wid, wname) for wid, wname in created if wid not in prior_ids]
+            if len(new_reserved) == 1:
+                self._remove_created_remote_window(name, new_reserved[0][0])
             raise ControlError("new Codex remote window could not be identified")
         return created[0][0], True
 
@@ -119,6 +125,32 @@ class SessionHubController:
         if result.returncode or len(pids) != 1:
             raise ControlError("Codex remote window has no unique process")
         return int(pids[0])
+
+    def _validate_remote_identity(self, session: str, owner: dict) -> None:
+        """Require the reserved window and pane to match the persisted Hub owner."""
+        window_id = owner.get("remote_window_id")
+        remote_pid = owner.get("remote_pid")
+        remote_start = owner.get("remote_start_time")
+        if (not isinstance(window_id, str) or not isinstance(remote_pid, int)
+                or isinstance(remote_pid, bool)):
+            raise ControlError("owned Codex remote client has no complete process identity")
+        if not isinstance(remote_start, str) or not remote_start:
+            raise ControlError("owned Codex remote client has no start-time identity")
+        windows = [(wid, wname) for wid, wname in self._windows(session)
+                   if wid == window_id and wname == REMOTE_WINDOW]
+        if len(windows) != 1:
+            raise ControlError("owned Codex remote window is missing or mismatched")
+        current_pid = self._remote_pid(session, window_id)
+        if current_pid != remote_pid or _start_time(current_pid) != remote_start:
+            raise ControlError("owned Codex remote client is stale or PID was reused")
+
+    def _remove_created_remote_window(self, session: str, window_id: str) -> None:
+        """Kill only a newly-created reserved window after proving its exact identity."""
+        windows = [(wid, wname) for wid, wname in self._windows(session)
+                   if wid == window_id and wname == REMOTE_WINDOW]
+        if len(windows) != 1:
+            return
+        self._tmux("kill-window", "-t", f"={session}:{window_id}", check=False)
 
     @staticmethod
     def _save_remote_identity(path: Path, *, pid: int, window_id: str) -> dict:
@@ -154,13 +186,12 @@ class SessionHubController:
             owner = live_record(owner_path, row_id=row_id)
         except (OSError, ValueError, ControlError, RuntimeError) as error:
             return {"status": "error", "name": name, "row_id": row_id, "message": str(error)}
-        windows = self._windows(name)
-        remote = [wid for wid, wname in windows if wname == REMOTE_WINDOW]
-        if len(remote) != 1:
-            return {"status": "error", "name": name, "row_id": row_id,
-                    "message": "owned App Server is live but remote window is missing or ambiguous"}
+        try:
+            self._validate_remote_identity(name, owner)
+        except (ControlError, OSError, RuntimeError, ValueError) as error:
+            return {"status": "error", "name": name, "row_id": row_id, "message": str(error)}
         return {"status": "running", "name": name, "row_id": row_id,
-                "thread_id": owner["thread_id"], "window_id": remote[0]}
+                "thread_id": owner["thread_id"], "window_id": owner["remote_window_id"]}
 
     def launch_exact(
         self, *, row_id: str, name: str, cwd: str, thread_id: str | None,
@@ -185,8 +216,10 @@ class SessionHubController:
                     raise ControlError("Codex App Server owner record does not match this row")
                 existing = None
             else:
+                self._validate_remote_identity(name, owner)
                 window_id, created = self._ensure_remote_window(
-                    name, cwd, Path(owner["endpoint"]), owner.get("thread_id") or None
+                    name, cwd, Path(owner["endpoint"]), owner.get("thread_id") or None,
+                    allow_existing=True,
                 )
                 owner = self._save_remote_identity(
                     existing, pid=self._remote_pid(name, window_id), window_id=window_id
@@ -205,6 +238,7 @@ class SessionHubController:
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             close_fds=True, start_new_session=True,
         )
+        created_window_id = None
         try:
             if not wait_ready(endpoint):
                 raise ControlError("Codex App Server did not become ready")
@@ -214,12 +248,18 @@ class SessionHubController:
             window_id, created = self._ensure_remote_window(
                 name, cwd, endpoint, thread_id
             )
+            created_window_id = window_id if created else None
             owner = self._save_remote_identity(
                 record_path, pid=self._remote_pid(name, window_id), window_id=window_id
             )
             return {"status": "resumed" if thread_id else "launched", "name": name,
                     "row_id": row_id, "thread_id": owner["thread_id"], "window_id": window_id}
         except Exception:
+            if created_window_id:
+                try:
+                    self._remove_created_remote_window(name, created_window_id)
+                except (ControlError, OSError, RuntimeError, ValueError):
+                    pass
             try:
                 server.terminate()
             except OSError:
@@ -241,6 +281,7 @@ class SessionHubController:
         if owner_path is None:
             return {"status": "stopped", "name": name, "row_id": row_id, "already_stopped": True}
         owner = live_record(owner_path, row_id=row_id)
+        self._validate_remote_identity(name, owner)
         # Kill only the Hub-owned remote pane's process, then the Hub-owned App Server. The
         # session and all composer/legacy panes remain untouched.
         remote_pid = owner.get("remote_pid")
