@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -21,6 +22,7 @@ from codex_app_server import (
 )
 
 REMOTE_WINDOW = "__session_hub_codex_remote__"
+_TMUX_NAME_UNSAFE = re.compile(r"[.:]")
 
 
 class ControlError(RuntimeError):
@@ -95,12 +97,16 @@ class SessionHubController:
         if existing:
             return existing[0][0], False
         tmux = self.which("tmux")
-        result = self.run(
-            [tmux, "new-window", "-d", "-t", f"={name}", "-n", REMOTE_WINDOW, "--", *args],
-            capture_output=True, text=True, check=False, timeout=5,
+        probe = self._tmux("has-session", "-t", f"={name}")
+        command = (
+            [tmux, "new-window", "-d", "-t", f"={name}", "-n", REMOTE_WINDOW, "--", *args]
+            if probe.returncode == 0
+            else [tmux, "new-session", "-d", "-s", name, "-c", cwd,
+                  "-n", REMOTE_WINDOW, "--", *args]
         )
+        result = self.run(command, capture_output=True, text=True, check=False, timeout=5)
         if result.returncode:
-            raise ControlError(result.stderr.strip() or "could not create Codex remote window")
+            raise ControlError(result.stderr.strip() or "could not create Codex tmux client")
         windows = self._windows(name)
         created = [(wid, wname) for wid, wname in windows if wname == REMOTE_WINDOW]
         if len(created) != 1:
@@ -156,35 +162,45 @@ class SessionHubController:
         return {"status": "running", "name": name, "row_id": row_id,
                 "thread_id": owner["thread_id"], "window_id": remote[0]}
 
-    def launch(self, cwd: str, name: str, *, resume: bool = False) -> dict:
-        row, row_id = self._row(cwd, name)
+    def launch_exact(
+        self, *, row_id: str, name: str, cwd: str, thread_id: str | None,
+        process_cwd: str | None = None,
+    ) -> dict:
+        """Launch one exact saved identity into tmux without constructing a GUI."""
+        name = _TMUX_NAME_UNSAFE.sub("_", name)
+        if not row_id or not name:
+            raise ControlError("Codex launch requires an exact row id and tmux name")
         if not Path(cwd).is_dir():
             raise ControlError(f"working directory does not exist: {cwd}")
+        if process_cwd and not Path(process_cwd).is_dir():
+            raise ControlError(f"working directory does not exist: {process_cwd}")
         existing = self._owner_path(row_id)
         if existing is not None:
-            owner = live_record(existing, row_id=row_id)
-            window_id, created = self._ensure_remote_window(
-                name, cwd, Path(owner["endpoint"]), owner.get("thread_id") or None
-            )
-            return {"status": "resumed" if resume else "running", "name": name,
-                    "row_id": row_id, "thread_id": owner["thread_id"],
-                    "window_id": window_id, "reused": True, "window_created": created}
-
-        # Exact target probing preserves every legacy pane/window. A missing session is the
-        # only case that creates one; no attach, rename, kill, or composer replacement occurs.
-        probe = self._tmux("has-session", "-t", f"={name}")
-        if probe.returncode:
-            tmux = self.which("tmux")
-            created = self.run([tmux, "new-session", "-d", "-s", name, "-c", cwd],
-                               capture_output=True, text=True, check=False, timeout=5)
-            if created.returncode:
-                raise ControlError(created.stderr.strip() or "could not create row tmux session")
+            try:
+                owner = live_record(existing, row_id=row_id)
+            except RuntimeError:
+                # A strictly valid, exactly bound stale claim is safe to retire. Malformed,
+                # cross-row, path-mismatched, or ambiguous state still raises and fails closed.
+                if not discard_stale_record(existing, row_id=row_id):
+                    raise ControlError("Codex App Server owner record does not match this row")
+                existing = None
+            else:
+                window_id, created = self._ensure_remote_window(
+                    name, cwd, Path(owner["endpoint"]), owner.get("thread_id") or None
+                )
+                owner = self._save_remote_identity(
+                    existing, pid=self._remote_pid(name, window_id), window_id=window_id
+                )
+                return {"status": "resumed" if owner["thread_id"] else "running", "name": name,
+                        "row_id": row_id, "thread_id": owner["thread_id"],
+                        "window_id": window_id, "reused": True,
+                        "window_created": created}
 
         self.registry_dir.mkdir(parents=True, exist_ok=True)
         endpoint = endpoint_for(row_id, self.registry_dir)
         record_path = endpoint.with_suffix(".json")
         server = self.popen(
-            app_server_argv(endpoint, cwd), cwd=cwd,
+            app_server_argv(endpoint, cwd), cwd=process_cwd or cwd,
             env={k: v for k, v in os.environ.items() if k != "TMUX"},
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             close_fds=True, start_new_session=True,
@@ -192,11 +208,12 @@ class SessionHubController:
         try:
             if not wait_ready(endpoint):
                 raise ControlError("Codex App Server did not become ready")
-            thread_id = self._thread_id(row) if resume else self._thread_id(row)
             owner = publish_record(record_path, row_id=row_id, endpoint=endpoint,
                                    thread_id=thread_id or "", process=server,
                                    name=name, aliases=[name])
-            window_id, _ = self._ensure_remote_window(name, cwd, endpoint, thread_id)
+            window_id, created = self._ensure_remote_window(
+                name, cwd, endpoint, thread_id
+            )
             owner = self._save_remote_identity(
                 record_path, pid=self._remote_pid(name, window_id), window_id=window_id
             )
@@ -210,6 +227,13 @@ class SessionHubController:
             record_path.unlink(missing_ok=True)
             endpoint.unlink(missing_ok=True)
             raise
+
+    def launch(self, cwd: str, name: str, *, resume: bool = False) -> dict:
+        row, row_id = self._row(cwd, name)
+        return self.launch_exact(
+            row_id=row_id, name=name, cwd=cwd,
+            thread_id=self._thread_id(row), process_cwd=cwd,
+        )
 
     def stop(self, cwd: str, name: str) -> dict:
         _, row_id = self._row(cwd, name)

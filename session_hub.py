@@ -32,8 +32,8 @@ from terminal_profile import (  # noqa: E402  (see terminal_profile.py -- shared
 from datetime import date, datetime
 from pathlib import Path
 from codex_app_server import (
-    REGISTRY_DIR, app_server_argv, discard_stale_record, endpoint_for, publish_record,
-    record_for_row, remote_tui_argv, stop_owned, stop_owned_for_row, wait_ready,
+    discard_stale_record, live_remote_owner_names, record_for_row, stop_owned,
+    stop_owned_for_row,
 )
 
 # Keep headless row control screen-inert: dispatch before importing PyQt6.  The controller is
@@ -5090,7 +5090,9 @@ def standalone_tmux_status(
     tmux_enabled = session.provider in ("Claude", "Codex")
     if not tmux_enabled:
         return False, None, None
-    name = (overrides.get("flags") or {}).get("--name") or overrides.get("name") or session.title
+    name = sanitize_tmux_session_name(
+        (overrides.get("flags") or {}).get("--name") or overrides.get("name") or session.title
+    )
     return True, name, ("Running" if tmux_session_alive(name, live_names) else "Stopped")
 
 
@@ -8722,6 +8724,7 @@ class SessionHub(QMainWindow):
         # standalone session below shares it instead of each spawning its own
         # `tmux has-session` (was up to 2 subprocesses per row).
         live_names = tmux_live_session_names()
+        codex_owner_by_row_id = live_remote_owner_names()
 
         # task-2156: ONE shared batched identity view, computed before the group-row
         # loop below so it can decide EACH row's actual tmux target, not just its
@@ -8770,7 +8773,15 @@ class SessionHub(QMainWindow):
                 # still owns the exact rollout `match.native_key` names, and that
                 # is what every tmux-facing action below must target -- the saved
                 # name is kept only for the row registry lookup and the label.
-                if match and match.provider == "Codex":
+                row_provider = row.get("provider", "Claude")
+                row_id = row.get("override_key") or f"group:{cwd}#{row['name']}"
+                registry_name = codex_owner_by_row_id.get(row_id)
+                if row_provider == "Codex" and registry_name in live_names:
+                    # The private owner registry is the launch authority for App Server rows.
+                    # It is stronger than transcript FD discovery and makes a just-launched
+                    # row visible before (or even without) a rollout census match.
+                    resolved_name = registry_name
+                elif match and match.provider == "Codex":
                     resolved_name = tmux_name_by_native_key.get(match.native_key)
                     if resolved_name is None:
                         # task-2156 REWORK #2 (18be076): missing/ambiguous exact identity must
@@ -10264,50 +10275,18 @@ class SessionHub(QMainWindow):
         self, session_id, cwd, source_cwd, model, session_key, tmux_name,
         reasoning_effort, initial_prompt, focus,
     ) -> None:
-        """Launch one private app-server and a remote Codex TUI (row518).
-
-        The server is started with Popen(cwd=...), then its owner record is atomically
-        published only after the process exists.  The TUI receives the exact saved thread
-        id, so this path cannot silently fork a replacement identity.
-        """
+        """Launch one private App Server with its remote TUI inside exact tmux."""
         row_id = session_key or tmux_name or session_id
         if not row_id:
             raise RuntimeError("Codex App Server launch requires a stable row identity")
-        REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
-        # A restart/replacement first tears down this row's previous owner, if any;
-        # stop_owned validates the persisted PID/start-time/record binding before killing.
-        self.stop_codex_app_server(row_id)
-        endpoint = endpoint_for(row_id)
-        record_path = REGISTRY_DIR / f"{endpoint.stem}.json"
-        server = subprocess.Popen(
-            app_server_argv(endpoint, cwd), cwd=source_cwd or cwd,
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            close_fds=True, start_new_session=True,
+        name = sanitize_tmux_session_name(tmux_name or "")
+        if not name:
+            raise RuntimeError("Codex App Server launch requires a tmux session name")
+        from session_hub_control import SessionHubController
+        SessionHubController(METADATA_PATH).launch_exact(
+            row_id=row_id, name=name, cwd=cwd, thread_id=session_id,
+            process_cwd=source_cwd or cwd,
         )
-        self._codex_app_servers[row_id] = (server, record_path)
-        try:
-            if not wait_ready(endpoint):
-                raise RuntimeError("Codex App Server did not become ready")
-            publish_record(record_path, row_id=row_id, endpoint=endpoint,
-                           thread_id=session_id or "", process=server,
-                           name=tmux_name, aliases=[tmux_name] if tmux_name else [])
-            terminal = shutil.which("gnome-terminal") or shutil.which("x-terminal-emulator")
-            if not terminal:
-                raise RuntimeError("No supported terminal emulator was found.")
-            # Existing rows resume their saved thread; a fresh row omits `resume`
-            # so the remote client creates its first thread instead of `resume ""`.
-            args = remote_tui_argv(endpoint, session_id, cwd)
-            command = [terminal, "--window", "--", *args] if Path(terminal).name == "gnome-terminal" else [terminal, "-e", shlex.join(args)]
-            self.spawn(command, session_key, cwd=cwd, focus=focus)
-        except Exception:
-            try:
-                self.stop_codex_app_server(row_id)
-            except Exception:
-                server.terminate()
-                record_path.unlink(missing_ok=True)
-                endpoint.unlink(missing_ok=True)
-            self._codex_app_servers.pop(row_id, None)
-            raise
 
     def stop_codex_app_server(self, row_id: str) -> None:
         owned = self._codex_app_servers.pop(row_id, None)

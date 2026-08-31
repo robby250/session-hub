@@ -172,6 +172,40 @@ def discard_stale_record(path: Path, *, row_id: str) -> bool:
     return True
 
 
+def live_remote_owner_names(registry_dir: Path = REGISTRY_DIR) -> dict[str, str]:
+    """Return exact row->tmux owners proven live by one bounded registry scan.
+
+    App Server liveness alone is insufficient: only a record with a live, start-time-bound
+    remote client and a tmux window identity can make a row appear Running. Duplicate owner
+    claims are omitted rather than guessed.
+    """
+    candidates: dict[str, list[str]] = {}
+    for path in registry_dir.glob("*.json"):
+        try:
+            raw = _read_owner_record(path)
+            record = live_record(path, row_id=raw["row_id"])
+        except (OSError, RuntimeError, ValueError):
+            continue
+        remote_pid = record.get("remote_pid")
+        remote_start = record.get("remote_start_time")
+        remote_window = record.get("remote_window_id")
+        name = record.get("name")
+        if (
+            not isinstance(remote_pid, int)
+            or not remote_start
+            or process_start_time(remote_pid) != remote_start
+            or not remote_window
+            or not name
+        ):
+            continue
+        candidates.setdefault(record["row_id"], []).append(name)
+    return {
+        row_id: names[0]
+        for row_id, names in candidates.items()
+        if len(names) == 1
+    }
+
+
 def stop_owned_for_row(row_id: str, registry_dir: Path = REGISTRY_DIR) -> bool:
     """Stop only the uniquely registered owner for a row; missing is a no-op."""
     path = record_for_row(row_id, registry_dir)
