@@ -9,7 +9,18 @@ import inspect
 import unittest
 from unittest.mock import Mock, PropertyMock, patch
 
+from textual.app import App, ComposeResult
+
 import session_hub_tui
+
+
+class _PaneHost(App):
+    def __init__(self, pane) -> None:
+        super().__init__()
+        self._pane = pane
+
+    def compose(self) -> ComposeResult:
+        yield self._pane
 
 
 class _FakeApp:
@@ -63,6 +74,15 @@ class RunningSelectionExitsInsteadOfEmbeddingTests(unittest.TestCase):
         self.assertEqual(fake_app.exited_with, "unset")
         pane.notify.assert_not_called()
 
+    def test_pre_prefixed_equals_target_fails_closed_without_exiting(self):
+        # main() builds f"={name}"; a discovered name already starting with "=" would
+        # produce the malformed "==name" tmux target if allowed through.
+        picked = {"kind": "standalone", "cwd": None, "name": "demo", "tmux_name": "=worker-session"}
+        pane, fake_app = self.pane_with(picked)
+        pane.on_list_view_selected(None)
+        self.assertEqual(fake_app.exited_with, "unset")
+        pane.notify.assert_called_once()
+
     def test_negative_control_a_switch_only_handler_never_exits(self):
         """Mimics the removed embedded-terminal behavior (retarget local state, never
         end the TUI). If on_list_view_selected regressed to this shape, the positive
@@ -76,6 +96,47 @@ class RunningSelectionExitsInsteadOfEmbeddingTests(unittest.TestCase):
 
         switch_only(None)
         self.assertEqual(fake_app.exited_with, "unset")
+
+
+class ApplySessionsFailClosedTests(unittest.IsolatedAsyncioTestCase):
+    """apply_sessions() itself must produce fail-closed rows for the real data shapes --
+    not only the hand-fabricated picked rows above."""
+
+    async def test_group_row_missing_discovered_name_has_no_saved_name_fallback(self):
+        data = {
+            "groups": {
+                "/proj": {
+                    "display_name": "/proj",
+                    "rows": [{
+                        "name": "saved-name", "provider": "Codex", "status": "Running",
+                        "key": "k1",
+                    }],
+                }
+            },
+            "sessions": [],
+        }
+        pane = session_hub_tui.RunningPane()
+        app = _PaneHost(pane)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            pane.apply_sessions(data)
+            self.assertIsNone(pane.rows[0]["tmux_name"])
+
+    async def test_standalone_row_missing_discovered_name_does_not_raise(self):
+        data = {
+            "groups": {},
+            "sessions": [{
+                "is_group": False, "provider": "Codex", "title": "demo",
+                "key": "Codex:x", "status": "Running",
+            }],
+        }
+        pane = session_hub_tui.RunningPane()
+        app = _PaneHost(pane)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            pane.apply_sessions(data)  # must not raise KeyError
+            self.assertIsNone(pane.rows[0]["tmux_name"])
+            self.assertEqual(pane.rows[0]["name"], "demo")
 
 
 class NoEmbeddedTerminalSurvivesTests(unittest.TestCase):

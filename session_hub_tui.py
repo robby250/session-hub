@@ -405,7 +405,9 @@ class RunningPane(Vertical):
             {
                 "kind": "group", "cwd": cwd, "name": row["name"], "provider": row["provider"],
                 "key": row.get("key") or row.get("session_key"),
-                "tmux_name": row.get("tmux_name") or row["name"],
+                # No saved-name fallback: an undiscovered live target must fail closed in
+                # on_list_view_selected, never silently attach to the stale saved name.
+                "tmux_name": row.get("tmux_name"),
                 "display": group["display_name"], "status_label": row.get("activity_label", ""),
                 # Status/activity detail is a separate state signal; the compact row's
                 # preview is exclusively the serialized provider-aware assistant text.
@@ -416,8 +418,11 @@ class RunningPane(Vertical):
             if row["status"] == "Running"
         ] + [
             {
-                "kind": "standalone", "key": s["key"], "name": s["tmux_name"], "provider": s["provider"],
-                "tmux_name": s["tmux_name"], "display": s["title"], "status_label": s.get("activity_label", ""),
+                "kind": "standalone", "key": s["key"],
+                "name": s.get("tmux_name") or s["title"], "provider": s["provider"],
+                # No KeyError on a missing discovered name: an absent tmux_name must reach
+                # on_list_view_selected's fail-closed check, not crash before it notifies.
+                "tmux_name": s.get("tmux_name"), "display": s["title"], "status_label": s.get("activity_label", ""),
                 "detail": s.get("assistant_preview", ""), "age": s.get("age", ""),
             }
             for s in data.get("sessions", [])
@@ -457,7 +462,7 @@ class RunningPane(Vertical):
         if not picked:
             return
         target = picked.get("tmux_name")
-        if not target:
+        if not target or target.startswith("="):
             self.notify("No exact tmux session to attach to.", severity="error")
             return
         self.app.exit((picked.get("cwd"), target))
