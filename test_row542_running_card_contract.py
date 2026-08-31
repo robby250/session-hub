@@ -81,8 +81,9 @@ class RunningCardContractTests(unittest.TestCase):
 
     def test_subtitle_is_clipped_at_the_real_cell_not_pre_elided(self):
         source = inspect.getsource(session_hub.RunningNameAgeDelegate.paint)
+        self.assertNotIn("elidedText", source)
+        self.assertIn("horizontalAdvance(age) + 3", source)
         subtitle_block = source[source.index("if len(lines) > 1:") :]
-        self.assertNotIn("elidedText", subtitle_block)
         self.assertIn("Qt.TextFlag.TextSingleLine", subtitle_block)
         self.assertIn("painter.setClipRect(rect)", source)
 

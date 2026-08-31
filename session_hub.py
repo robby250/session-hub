@@ -4761,7 +4761,7 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index) -> None:
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
-        age = index.data(Qt.ItemDataRole.UserRole + 5) or ""
+        age = str(index.data(Qt.ItemDataRole.UserRole + 5) or "").strip()
         lines = opt.text.split("\n")
         opt.text = ""
         style = opt.widget.style() if opt.widget else QApplication.style()
@@ -4771,7 +4771,9 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
         fm = painter.fontMetrics()
         pen = opt.palette.highlightedText() if opt.state & QStyle.StateFlag.State_Selected else opt.palette.text()
         painter.setPen(pen.color())
-        age_width = fm.horizontalAdvance(age) + 8 if age else 0
+        # Reserve the glyphs plus one minimal visual gap.  The old +8 padding left a conspicuous
+        # dead lane between short values such as ``1m`` and Last message.
+        age_width = fm.horizontalAdvance(age) + 3 if age else 0
         geometry = running_card_text_geometry(
             rect.left(), rect.top(), rect.width(), rect.height(), age_width
         )
@@ -4779,11 +4781,11 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
         # particular, a long name must not paint underneath the age or into Last message.
         painter.setClipRect(rect)
         top_rect = QRect(*geometry["name"])
-        name = fm.elidedText(
-            lines[0] if lines else "", Qt.TextElideMode.ElideRight, geometry["name"][2]
-        )
         painter.drawText(
-            top_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name
+            top_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            | Qt.TextFlag.TextSingleLine,
+            lines[0] if lines else "",
         )
         if age:
             age_rect = QRect(*geometry["age"])
