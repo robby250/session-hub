@@ -476,9 +476,9 @@ class RunningPane(Vertical):
     ]
 
     CSS = """
-    # Keep the activity list in the upper third of a phone viewport; overflow scrolls here.
-    # The terminal owns the remaining height and never gets pushed below the screen.
-    #running-list { height: 12; min-height: 5; border: round $panel; }
+    # Hug one/few cards with only a small intentional gap; overflow past the cap scrolls
+    # here instead of growing. The terminal owns whatever height this list does not need.
+    #running-list { height: auto; max-height: 12; min-height: 3; border: round $panel; }
     #terminal-host { height: 1fr; min-height: 4; border: round $panel; }
     #terminal-empty { height: 1fr; content-align: center middle; color: $text-muted; }
     .running-row { height: 3; padding: 0 1; }
