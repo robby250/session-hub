@@ -9480,6 +9480,13 @@ class SessionHub(QMainWindow):
         if entry.controller.focus():
             self._focused_entry = entry
             self._note_embed_focus_grabbed(interaction_serial)
+            return
+        cwd, session_id, saved_name = entry.meta or (None, None, None)
+        self._evict_entry(entry)
+        self._show_embed_failure(
+            cwd, identity, session_id, "failed to focus the embedded terminal's window",
+            saved_name=saved_name,
+        )
 
     def _promote_entry(
         self, entry: "_TerminalCacheEntry", attach_start_serial: int,

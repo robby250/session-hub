@@ -13,9 +13,10 @@ import session_hub
 
 
 class _FakeController:
-    def __init__(self, generation=4, alive=True):
+    def __init__(self, generation=4, alive=True, focus_result=True):
         self.generation = generation
         self.alive = alive
+        self.focus_result = focus_result
         self.focus_calls = 0
 
     def poll_alive(self):
@@ -23,7 +24,7 @@ class _FakeController:
 
     def focus(self):
         self.focus_calls += 1
-        return True
+        return self.focus_result
 
 
 class RunningFocusDeferredTests(unittest.TestCase):
@@ -88,6 +89,51 @@ class RunningFocusDeferredTests(unittest.TestCase):
             mutation(window, entry)
             callbacks[0]()
             self.assertEqual(entry.controller.focus_calls, 0)
+
+    def test_focus_failure_evicts_and_falls_back_for_promotion_and_reselect(self):
+        class _Stack:
+            def __init__(self, current):
+                self.current = current
+                self.set_calls = []
+
+            def currentWidget(self):
+                return self.current
+
+            def setCurrentWidget(self, widget):
+                self.set_calls.append(widget)
+                self.current = widget
+
+        for path in ("promotion", "reselect"):
+            entry = self._entry(
+                controller=_FakeController(focus_result=False),
+                meta=("/tmp/project", "session-id", "saved-name"),
+                last_used=0.0,
+                container=object(),
+                paint_verified=True,
+            )
+            window = self._window(entry)
+            window._running_terminal_stack = _Stack(entry.container)
+            window.running_terminal_placeholder = object()
+            evicted = []
+            failures = []
+            window._evict_entry = lambda candidate: evicted.append(candidate)
+            window._show_embed_failure = lambda *args, **kwargs: failures.append((args, kwargs))
+            callbacks = []
+            with patch.object(session_hub.QTimer, "singleShot",
+                              side_effect=lambda delay, callback: callbacks.append(callback)):
+                if path == "promotion":
+                    window._promote_entry(entry, 12, defer_focus=True)
+                else:
+                    window._select_running_terminal(
+                        "/tmp/project", "worker", "session-id", saved_name="saved-name",
+                        defer_focus=True,
+                    )
+            self.assertEqual(len(callbacks), 1)
+            callbacks[0]()
+            self.assertEqual(entry.controller.focus_calls, 1)
+            self.assertEqual(evicted, [entry])
+            self.assertEqual(len(failures), 1)
+            self.assertEqual(failures[0][0][1], "worker")
 
     def test_click_enter_and_double_click_share_deferred_activation_boundary(self):
         setup = inspect.getsource(session_hub.SessionHub.build_ui)
