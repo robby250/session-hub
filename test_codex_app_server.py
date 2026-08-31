@@ -152,6 +152,90 @@ def _fake_lifecycle_control() -> None:
                 _stop_fake_server(process)
 
 
+def _fake_session_hub_launch_control() -> None:
+    """Drive SessionHub's launch boundary with fakes, without Qt, Codex, or a terminal."""
+    import session_hub
+
+    class FakeHub:
+        def __init__(self):
+            self._codex_app_servers = {}
+            self.stopped = []
+            self.spawned = []
+
+        def stop_codex_app_server(self, row_id):
+            self.stopped.append(row_id)
+
+        def spawn(self, command, session_key, **kwargs):
+            self.spawned.append((command, session_key, kwargs))
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        events = []
+        endpoints = [root / "row-a.sock", root / "row-a-restart.sock"]
+        records = []
+
+        def fake_endpoint(row_id):
+            endpoint = endpoints[len(records)]
+            events.append(("endpoint", row_id, endpoint.name))
+            return endpoint
+
+        def fake_popen(argv, **kwargs):
+            events.append(("start", tuple(argv), kwargs["cwd"]))
+            return FakeProcess(os.getpid())
+
+        def fake_ready(endpoint):
+            events.append(("ready", endpoint.name))
+            return True
+
+        def fake_publish(path, **kwargs):
+            events.append(("publish", kwargs["row_id"], kwargs["thread_id"]))
+            records.append(path)
+            return {"row_id": kwargs["row_id"], "thread_id": kwargs["thread_id"]}
+
+        def fake_remote(endpoint, thread_id, cwd):
+            events.append(("remote", endpoint.name, thread_id, cwd))
+            return ["codex", "--remote", str(endpoint)]
+
+        hub = FakeHub()
+        with (
+            patch.object(session_hub, "REGISTRY_DIR", root),
+            patch.object(session_hub, "endpoint_for", side_effect=fake_endpoint),
+            patch.object(session_hub.subprocess, "Popen", side_effect=fake_popen),
+            patch.object(session_hub, "wait_ready", side_effect=fake_ready),
+            patch.object(session_hub, "publish_record", side_effect=fake_publish),
+            patch.object(session_hub, "remote_tui_argv", side_effect=fake_remote),
+            patch.object(session_hub.shutil, "which", return_value="/usr/bin/gnome-terminal"),
+        ):
+            session_hub.SessionHub._launch_codex_app_server(
+                hub, "thread-a", "/tmp/project", "/tmp/project", "gpt", "row-a", "tmux-a",
+                "medium", "prompt", False,
+            )
+            # Restart through the same production boundary: exact thread id, new private endpoint.
+            session_hub.SessionHub._launch_codex_app_server(
+                hub, "thread-a", "/tmp/project", "/tmp/project", "gpt", "row-a", "tmux-a",
+                "medium", "prompt", False,
+            )
+        phases = [event[0] for event in events]
+        assert phases == ["endpoint", "start", "ready", "publish", "remote",
+                          "endpoint", "start", "ready", "publish", "remote"]
+        assert events[3] == ("publish", "row-a", "thread-a")
+        assert events[8] == ("publish", "row-a", "thread-a")
+        assert hub.stopped == ["row-a", "row-a"]
+        assert len(hub.spawned) == 2 and all(item[1] == "row-a" for item in hub.spawned)
+
+    # The real stop path must surface an ambiguous registry instead of swallowing it and launching.
+    ambiguous = session_hub.SessionHub.__new__(session_hub.SessionHub)
+    ambiguous._codex_app_servers = {}
+    with patch.object(session_hub, "stop_owned_for_row", side_effect=RuntimeError("ambiguous")), \
+         patch.object(session_hub, "record_for_row", side_effect=RuntimeError("ambiguous")):
+        try:
+            session_hub.SessionHub.stop_codex_app_server(ambiguous, "row-a")
+        except RuntimeError as error:
+            assert "ambiguous" in str(error)
+        else:
+            raise AssertionError("SessionHub swallowed ambiguous persisted ownership")
+
+
 def _record(path: Path, endpoint: Path, row_id: str):
     return codex_app_server.publish_record(
         path,
@@ -233,6 +317,7 @@ def main() -> int:
             raise AssertionError("ambiguous owner records were accepted")
 
     _fake_lifecycle_control()
+    _fake_session_hub_launch_control()
 
     source = inspect.getsource(codex_app_server)
     assert "wait_ready" in source and "not record.get(\"start_time\")" in source

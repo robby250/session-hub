@@ -10259,10 +10259,14 @@ class SessionHub(QMainWindow):
             # ambiguous set remains untouched and fail-closed.
             try:
                 record_path = record_for_row(row_id)
-                if record_path:
-                    discard_stale_record(record_path, row_id=row_id)
-            except (OSError, RuntimeError, ValueError):
-                pass
+            except RuntimeError:
+                # record_for_row raises for multiple owners.  Never turn that ambiguity into a
+                # replacement launch: the caller must see the fail-closed refusal.
+                raise
+            except (OSError, ValueError):
+                return
+            if record_path:
+                discard_stale_record(record_path, row_id=row_id)
 
     def stop_all_codex_app_servers(self) -> None:
         for row_id in list(self._codex_app_servers):
