@@ -40,10 +40,27 @@ from textual.widgets import (
     TabPane,
 )
 
+def _shim_textual_terminal_default_colors() -> None:
+    """textual-terminal 0.3.0 does `from textual.app import DEFAULT_COLORS` at module
+    load, unconditionally, even though it only reads the value when a Terminal is
+    constructed with default_colors="textual" (this file always uses the "system"
+    default). Modern Textual dropped that name, so supply an inert stand-in only if
+    it is missing, private to this import boundary, never touched otherwise."""
+    import textual.app as _textual_app
+
+    if not hasattr(_textual_app, "DEFAULT_COLORS"):
+        _textual_app.DEFAULT_COLORS = {"dark": None, "light": None}
+
+
+_OssTerminal = None
+_textual_terminal_import_error: ImportError | None = None
 try:
+    _shim_textual_terminal_default_colors()
     from textual_terminal import Terminal as _OssTerminal
-except ImportError:  # startup reports the pinned install command; tests can inject a fake adapter
-    _OssTerminal = None
+except ModuleNotFoundError as exc:  # adapter package not installed at all
+    _textual_terminal_import_error = exc
+except ImportError as exc:  # adapter present but incompatible with this Textual version
+    _textual_terminal_import_error = exc
 
 SESSION_HUB = Path(__file__).resolve().parent / "session_hub.py"
 PHONE_ROW_HEIGHT = 2
@@ -743,11 +760,18 @@ class SessionHubTUI(App):
 
 def main() -> int:
     if _OssTerminal is None:
-        print(
-            f"Session Hub Running terminal requires the maintained OSS adapter; install with: "
-            f"{TEXTUAL_TERMINAL_INSTALL}",
-            file=sys.stderr,
-        )
+        if isinstance(_textual_terminal_import_error, ModuleNotFoundError):
+            print(
+                f"Session Hub Running terminal requires the maintained OSS adapter; install with: "
+                f"{TEXTUAL_TERMINAL_INSTALL}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Session Hub Running terminal adapter is installed but failed to import "
+                f"against this Textual version: {_textual_terminal_import_error}",
+                file=sys.stderr,
+            )
         return 2
     app = SessionHubTUI()
     result = app.run()
