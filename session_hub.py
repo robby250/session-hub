@@ -31,6 +31,10 @@ from terminal_profile import (  # noqa: E402  (see terminal_profile.py -- shared
 )
 from datetime import date, datetime
 from pathlib import Path
+from codex_app_server import (
+    REGISTRY_DIR, app_server_argv, discard_stale_record, endpoint_for, publish_record,
+    record_for_row, remote_tui_argv, stop_owned, stop_owned_for_row, wait_ready,
+)
 
 from PyQt6.QtCore import (
     QByteArray, QEvent, QItemSelectionModel, QObject, QRect, QRunnable, QSocketNotifier,
@@ -7457,6 +7461,8 @@ class SessionHub(QMainWindow):
         self.usage_compact_bars: dict[str, QProgressBar] = {}
         self.thread_pool = QThreadPool.globalInstance()
         self.group_dialogs: dict[str, "ManageGroupDialog"] = {}
+        # task-2194 row518: Session Hub owns Codex App Server processes and records.
+        self._codex_app_servers: dict[str, tuple[subprocess.Popen, Path]] = {}
         # task-2142 row453 REWORK (orchestrator search REWORK): every saved group row's
         # identity, rebuilt once per refresh() straight from already-loaded metadata (no
         # subprocess) -- what apply_filter's All Sessions branch searches to surface a
@@ -7976,6 +7982,9 @@ class SessionHub(QMainWindow):
             self.settings().pop("window_geometry", None)
 
     def closeEvent(self, event) -> None:
+        # task-2194 row518: the Hub owns every Codex App Server child; close tears down only
+        # records/endpoints it published, never an unrelated process or socket.
+        self.stop_all_codex_app_servers()
         # task-2170: undo installEventFilter(self) from __init__ -- an event filter installed on
         # the QApplication SINGLETON outlives this window unless explicitly removed, leaving a
         # dangling reference once this SessionHub instance is garbage collected (confirmed live:
@@ -8897,8 +8906,30 @@ class SessionHub(QMainWindow):
         # can differ from its saved row name after an external restart -- stopping `name` here
         # would silently no-op (nothing tmux-alive under that name) and leave the real session
         # running headless forever.
+        row_id = self.codex_app_server_row_id(cwd, name, _session_id)
+        if row_id:
+            self.stop_codex_app_server(row_id)
         stop_tmux_session(tmux_name)
         self.refresh_running_tab()
+
+    def codex_app_server_row_id(
+        self, cwd: str | None, name: str | None, session_id: str | None = None
+    ) -> str | None:
+        """Resolve the stable row key used by the App Server registry."""
+        if cwd and name:
+            group = self.metadata.get("groups", {}).get(cwd) or {}
+            row = next((item for item in group.get("rows", []) if item.get("name") == name), None)
+            if row and row.get("provider") == "Codex":
+                return row.get("override_key") or row.get("session_key") or name
+        if session_id:
+            session = next(
+                (item for item in getattr(self, "sessions", [])
+                 if item.session_id == session_id and item.provider == "Codex"),
+                None,
+            )
+            if session:
+                return session.key
+        return None
 
     def _focus_or_resume_session(
         self, cwd: str, name: str, session_id: str | None, *, tmux_name: str | None = None,
@@ -10062,6 +10093,12 @@ class SessionHub(QMainWindow):
                     "live status until you clear or replace that `notify` line yourself.",
                 )
         try:
+            if provider == "Codex":
+                self._launch_codex_app_server(
+                    session_id, cwd, source_cwd, model, session_key, tmux_name,
+                    reasoning_effort, initial_prompt, focus,
+                )
+                return
             if provider in ("Claude", "Codex"):
                 # tmux_name, not flag_overrides["--name"]: resuming a group
                 # row (session_id set) never passes --name at all - Claude
@@ -10156,6 +10193,85 @@ class SessionHub(QMainWindow):
             )
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(self, "Could not launch session", str(error))
+
+    def _launch_codex_app_server(
+        self, session_id, cwd, source_cwd, model, session_key, tmux_name,
+        reasoning_effort, initial_prompt, focus,
+    ) -> None:
+        """Launch one private app-server and a remote Codex TUI (row518).
+
+        The server is started with Popen(cwd=...), then its owner record is atomically
+        published only after the process exists.  The TUI receives the exact saved thread
+        id, so this path cannot silently fork a replacement identity.
+        """
+        row_id = session_key or tmux_name or session_id
+        if not row_id:
+            raise RuntimeError("Codex App Server launch requires a stable row identity")
+        REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
+        # A restart/replacement first tears down this row's previous owner, if any;
+        # stop_owned validates the persisted PID/start-time/record binding before killing.
+        self.stop_codex_app_server(row_id)
+        endpoint = endpoint_for(row_id)
+        record_path = REGISTRY_DIR / f"{endpoint.stem}.json"
+        server = subprocess.Popen(app_server_argv(endpoint, cwd), cwd=source_cwd or cwd)
+        self._codex_app_servers[row_id] = (server, record_path)
+        try:
+            if not wait_ready(endpoint):
+                raise RuntimeError("Codex App Server did not become ready")
+            publish_record(record_path, row_id=row_id, endpoint=endpoint,
+                           thread_id=session_id or "", process=server,
+                           name=tmux_name, aliases=[tmux_name] if tmux_name else [])
+            terminal = shutil.which("gnome-terminal") or shutil.which("x-terminal-emulator")
+            if not terminal:
+                raise RuntimeError("No supported terminal emulator was found.")
+            # Existing rows resume their saved thread; a fresh row omits `resume`
+            # so the remote client creates its first thread instead of `resume ""`.
+            args = remote_tui_argv(endpoint, session_id, cwd)
+            command = [terminal, "--window", "--", *args] if Path(terminal).name == "gnome-terminal" else [terminal, "-e", shlex.join(args)]
+            self.spawn(command, session_key, cwd=cwd, focus=focus)
+        except Exception:
+            try:
+                self.stop_codex_app_server(row_id)
+            except Exception:
+                server.terminate()
+                record_path.unlink(missing_ok=True)
+                endpoint.unlink(missing_ok=True)
+            self._codex_app_servers.pop(row_id, None)
+            raise
+
+    def stop_codex_app_server(self, row_id: str) -> None:
+        owned = self._codex_app_servers.pop(row_id, None)
+        if owned:
+            process, record_path = owned
+            try:
+                stop_owned(record_path, row_id=row_id)
+            except (OSError, RuntimeError, ValueError):
+                # A stale persisted identity must never be signalled.  Remove its
+                # record only after codex_app_server validates the row/path binding;
+                # the in-memory child is terminated only while its own PID is live.
+                discard_stale_record(record_path, row_id=row_id)
+                if getattr(process, "poll", lambda: 0)() is None:
+                    process.terminate()
+            return
+        try:
+            stop_owned_for_row(row_id)
+        except (OSError, RuntimeError, ValueError):
+            # A stale single record can be retired after binding validation; an
+            # ambiguous set remains untouched and fail-closed.
+            try:
+                record_path = record_for_row(row_id)
+            except RuntimeError:
+                # record_for_row raises for multiple owners.  Never turn that ambiguity into a
+                # replacement launch: the caller must see the fail-closed refusal.
+                raise
+            except (OSError, ValueError):
+                return
+            if record_path:
+                discard_stale_record(record_path, row_id=row_id)
+
+    def stop_all_codex_app_servers(self) -> None:
+        for row_id in list(self._codex_app_servers):
+            self.stop_codex_app_server(row_id)
 
     def _selected_search_member(self) -> tuple[str, str, str | None] | None:
         """(cwd, name, session_id) if the currently-selected All Sessions row is a search-
@@ -10659,6 +10775,10 @@ class SessionHub(QMainWindow):
             reasoning_effort = dialog.reasoning_effort
             account_config_dir = dialog.account_config_dir if target == "Claude" else None
 
+        if session.provider == "Codex":
+            self.stop_codex_app_server(
+                group_row.get("override_key") if group_row else session.key
+            )
         if use_tmux:
             stop_tmux_session(tmux_name)
 
@@ -10966,6 +11086,9 @@ class SessionHub(QMainWindow):
             else None,
             session_key=row["override_key"],
             flag_overrides={"--name": row["name"]},
+            # Fresh managed rows have no saved thread yet, but their public row name is still
+            # the address consumed by session_ctl's App Server resolver.
+            tmux_name=row["name"],
             strip_env=strip_env,
             wait_for_tracking=wait_for_tracking,
         )
@@ -11205,6 +11328,14 @@ class SessionHub(QMainWindow):
             )
 
     def move_session_to_trash(self, session: Session) -> None:
+        if session.provider == "Codex":
+            self.stop_codex_app_server(session.key)
+            for group in self.metadata.get("groups", {}).values():
+                for row in group.get("rows", []):
+                    if row.get("provider") == "Codex" and row.get("session_key") == session.key:
+                        self.stop_codex_app_server(
+                            row.get("override_key") or row.get("session_key") or row.get("name")
+                        )
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         destination = TRASH_DIR / session.provider.lower() / f"{stamp}-{session.session_id}"
         destination.mkdir(parents=True, exist_ok=False)
@@ -11616,6 +11747,8 @@ def stop_group_row_cli(argv: list[str]) -> int:
     if not row:
         print(json.dumps({"status": "error", "message": f"No row named {name!r} in group {cwd!r}."}))
         return 1
+    if row.get("provider") == "Codex":
+        stop_owned_for_row(row.get("override_key") or row.get("session_key") or name)
     stop_tmux_session(name)
     print(json.dumps({"status": "ok"}))
     return 0
@@ -11646,6 +11779,8 @@ def stop_session_cli(argv: list[str]) -> int:
     if not tmux_enabled:
         print(json.dumps({"status": "error", "message": f"{key!r} is not launched in tmux."}))
         return 1
+    if session.provider == "Codex":
+        stop_owned_for_row(session.key)
     stop_tmux_session(name)
     print(json.dumps({"status": "ok"}))
     return 0
