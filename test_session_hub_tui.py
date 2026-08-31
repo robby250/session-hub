@@ -1,146 +1,19 @@
-"""Pure model/adapter controls for the Session Hub TUI panes.
+"""Pure model controls for the Session Hub TUI panes.
 
-Running is a compact scrolling list above one retained terminal adapter; runtime pilot/PTY tests
-remain frozen by row503 and are not run here.
+Running selection exits the TUI to a separate `tmux attach` (see
+test_row585_running_attach.py) rather than embedding a terminal; runtime pilot/PTY
+tests remain frozen by row503 and are not run here.
 """
 from __future__ import annotations
 
 import threading
 import unittest
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from textual.app import App, ComposeResult
 from textual.widgets import TabbedContent
 
 import session_hub_tui
-
-
-class TerminalAdapterControlsTests(unittest.TestCase):
-    def test_tmux_target_is_exact_and_shell_free(self):
-        with patch.object(session_hub_tui.shutil, "which", return_value="/usr/bin/tmux"):
-            self.assertEqual(
-                session_hub_tui.tmux_attach_argv("worker 5"),
-                ["/usr/bin/tmux", "attach", "-t", "=worker 5"],
-            )
-
-    def test_adapter_lifecycle_stops_only_terminal_client(self):
-        widget = Mock()
-        factory = Mock(return_value=widget)
-        with patch.object(session_hub_tui.shutil, "which", return_value="/usr/bin/tmux"):
-            adapter = session_hub_tui.OssTmuxTerminalAdapter("worker", factory)
-        adapter.start()
-        adapter.close()
-        factory.assert_called_once()
-        widget.start.assert_called_once_with()
-        widget.stop.assert_called_once_with()
-
-
-class _FakeWidget:
-    def __init__(self):
-        self.focuses = 0
-
-    def focus(self):
-        self.focuses += 1
-
-
-class _FakeAdapter:
-    instances = []
-
-    def __init__(self, name):
-        self.identity = name
-        self.widget = _FakeWidget()
-        self.starts = 0
-        self.closes = 0
-        self.switches = []
-        self.resizes = []
-        self.active = False
-        self.__class__.instances.append(self)
-
-    def start(self):
-        self.starts += 1
-        self.active = True
-
-    def switch(self, name):
-        self.switches.append(name)
-        self.close()
-        self.identity = name
-        self.start()
-
-    def close(self):
-        if self.active:
-            self.closes += 1
-        self.active = False
-
-    def resize(self, width, height):
-        self.resizes.append((width, height))
-
-
-class _FakeHost:
-    content_size = SimpleNamespace(width=80, height=20)
-
-    def __init__(self):
-        self.mounted = []
-
-    async def mount(self, widget):
-        self.mounted.append(widget)
-
-
-class _FakeEmpty:
-    def __init__(self):
-        self.text = "Select a running session"
-
-    def update(self, text):
-        self.text = text
-
-
-class RunningPaneLifecycleControlsTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        _FakeAdapter.instances.clear()
-        self.host = _FakeHost()
-        self.empty = _FakeEmpty()
-        self.pane = session_hub_tui.RunningPane(adapter_factory=_FakeAdapter)
-        def query_one(selector, *_types):
-            return self.empty if selector == "#terminal-empty" else self.host
-        self.pane.query_one = query_one
-
-    @staticmethod
-    def row(key, name):
-        return {"key": key, "name": name, "tmux_name": name}
-
-    async def test_selection_refresh_reorder_and_switch_retain_one_surface(self):
-        first = self.row("Codex:first", "first")
-        second = self.row("Codex:second", "second")
-        await self.pane._switch_terminal(first)  # tap/Enter exact target
-        await self.pane._switch_terminal(first)  # same-key refresh: no reattach
-        self.pane.rows = [second, first]  # reorder preserves selected identity
-        await self.pane._switch_terminal(first)
-        await self.pane._switch_terminal(second)  # switch closes only old client
-        self.assertEqual(len(_FakeAdapter.instances), 1)
-        adapter = _FakeAdapter.instances[0]
-        self.assertEqual(self.host.mounted, [adapter.widget])
-        self.assertEqual(adapter.switches, ["second"])
-        self.assertEqual(adapter.closes, 1)
-        self.assertEqual(self.pane.selected_key, "Codex:second")
-
-    async def test_disappearance_resize_and_app_exit_are_safe_and_idempotent(self):
-        row = self.row("Codex:gone", "gone")
-        await self.pane._switch_terminal(row)
-        self.pane.selected_key = None  # apply_sessions disappearance branch
-        self.pane._close_adapter()
-        self.assertIsNotNone(self.pane.adapter)
-        self.assertEqual(len(self.host.mounted), 1)  # app/surface remains alive
-        self.assertEqual(self.empty.text, "Select a running session")
-        await self.pane._switch_terminal(self.row("Codex:back", "back"))
-        self.assertEqual(self.empty.text, "")
-        self.assertEqual(len(_FakeAdapter.instances), 1)  # reactivation reuses the surface/client
-        self.assertEqual(self.pane.adapter.switches, ["back"])
-        self.pane.on_resize(SimpleNamespace(size=SimpleNamespace(width=1, height=1)))
-        self.assertEqual(self.pane.adapter.resizes, [(80, 20)])
-        self.pane.on_unmount()
-        self.pane.on_unmount()
-        self.assertEqual(self.pane.adapter.closes, 1)
-        self.assertEqual(self.pane.adapter.switches, [])
 
 
 class _PaneHost(App):
