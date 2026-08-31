@@ -80,10 +80,18 @@ def running_card_lines(row: dict, content_width: int | None = None) -> tuple[str
     name = " ".join(str(row.get("name", "")).split())
     if content_width is None:
         name_width = len(name)
+        first_name = elide_running_text(name, name_width)
+        first = f"{first_name}{f'  {age}' if age else ''}"
     else:
-        name_width = max(0, content_width - len(age) - (2 if age else 0))
-    first_name = elide_running_text(name, name_width)
-    first = f"{first_name}{f'  {age}' if age else ''}"
+        reservation = len(age) + (2 if age else 0)
+        if age and content_width < reservation:
+            first = elide_running_text(age, content_width)
+        elif age:
+            name_width = content_width - reservation
+            first_name = elide_running_text(name, name_width)
+            first = f"{first_name:<{name_width}}  {age}"
+        else:
+            first = elide_running_text(name, content_width)
     second = f"{row.get('provider', '')} · {row.get('display', '')}"
     detail = " ".join(str(row.get("detail", "")).split())
     if detail:

@@ -286,6 +286,14 @@ class RunningCardPureContractTests(unittest.TestCase):
         self.assertIn("Codex", narrow[1])
         self.assertNotIn("ago", "\n".join(wide))
 
+    def test_short_name_right_aligns_age_and_tiny_width_never_overflows(self):
+        row = self.row(name="A", age="12h")
+        line, _ = session_hub_tui.running_card_lines(row, 18)
+        self.assertEqual(len(line), 18)
+        self.assertTrue(line.endswith("12h"))
+        tiny, _ = session_hub_tui.running_card_lines(row, 2)
+        self.assertLessEqual(len(tiny), 2)
+
 
 _FAKE_SESSIONS = {
     "sessions": [
