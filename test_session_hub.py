@@ -8518,6 +8518,23 @@ class SessionActivityTests(unittest.TestCase):
             ("done", "", ""),
         )
 
+    def test_claude_answered_ask_user_question_clears_needs_input_to_working(self):
+        # An unanswered AskUserQuestion remains a real blocker; the next user
+        # submission is authoritative newer work and must clear that badge.
+        needs_input = session_hub.hook_event_to_status({
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt",
+            "message": "AskUserQuestion",
+        })
+        self.assertEqual(needs_input, ("needs_input", "AskUserQuestion", "permission_prompt"))
+        self.assertEqual(
+            session_hub.hook_event_to_status({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "answered",
+            }),
+            ("working", "", ""),
+        )
+
     def test_claude_interrupt_requires_structured_reason_not_ordinary_prose(self):
         self.assertIsNone(session_hub.hook_event_to_status({
             "hook_event_name": "Notification",
