@@ -66,6 +66,13 @@ def _fake_lifecycle_control() -> None:
         endpoint_a = endpoint_for("row-a", root)
         endpoint_b = endpoint_for("row-b", root)
         assert endpoint_a != endpoint_b and endpoint_a.parent == endpoint_b.parent == root
+        # Real managed keys include long provider/session/group identities.  The endpoint name
+        # must remain bounded by AF_UNIX SUN_LEN while the complete key stays in the JSON record.
+        long_row_id = "Codex:" + "session-identity-" * 24
+        long_endpoint = endpoint_for(long_row_id, root)
+        assert len(os.fsencode(long_endpoint)) < 104
+        assert long_row_id not in long_endpoint.name
+        assert long_endpoint != endpoint_for(long_row_id, root)
         server_a = _fake_server(endpoint_a)
         server_b = _fake_server(endpoint_b)
         record_a = endpoint_a.with_suffix(".json")

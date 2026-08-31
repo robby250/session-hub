@@ -6,6 +6,7 @@ private Unix endpoint per saved group row and publishes its process identity ato
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import secrets
 import signal
@@ -19,8 +20,15 @@ REGISTRY_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "session-hub" /
 
 
 def endpoint_for(row_id: str, root: Path = REGISTRY_DIR) -> Path:
-    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in row_id)
-    return root / f"{safe}-{secrets.token_hex(8)}.sock"
+    # AF_UNIX paths are capped at roughly 104-108 bytes.  Managed row ids contain the provider,
+    # full native session UUID and sometimes group identity, so embedding them in the filename can
+    # exceed SUN_LEN before Codex even binds.  The full row id remains authoritative inside the
+    # owner record; the pathname needs only a collision-resistant, bounded private token.
+    digest = hashlib.sha256(row_id.encode("utf-8")).hexdigest()[:16]
+    endpoint = root / f"c-{digest}-{secrets.token_hex(6)}.sock"
+    if len(os.fsencode(endpoint)) >= 104:
+        raise RuntimeError("Codex App Server registry path is too long for a Unix socket")
+    return endpoint
 
 
 def app_server_argv(endpoint: Path, cwd: str) -> list[str]:
