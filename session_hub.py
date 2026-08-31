@@ -4724,7 +4724,7 @@ def bounded_tooltip(text: str) -> str:
 
 
 def running_card_text_geometry(
-    left: int, top: int, width: int, height: int, age_width: int, line_height: int
+    left: int, top: int, width: int, height: int, age_width: int
 ) -> dict[str, tuple[int, int, int, int]]:
     """Return the half-open text rectangles used by ``RunningNameAgeDelegate``.
 
@@ -4735,18 +4735,11 @@ def running_card_text_geometry(
     height = max(0, height)
     age_width = min(max(0, age_width), width)
     text_width = width - age_width
-    # The first line needs only one font line.  Give every remaining pixel to the
-    # wrapping provider/project subtitle instead of leaving the lower card empty.
-    name_height = min(max(0, line_height), height)
-    subtitle_height = height - name_height
     geometry = {
-        "name": (left, top, text_width, name_height),
-        # The age occupies only the first line.  The provider/project text owns the full
-        # width and all remaining height, so narrow identity cells can wrap vertically.
-        "subtitle": (left, top + name_height, width, subtitle_height),
+        "identity": (left, top, text_width, height),
     }
     if age_width:
-        geometry["age"] = (left + width - age_width + 1, top, age_width - 1, name_height)
+        geometry["age"] = (left + width - age_width + 1, top, age_width - 1, height)
     return geometry
 
 
@@ -4764,7 +4757,7 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
         age = str(index.data(Qt.ItemDataRole.UserRole + 5) or "").strip()
-        lines = opt.text.split("\n")
+        identity = opt.text
         opt.text = ""
         style = opt.widget.style() if opt.widget else QApplication.style()
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
@@ -4777,34 +4770,23 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
         # dead lane between short values such as ``1m`` and Last message.
         age_width = fm.horizontalAdvance(age) + 3 if age else 0
         geometry = running_card_text_geometry(
-            rect.left(), rect.top(), rect.width(), rect.height(), age_width, fm.height()
+            rect.left(), rect.top(), rect.width(), rect.height(), age_width
         )
-        # Clip the custom paint to the cell.  In particular, a long name must not paint
-        # underneath the age or into Last message.
+        # One wrapped identity block owns the card's full height.  The age owns only its
+        # narrow right-hand strip and is centered vertically through that same full height.
         painter.setClipRect(rect)
-        top_rect = QRect(*geometry["name"])
+        identity_rect = QRect(*geometry["identity"])
         painter.drawText(
-            top_rect,
+            identity_rect,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-            | Qt.TextFlag.TextSingleLine,
-            lines[0] if lines else "",
+            | Qt.TextFlag.TextWordWrap,
+            identity,
         )
         if age:
             age_rect = QRect(*geometry["age"])
             painter.setPen(QColor("#9aa0a6"))
             painter.drawText(age_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, age)
             painter.setPen(pen.color())
-        if len(lines) > 1:
-            sub_rect = QRect(*geometry["subtitle"])
-            painter.setPen(QColor("#9aa0a6"))
-            # Wrap the subtitle through the rest of the card.  Forcing TextSingleLine here
-            # clipped provider/project halfway across while leaving the lower half blank.
-            painter.drawText(
-                sub_rect,
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
-                | Qt.TextFlag.TextWordWrap,
-                lines[1],
-            )
         painter.restore()
 
 
