@@ -36,6 +36,16 @@ from codex_app_server import (
     record_for_row, remote_tui_argv, stop_owned, stop_owned_for_row, wait_ready,
 )
 
+# Keep headless row control screen-inert: dispatch before importing PyQt6.  The controller is
+# deliberately a separate module so CLI callers never construct QApplication or SessionHub.
+_HEADLESS_ROW_FLAGS = {
+    "--launch-group-row", "--resume-group-row", "--stop-group-row", "--status-group-row",
+}
+if _HEADLESS_ROW_FLAGS.intersection(sys.argv):
+    from session_hub_control import cli as _headless_row_cli
+    _headless_data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+    raise SystemExit(_headless_row_cli(sys.argv, _headless_data_home / "session-hub" / "metadata.json"))
+
 from PyQt6.QtCore import (
     QByteArray, QEvent, QItemSelectionModel, QObject, QRect, QRunnable, QSocketNotifier,
     QThreadPool, QTimer, QUrl, Qt, pyqtSignal,
@@ -11046,6 +11056,14 @@ class SessionHub(QMainWindow):
         if not row:
             return {"status": "error", "message": f"No row named {name!r} in this group"}
         provider = row.get("provider", "Claude")
+        if provider == "Codex":
+            from session_hub_control import ControlError, SessionHubController
+            try:
+                return SessionHubController(METADATA_PATH).launch(
+                    cwd, name, resume=bool(row.get("session_key"))
+                )
+            except (ControlError, OSError, RuntimeError) as error:
+                return {"status": "error", "message": str(error)}
         # No tmux-alive short-circuit here (task-2142): a live-but-detached row (no window open)
         # reaches this function through _focus_or_resume_session precisely because window_titled()
         # found nothing, and an early "already_running" return used to hand back a status dict
@@ -11166,6 +11184,12 @@ class SessionHub(QMainWindow):
         row = next((r for r in group.get("rows", []) if r["name"] == name), None)
         if not row:
             return {"status": "error", "message": f"No row named {name!r} in this group"}
+        if row.get("provider", "Claude") == "Codex":
+            from session_hub_control import ControlError, SessionHubController
+            try:
+                return SessionHubController(METADATA_PATH).launch(cwd, name, resume=True)
+            except (ControlError, OSError, RuntimeError) as error:
+                return {"status": "error", "message": str(error)}
         # group_row_candidates(), not a same-provider-only claude_sessions()/
         # codex_sessions() call: an unlinked, single-provider pool matches
         # the row's stored (possibly stale) native key literally instead of
@@ -11821,53 +11845,14 @@ def stop_session_cli(argv: list[str]) -> int:
 
 
 def launch_group_row_cli(argv: list[str]) -> int:
-    """Headless `--launch-group-row <cwd> <name>`, for an orchestrator's own Bash tool.
-
-    Builds a real (but never shown) SessionHub so the launch goes through
-    the exact same tracked path (PID capture, launch_env/launch_flags
-    overrides) a GUI click uses - see SessionHub.launch_group_row. Blocks
-    briefly (wait_for_tracking) since this process exits right after, unlike
-    the GUI where a background daemon thread has the app's whole lifetime to
-    finish capturing the launched PID.
-    """
-    try:
-        index = argv.index("--launch-group-row")
-        cwd, name = argv[index + 1], argv[index + 2]
-    except (ValueError, IndexError):
-        print(json.dumps({
-            "status": "error",
-            "message": "usage: session_hub.py --launch-group-row <cwd> <name>",
-        }))
-        return 1
-    app = QApplication.instance() or QApplication(argv[:1])
-    window = SessionHub()
-    result = window.launch_group_row(cwd, name, wait_for_tracking=True)
-    print(json.dumps(result))
-    return 0 if result.get("status") != "error" else 1
+    from session_hub_control import cli
+    return cli(argv, METADATA_PATH)
 
 
 def resume_session_cli(argv: list[str]) -> int:
-    """Headless `--resume-session <name|key|id>`, for an orchestrator's own Bash.
-
-    The single-session counterpart to --launch-group-row: same never-shown
-    SessionHub, so the resume goes through the exact tracked path (PID
-    capture, launch_env/launch_flags overrides) a GUI double-click uses.
-    Blocks briefly (wait_for_tracking) since this process exits right after.
-    """
-    try:
-        index = argv.index("--resume-session")
-        wanted = argv[index + 1]
-    except (ValueError, IndexError):
-        print(json.dumps({
-            "status": "error",
-            "message": "usage: session_hub.py --resume-session <name|key|session-id>",
-        }))
-        return 1
-    app = QApplication.instance() or QApplication(argv[:1])
-    window = SessionHub()
-    result = window.resume_session_by_name(wanted, wait_for_tracking=True)
-    print(json.dumps(result))
-    return 0 if result.get("status") != "error" else 1
+    print(json.dumps({"status": "error", "message":
+                      "use --resume-group-row <cwd> <name> for exact managed-row control"}))
+    return 1
 
 
 def main() -> int:
@@ -11892,6 +11877,9 @@ def main() -> int:
         return launch_group_row_cli(sys.argv)
     if "--resume-session" in sys.argv:
         return resume_session_cli(sys.argv)
+    if "--resume-group-row" in sys.argv or "--status-group-row" in sys.argv:
+        from session_hub_control import cli
+        return cli(sys.argv, METADATA_PATH)
     if "--hook-notify" in sys.argv:
         return hook_notify_cli()
     if "--hook-notify-codex" in sys.argv:

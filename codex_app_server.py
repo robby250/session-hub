@@ -91,7 +91,9 @@ def _read_owner_record(path: Path) -> dict:
     if not isinstance(record, dict):
         raise RuntimeError("Codex App Server owner record must be a JSON object")
     required = {"schema", "row_id", "endpoint", "thread_id", "pid", "start_time"}
-    optional = {"name", "aliases"}
+    optional = {
+        "name", "aliases", "remote_pid", "remote_start_time", "remote_window_id",
+    }
     if set(record) - required - optional or not required.issubset(record):
         raise RuntimeError("Codex App Server owner record has the wrong shape")
     if (
@@ -107,6 +109,11 @@ def _read_owner_record(path: Path) -> dict:
             not isinstance(record["aliases"], list)
             or any(not isinstance(alias, str) for alias in record["aliases"])
         ))
+        or ("remote_pid" in record and (
+            not isinstance(record["remote_pid"], int) or isinstance(record["remote_pid"], bool)
+        ))
+        or ("remote_start_time" in record and not isinstance(record["remote_start_time"], str))
+        or ("remote_window_id" in record and not isinstance(record["remote_window_id"], str))
     ):
         raise RuntimeError("Codex App Server owner record has invalid fields")
     return record
