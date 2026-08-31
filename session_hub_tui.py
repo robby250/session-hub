@@ -411,7 +411,9 @@ class RunningPane(Vertical):
                 "key": row.get("key") or row.get("session_key"),
                 "tmux_name": row.get("tmux_name") or row["name"],
                 "display": group["display_name"], "status_label": row.get("activity_label", ""),
-                "detail": row.get("activity_detail", ""), "age": row.get("age", ""),
+                # Status/activity detail is a separate state signal; the compact row's
+                # preview is exclusively the serialized provider-aware assistant text.
+                "detail": row.get("assistant_preview", ""), "age": row.get("age", ""),
             }
             for cwd, group in data.get("groups", {}).items()
             for row in group["rows"]
@@ -420,7 +422,7 @@ class RunningPane(Vertical):
             {
                 "kind": "standalone", "key": s["key"], "name": s["tmux_name"], "provider": s["provider"],
                 "tmux_name": s["tmux_name"], "display": s["title"], "status_label": s.get("activity_label", ""),
-                "detail": s.get("activity_detail", ""), "age": s.get("age", ""),
+                "detail": s.get("assistant_preview", ""), "age": s.get("age", ""),
             }
             for s in data.get("sessions", [])
             if not s["is_group"] and s["status"] == "Running"

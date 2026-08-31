@@ -100,7 +100,8 @@ class RunningPaneColumnsTests(unittest.IsolatedAsyncioTestCase):
                     "age": "8m ago",
                     "status": "Running",
                     "activity_label": "Needs input",
-                    "activity_detail": "approve   the plan?",
+                    "activity_detail": "status-only text must not render",
+                    "assistant_preview": "approve   the plan?",
                 }
             ],
             "groups": {},
@@ -114,10 +115,28 @@ class RunningPaneColumnsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(pane.rows), 1)
             self.assertEqual(pane.rows[0]["key"], "Claude:id-2")
             self.assertEqual(pane.rows[0]["tmux_name"], "demo-tmux")
+            self.assertEqual(pane.rows[0]["detail"], "approve   the plan?")
             text = pane._row_text({**pane.rows[0], "detail": "approve the plan?"})
             self.assertIn("demo-tmux", text)
             self.assertIn("8m ago", text)
             self.assertIn("approve the plan?", text)
+            self.assertNotIn("status-only text must not render", text)
+
+    async def test_running_preview_is_empty_when_serialized_field_is_missing(self):
+        fake_data = {
+            "sessions": [{
+                "is_group": False, "provider": "Codex", "title": "no-preview",
+                "key": "Codex:none", "tmux_name": "no-preview", "age": "now",
+                "status": "Running", "activity_label": "Working",
+            }], "groups": {},
+        }
+        pane = RunningPane()
+        app = _PaneHost(pane)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            pane.apply_sessions(fake_data)
+            await pilot.pause()
+            self.assertEqual(pane.rows[0]["detail"], "")
 
 
 _FAKE_SESSIONS = {
