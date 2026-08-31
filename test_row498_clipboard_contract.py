@@ -51,6 +51,11 @@ def main():
     assert tmpdir_index < tmux_pop_index < import_index
     assert "TMUX_TMPDIR" in ast.unparse(module[tmpdir_index])
     assert "TMUX" in ast.unparse(module[tmux_pop_index])
+    # The import-order check is intentionally process-wide: setting only TMUX_TMPDIR is a red
+    # control because tmux prefers inherited TMUX.  The production test must establish the
+    # owned tmpdir, remove TMUX, and only then import Qt/session_hub or spawn a child.
+    assert "tempfile.mkdtemp" in ast.unparse(module[tmpdir_index])
+    assert "None" in ast.unparse(module[tmux_pop_index])
 
     wrapper = next(node for node in ast.walk(test_tree)
                    if isinstance(node, ast.FunctionDef) and node.name == "_disposable_tmux_wrapper")
@@ -78,6 +83,27 @@ def main():
     assert "self.assertEqual(state(sentinel, sentinel_session), before)" in sentinel_source
     assert "run(fixture" in sentinel_source and "kill-server" in sentinel_source
     assert "run(sentinel" in sentinel_source and "kill-server" in sentinel_source
+    # The sentinel snapshot is deliberately multi-dimensional.  A PID-only assertion would miss
+    # a session/options/environment mutation that leaves the server process alive.
+    assert "display-message" in sentinel_literals
+    assert "list-sessions" in sentinel_literals
+    assert "show-options" in sentinel_literals
+    assert "show-environment" in sentinel_literals
+    assert "session_env" in sentinel_source
+    assert "before = state(sentinel, sentinel_session)" in sentinel_source
+    assert "state(sentinel, sentinel_session), before" in sentinel_source
+
+    lifecycle = next(node for node in ast.walk(test_tree)
+                     if isinstance(node, ast.FunctionDef)
+                     and node.name == "test_reconcile_tmux_desktop_env_real_lifecycle_survives_a_headless_attach")
+    lifecycle_source = ast.unparse(lifecycle)
+    # This is the causal negative/positive control: a later headless child is launched from a
+    # scrubbed env, while both real tmux endpoints remain explicit disposable -L wrappers.
+    assert "'env', '-i'" in lifecycle_source
+    assert "attach-session" in lifecycle_source
+    assert "TMUX" not in lifecycle_source.split("'env', '-i'", 1)[1].split("attach-session", 1)[0]
+    assert "_disposable_tmux_wrapper" in lifecycle_source
+    assert "detach-client" in lifecycle_source
     # The process-wide inherited socket selector must be cleared before any import or child.
     assert "os.environ.pop" in ast.unparse(module[tmux_pop_index])
     print("[Row498ClipboardContract] PASS structural isolation=TMUX-cleared-before-import -L sentinel=pid/sessions/options/env byte-identical")
