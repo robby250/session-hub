@@ -226,7 +226,8 @@ class RunningPaneColumnsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(pane.rows[0]["detail"], "approve   the plan?")
             text = pane._row_text({**pane.rows[0], "detail": "approve the plan?"})
             self.assertIn("demo-tmux", text)
-            self.assertIn("8m ago", text)
+            self.assertIn("8m", text)
+            self.assertNotIn("ago", text)
             self.assertIn("approve the plan?", text)
             self.assertEqual(text.count("\n"), 1)
             self.assertNotIn("status-only text must not render", text)
@@ -246,6 +247,44 @@ class RunningPaneColumnsTests(unittest.IsolatedAsyncioTestCase):
             pane.apply_sessions(fake_data)
             await pilot.pause()
             self.assertEqual(pane.rows[0]["detail"], "")
+
+
+class RunningCardPureContractTests(unittest.TestCase):
+    def row(self, **overrides):
+        row = {
+            "name": "a-very-long-running-session",
+            "provider": "Codex",
+            "display": "/projects/vampulse",
+            "detail": "a preview that should use all available lower-line width",
+        }
+        row.update(overrides)
+        return row
+
+    def test_phone_target_has_three_cells_but_card_text_has_two_lines(self):
+        item = session_hub_tui.RunningPane._render_item(
+            session_hub_tui.RunningPane.__new__(session_hub_tui.RunningPane),
+            self.row(age="0m"),
+        )
+        self.assertEqual(session_hub_tui.RUNNING_CARD_HEIGHT, 3)
+        self.assertEqual(item.classes, {"running-row"})
+        self.assertEqual(item.children[0].classes, {"running-card"})
+        self.assertEqual(item.children[0].renderable.count("\n"), 1)
+
+    def test_age_formats_only_compact_units_and_blank_stays_blank(self):
+        for raw, expected in (("now", "0m"), ("8m ago", "8m"), ("2h", "2h"), ("3d ago", "3d"), ("", "")):
+            self.assertEqual(session_hub_tui.compact_running_age(raw), expected)
+        self.assertEqual(session_hub_tui.compact_running_age("just now"), "0m")
+        self.assertEqual(session_hub_tui.compact_running_age("tomorrow"), "")
+
+    def test_age_reserves_only_its_actual_width_and_lower_line_uses_full_width(self):
+        row = self.row(age="12h")
+        narrow = session_hub_tui.running_card_lines(row, 18)
+        wide = session_hub_tui.running_card_lines(row, 60)
+        self.assertEqual(narrow[0][-3:], " 12h")
+        self.assertLess(len(narrow[0]), len(wide[0]))
+        self.assertLess(len(narrow[1]), len(wide[1]))
+        self.assertIn("Codex", narrow[1])
+        self.assertNotIn("ago", "\n".join(wide))
 
 
 _FAKE_SESSIONS = {

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -46,7 +47,66 @@ except ImportError:  # startup reports the pinned install command; tests can inj
 
 SESSION_HUB = Path(__file__).resolve().parent / "session_hub.py"
 PHONE_ROW_HEIGHT = 2
+RUNNING_CARD_HEIGHT = 3
 TEXTUAL_TERMINAL_INSTALL = "pip3 install --user --break-system-packages textual-terminal==0.3.0"
+
+
+def compact_running_age(value: object) -> str:
+    """Normalize the shared activity age for the two-line Running card."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if text in {"now", "just now"}:
+        return "0m"
+    match = re.fullmatch(r"(\d+)\s*([mhd])(?:\s+ago)?", text)
+    return f"{match.group(1)}{match.group(2)}" if match else ""
+
+
+def elide_running_text(value: object, width: int) -> str:
+    """Fit text to a card cell without reserving space for an imaginary column."""
+    text = " ".join(str(value or "").split())
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    return text[: width - 1] + "…"
+
+
+def running_card_lines(row: dict, content_width: int | None = None) -> tuple[str, str]:
+    """Return exactly two responsive lines for a selectable Running card."""
+    age = compact_running_age(row.get("age", ""))
+    name = " ".join(str(row.get("name", "")).split())
+    if content_width is None:
+        name_width = len(name)
+    else:
+        name_width = max(0, content_width - len(age) - (2 if age else 0))
+    first_name = elide_running_text(name, name_width)
+    first = f"{first_name}{f'  {age}' if age else ''}"
+    second = f"{row.get('provider', '')} · {row.get('display', '')}"
+    detail = " ".join(str(row.get("detail", "")).split())
+    if detail:
+        second += f" · {detail}"
+    return first, elide_running_text(second, content_width) if content_width is not None else second
+
+
+class RunningCard(Static):
+    """Two content lines inside a three-cell selectable ListItem target."""
+
+    def __init__(self, row: dict) -> None:
+        self.row = row
+        super().__init__("\n".join(running_card_lines(row)), classes="running-card")
+
+    def on_mount(self) -> None:
+        self._refresh_text()
+
+    def on_resize(self, _event: Resize) -> None:
+        self._refresh_text()
+
+    def _refresh_text(self) -> None:
+        width = self.content_size.width
+        self.update("\n".join(running_card_lines(self.row, width if width else None)))
 
 
 def run_cli(args: list[str], *, offscreen: bool = False) -> dict:
@@ -386,7 +446,8 @@ class RunningPane(Vertical):
     #running-list { height: 12; min-height: 5; border: round $panel; }
     #terminal-host { height: 1fr; min-height: 4; border: round $panel; }
     #terminal-empty { height: 1fr; content-align: center middle; color: $text-muted; }
-    .running-row { height: 2; padding: 0 1; }
+    .running-row { height: 3; padding: 0 1; }
+    .running-card { height: 2; content-align: left middle; }
     .running-group { height: 1; padding: 0 1; color: $text-muted; text-style: bold; }
     """
 
@@ -411,16 +472,13 @@ class RunningPane(Vertical):
         return str(row.get("key") or f"group:{row.get('cwd', '')}:{row.get('name', '')}")
 
     @staticmethod
-    def _row_text(row: dict) -> str:
-        detail = " ".join(str(row.get("detail", "")).split())
-        if len(detail) > 60:
-            detail = detail[:59] + "…"
-        age = str(row.get("age", ""))
-        first = row["name"] + (f"  {age}" if age else "")
-        second = f"{row['provider']} · {row['display']}"
-        if detail:
-            second += f" · {detail}"
-        return f"{first}\n{second}"
+    def _row_text(row: dict, content_width: int | None = None) -> str:
+        return "\n".join(running_card_lines(row, content_width))
+
+    def _render_item(self, row: dict) -> ListItem:
+        item = ListItem(RunningCard(row), classes="running-row")
+        item.name = self._identity(row)
+        return item
 
     def apply_sessions(self, data: dict) -> None:
         self.rows = [
@@ -456,20 +514,16 @@ class RunningPane(Vertical):
             heading_rows = groups.pop(heading, [])
             if not heading_rows:
                 continue
-            list_view.append(ListItem(Label(heading, classes="running-group")))
+            list_view.append(ListItem(Label(f"{heading} ({len(heading_rows)})", classes="running-group")))
             self._visible_rows.append(None)
             for row in heading_rows:
-                item = ListItem(Label(self._row_text(row), classes="running-row"))
-                item.name = self._identity(row)
-                list_view.append(item)
+                list_view.append(self._render_item(row))
                 self._visible_rows.append(row)
         for heading, rows in groups.items():
-            list_view.append(ListItem(Label(heading, classes="running-group")))
+            list_view.append(ListItem(Label(f"{heading} ({len(rows)})", classes="running-group")))
             self._visible_rows.append(None)
             for row in rows:
-                item = ListItem(Label(self._row_text(row), classes="running-row"))
-                item.name = self._identity(row)
-                list_view.append(item)
+                list_view.append(self._render_item(row))
                 self._visible_rows.append(row)
         # Activity labels remain in each compact row; preserve a stable order
         # while avoiding a second widget hierarchy that could steal height.
@@ -535,6 +589,7 @@ class RunningPane(Vertical):
         self.query_one("#running-list", ListView).focus()
 
     def on_resize(self, event: Resize) -> None:
+        # RunningCard recalculates its two lines from its actual content width.
         if self.adapter is not None:
             host = self.query_one("#terminal-host", Vertical)
             size = host.content_size
