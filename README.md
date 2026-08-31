@@ -30,8 +30,9 @@ A small Linux desktop launcher for local Codex, Claude Code, and Antigravity ses
 - PyQt6
 - GNOME Terminal
 - Codex, Claude Code, and/or Antigravity CLI installed
-- tmux, and [Textual](https://textual.textualize.io/) (only for `session-hub-tui`, the phone/SSH
-  TUI — install with `pip3 install --user --break-system-packages textual`)
+- tmux, [Textual](https://textual.textualize.io/), and the maintained OSS
+  [`textual-terminal`](https://github.com/mitosch/textual-terminal) adapter pinned at 0.3.0
+  (install with `pip3 install --user --break-system-packages textual-terminal==0.3.0`)
 
 ## Install
 
@@ -63,8 +64,9 @@ session-hub-tui
 
 It mirrors the desktop app: a main session list, a flat "Running" tab (tmux-launched rows only) with
 Attach/Launch/Stop, and a "Usage" tab with the same Codex/Claude/Antigravity usage bars as the desktop
-panel, stacked in one column. Selecting a running session hands off to `tmux attach` directly —
-detaching (`Ctrl-b d`) ends the SSH connection; reconnect to see the menu again.
+panel, stacked in one column. Selecting a running session keeps one maintained OSS
+`textual-terminal==0.3.0` widget attached to the exact tmux identity; `Ctrl-L` returns focus to
+the list and detaching (`Ctrl-b d`) leaves the menu available.
 
 Session Hub metadata and recoverable trash are stored in
 `~/.local/share/session-hub/`.

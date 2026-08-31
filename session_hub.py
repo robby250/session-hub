@@ -4570,6 +4570,20 @@ def _transcript_last_assistant_text(path: Path, provider: str) -> str:
     return _transcript_last_assistant_record(path, provider)[0]
 
 
+_TUI_ASSISTANT_PREVIEW_MAX = 240
+
+
+def serialized_assistant_preview(session: Session | None) -> str:
+    """Bounded provider-aware assistant preview for the headless Running TUI."""
+    if session is None:
+        return ""
+    text, _message_ms = _transcript_last_assistant_record(session.path, session.provider)
+    compact = " ".join(text.split())
+    if len(compact) > _TUI_ASSISTANT_PREVIEW_MAX:
+        return compact[: _TUI_ASSISTANT_PREVIEW_MAX - 1] + "…"
+    return compact
+
+
 def _codex_activity(session: "Session", status: dict | None) -> tuple[str, str]:
     """Codex activity verdict: `notify` only ever proves turn completion
     (hook_event_to_status_codex), so "working" has to come from the rollout
@@ -11451,6 +11465,8 @@ def sessions_json_cli() -> int:
             rows_out.append(
                 {
                     "name": row["name"],
+                    "key": match.native_key if match else row.get("session_key"),
+                    "tmux_name": resolved_name,
                     "provider": row.get("provider", "Claude"),
                     # Liveness (process/tmux) - separate fact from activity below.
                     "status": (
@@ -11460,6 +11476,8 @@ def sessions_json_cli() -> int:
                     "activity": activity_state,
                     "activity_label": activity_label(activity_state)[0],
                     "activity_detail": activity_detail,
+                    "assistant_preview": serialized_assistant_preview(match),
+                    "age": relative_activity_age(match.updated_ms) if match else "",
                 }
             )
         groups[cwd] = {
@@ -11499,6 +11517,8 @@ def sessions_json_cli() -> int:
             "activity": activity_state,
             "activity_label": activity_label(activity_state)[0],
             "activity_detail": activity_detail,
+            "assistant_preview": serialized_assistant_preview(item),
+            "age": relative_activity_age(item.updated_ms),
         }
 
     print(
