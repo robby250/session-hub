@@ -4693,20 +4693,24 @@ def activity_label(state: str | None) -> tuple[str, str]:
 
 
 def relative_activity_age(updated_ms: int, now: float | None = None) -> str:
-    """Compact human age for a transcript's latest agent activity."""
+    """Shortest bounded age label for a transcript's latest agent activity.
+
+    This deliberately has no prose suffix: the Running card reserves a small rectangle for
+    exactly ``0m``/``Nm``/``Nh``/``Nd`` so the label cannot collide with the identity stack.
+    """
     if not updated_ms:
         return ""
     seconds = max(0, int((now if now is not None else time.time()) - updated_ms / 1000))
     if seconds < 60:
-        return "just now"
+        return "0m"
     minutes = seconds // 60
     if minutes < 60:
-        return f"{minutes}m ago"
+        return f"{minutes}m"
     hours = minutes // 60
     if hours < 24:
-        return f"{hours}h ago"
+        return f"{hours}h"
     days = hours // 24
-    return f"{days}d ago"
+    return f"{days}d"
 
 
 def bounded_tooltip(text: str) -> str:
@@ -4739,20 +4743,26 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
         line_h = fm.height()
         pen = opt.palette.highlightedText() if opt.state & QStyle.StateFlag.State_Selected else opt.palette.text()
         painter.setPen(pen.color())
-        top_rect = QRect(rect.left(), rect.top(), rect.width(), line_h)
+        age_width = fm.horizontalAdvance(age) + 8 if age else 0
+        text_width = max(0, rect.width() - age_width)
+        # Clip the custom paint to the cell and elide each identity line independently.  In
+        # particular, a long name must not paint underneath the age or into Last message.
+        painter.setClipRect(rect)
+        top_rect = QRect(rect.left(), rect.top(), text_width, line_h)
+        name = fm.elidedText(lines[0] if lines else "", Qt.TextElideMode.ElideRight, text_width)
         painter.drawText(
-            top_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, lines[0] if lines else ""
+            top_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name
         )
         if age:
-            age_width = fm.horizontalAdvance(age) + 4
-            age_rect = QRect(rect.right() - age_width, rect.top(), age_width, line_h)
+            age_rect = QRect(rect.right() - age_width + 1, rect.top(), age_width - 1, line_h)
             painter.setPen(QColor("#9aa0a6"))
             painter.drawText(age_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, age)
             painter.setPen(pen.color())
         if len(lines) > 1:
-            sub_rect = QRect(rect.left(), rect.top() + line_h, rect.width(), line_h)
+            sub_rect = QRect(rect.left(), rect.top() + line_h, text_width, line_h)
             painter.setPen(QColor("#9aa0a6"))
-            painter.drawText(sub_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, lines[1])
+            subtitle = fm.elidedText(lines[1], Qt.TextElideMode.ElideRight, text_width)
+            painter.drawText(sub_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, subtitle)
         painter.restore()
 
 
@@ -7834,13 +7844,16 @@ class SessionHub(QMainWindow):
         self.running_table.setShowGrid(False)
         self.running_table.verticalHeader().setDefaultSectionSize(62)
         self.running_table.verticalHeader().setVisible(False)
-        self.running_table.horizontalHeader().setStretchLastSection(False)
-        for column in range(2):
-            self.running_table.horizontalHeader().setSectionResizeMode(
-                column, QHeaderView.ResizeMode.Interactive
-            )
-        self.running_table.setColumnWidth(0, 185)
-        self.running_table.setColumnWidth(1, 410)
+        # The identity card keeps a usable minimum while Last message owns all recovered width;
+        # stretching the second section also adapts correctly to phone-sized remote windows.
+        self.running_table.horizontalHeader().setStretchLastSection(True)
+        self.running_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Interactive
+        )
+        self.running_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self.running_table.setColumnWidth(0, 240)
         # _v2: task-2191 dropped the Status column (three sections to two) -- a
         # pre-existing three-section blob restored onto the new two-section header
         # scrambles widths (the same class of bug _v2 fixed for `main_table_columns_v2`
@@ -8832,7 +8845,8 @@ class SessionHub(QMainWindow):
                 name_item.setData(
                     Qt.ItemDataRole.AccessibleTextRole,
                     f"{visible_name}, {provider} · {display_name}, {label or 'Unknown'}"
-                    + (f", {age}" if age else ""),
+                    + (f", {age}" if age else "")
+                    + (f", {last_message}" if last_message else ""),
                 )
                 name_item.setToolTip(
                     bounded_tooltip(f"{provider} · {display_name} · {cwd}")
