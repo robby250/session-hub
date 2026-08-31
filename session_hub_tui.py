@@ -484,6 +484,15 @@ class RunningPane(Vertical):
     def _close_adapter(self) -> None:
         if self.adapter is not None:
             self.adapter.close()
+        # Keep the retained terminal surface mounted, but make a disappeared selection visibly
+        # empty.  The list and host stay alive so a later activation can reuse this one surface.
+        try:
+            empty = self.query_one("#terminal-empty", Static)
+            empty.update("Select a running session")
+        except Exception:
+            # Pure adapter controls use a host stub without Textual's Static; real panes always
+            # have the mounted widget and therefore take the update path above.
+            pass
 
     def selected(self) -> dict | None:
         list_view = self.query_one("#running-list", ListView)
@@ -516,6 +525,10 @@ class RunningPane(Vertical):
             self.notify(str(exc), severity="error")
             return
         self.selected_key = identity
+        try:
+            self.query_one("#terminal-empty", Static).update("")
+        except Exception:
+            pass
         adapter.widget.focus()
 
     def action_focus_list(self) -> None:

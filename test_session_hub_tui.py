@@ -86,12 +86,23 @@ class _FakeHost:
         self.mounted.append(widget)
 
 
+class _FakeEmpty:
+    def __init__(self):
+        self.text = "Select a running session"
+
+    def update(self, text):
+        self.text = text
+
+
 class RunningPaneLifecycleControlsTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         _FakeAdapter.instances.clear()
         self.host = _FakeHost()
+        self.empty = _FakeEmpty()
         self.pane = session_hub_tui.RunningPane(adapter_factory=_FakeAdapter)
-        self.pane.query_one = lambda _selector, *_types: self.host
+        def query_one(selector, *_types):
+            return self.empty if selector == "#terminal-empty" else self.host
+        self.pane.query_one = query_one
 
     @staticmethod
     def row(key, name):
@@ -119,6 +130,11 @@ class RunningPaneLifecycleControlsTests(unittest.IsolatedAsyncioTestCase):
         self.pane._close_adapter()
         self.assertIsNotNone(self.pane.adapter)
         self.assertEqual(len(self.host.mounted), 1)  # app/surface remains alive
+        self.assertEqual(self.empty.text, "Select a running session")
+        await self.pane._switch_terminal(self.row("Codex:back", "back"))
+        self.assertEqual(self.empty.text, "")
+        self.assertEqual(len(_FakeAdapter.instances), 1)  # reactivation reuses the surface/client
+        self.assertEqual(self.pane.adapter.switches, ["back"])
         self.pane.on_resize(SimpleNamespace(size=SimpleNamespace(width=1, height=1)))
         self.assertEqual(self.pane.adapter.resizes, [(80, 20)])
         self.pane.on_unmount()
