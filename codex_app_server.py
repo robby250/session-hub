@@ -28,8 +28,16 @@ def app_server_argv(endpoint: Path, cwd: str) -> list[str]:
     return ["codex", "app-server", "--listen", f"unix://{endpoint}"]
 
 
-def remote_tui_argv(endpoint: Path, thread_id: str, cwd: str) -> list[str]:
-    return ["codex", "--remote", f"unix://{endpoint}", "--cd", cwd, "resume", thread_id]
+def remote_tui_argv(endpoint: Path, thread_id: str | None, cwd: str) -> list[str]:
+    """Build a remote client command, resuming only an existing saved thread.
+
+    A fresh Codex row has no thread id yet; omitting ``resume`` asks the remote
+    client to create its first thread instead of emitting the invalid ``resume ""``.
+    """
+    argv = ["codex", "--remote", f"unix://{endpoint}", "--cd", cwd]
+    if thread_id:
+        argv += ["resume", thread_id]
+    return argv
 
 
 def publish_record(path: Path, *, row_id: str, endpoint: Path, thread_id: str, process: subprocess.Popen) -> dict:
@@ -92,6 +100,30 @@ def record_for_row(row_id: str, registry_dir: Path = REGISTRY_DIR) -> Path | Non
     if len(matches) > 1:
         raise RuntimeError("Multiple Codex App Server owner records for row")
     return matches[0] if matches else None
+
+
+def discard_stale_record(path: Path, *, row_id: str) -> bool:
+    """Remove one dead owner record after proving its row/path binding.
+
+    This is deliberately not a stop operation: a stale PID is never signalled.
+    The endpoint is removed only when the record's schema, row id, registry
+    directory, and filename-derived socket name all agree.
+    """
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    if record.get("schema") != SCHEMA_VERSION or record.get("row_id") != row_id:
+        return False
+    try:
+        endpoint = Path(record["endpoint"])
+    except (KeyError, TypeError):
+        return False
+    if endpoint.parent != path.parent or endpoint.name != f"{path.stem}.sock":
+        return False
+    path.unlink(missing_ok=True)
+    endpoint.unlink(missing_ok=True)
+    return True
 
 
 def stop_owned_for_row(row_id: str, registry_dir: Path = REGISTRY_DIR) -> bool:

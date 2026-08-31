@@ -32,8 +32,8 @@ from terminal_profile import (  # noqa: E402  (see terminal_profile.py -- shared
 from datetime import date, datetime
 from pathlib import Path
 from codex_app_server import (
-    REGISTRY_DIR, app_server_argv, endpoint_for, publish_record, remote_tui_argv,
-    stop_owned, stop_owned_for_row, wait_ready,
+    REGISTRY_DIR, app_server_argv, discard_stale_record, endpoint_for, publish_record,
+    record_for_row, remote_tui_argv, stop_owned, stop_owned_for_row, wait_ready,
 )
 
 from PyQt6.QtCore import (
@@ -10223,7 +10223,9 @@ class SessionHub(QMainWindow):
             terminal = shutil.which("gnome-terminal") or shutil.which("x-terminal-emulator")
             if not terminal:
                 raise RuntimeError("No supported terminal emulator was found.")
-            args = remote_tui_argv(endpoint, session_id or "", cwd)
+            # Existing rows resume their saved thread; a fresh row omits `resume`
+            # so the remote client creates its first thread instead of `resume ""`.
+            args = remote_tui_argv(endpoint, session_id, cwd)
             command = [terminal, "--window", "--", *args] if Path(terminal).name == "gnome-terminal" else [terminal, "-e", shlex.join(args)]
             self.spawn(command, session_key, cwd=cwd, focus=focus)
         except Exception:
@@ -10243,14 +10245,24 @@ class SessionHub(QMainWindow):
             try:
                 stop_owned(record_path, row_id=row_id)
             except (OSError, RuntimeError, ValueError):
-                process.terminate()
-                record_path.unlink(missing_ok=True)
+                # A stale persisted identity must never be signalled.  Remove its
+                # record only after codex_app_server validates the row/path binding;
+                # the in-memory child is terminated only while its own PID is live.
+                discard_stale_record(record_path, row_id=row_id)
+                if getattr(process, "poll", lambda: 0)() is None:
+                    process.terminate()
             return
         try:
             stop_owned_for_row(row_id)
         except (OSError, RuntimeError, ValueError):
-            # A stale/ambiguous record is fail-closed: do not kill an arbitrary PID.
-            return
+            # A stale single record can be retired after binding validation; an
+            # ambiguous set remains untouched and fail-closed.
+            try:
+                record_path = record_for_row(row_id)
+                if record_path:
+                    discard_stale_record(record_path, row_id=row_id)
+            except (OSError, RuntimeError, ValueError):
+                pass
 
     def stop_all_codex_app_servers(self) -> None:
         for row_id in list(self._codex_app_servers):

@@ -5,8 +5,12 @@ import ast
 import inspect
 import json
 import os
+import socket
 import stat
+import subprocess
 import tempfile
+import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,7 +18,9 @@ import codex_app_server
 from codex_app_server import (
     SCHEMA_VERSION,
     app_server_argv,
+    publish_record,
     endpoint_for,
+    discard_stale_record,
     live_record,
     record_for_row,
     remote_tui_argv,
@@ -29,6 +35,121 @@ class FakeProcess:
 
     def terminate(self):
         self.terminated = True
+
+
+def _fake_server(endpoint: Path) -> subprocess.Popen:
+    """Start a local Unix listener; no Codex, Qt, tmux, or network is involved."""
+    code = (
+        "import socket, sys, time\n"
+        "s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "s.bind(sys.argv[1]); s.listen(); s.settimeout(0.1)\n"
+        "while True:\n"
+        "  try: c,_=s.accept(); c.close()\n"
+        "  except TimeoutError: pass\n"
+    )
+    return subprocess.Popen([os.environ.get("PYTHON", "python3"), "-c", code, str(endpoint)])
+
+
+def _stop_fake_server(process: subprocess.Popen) -> None:
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2)
+
+
+def _fake_lifecycle_control() -> None:
+    """Exercise readiness, atomic records, restart identity, and stale cleanup with fakes."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        endpoint_a = endpoint_for("row-a", root)
+        endpoint_b = endpoint_for("row-b", root)
+        assert endpoint_a != endpoint_b and endpoint_a.parent == endpoint_b.parent == root
+        server_a = _fake_server(endpoint_a)
+        server_b = _fake_server(endpoint_b)
+        record_a = endpoint_a.with_suffix(".json")
+        record_b = endpoint_b.with_suffix(".json")
+        try:
+            assert codex_app_server.wait_ready(endpoint_a, timeout=1.0)
+            assert codex_app_server.wait_ready(endpoint_b, timeout=1.0)
+            observed_partial = []
+            observing = True
+
+            def observe_publication():
+                while observing:
+                    if record_a.exists():
+                        try:
+                            json.loads(record_a.read_text())
+                        except json.JSONDecodeError:
+                            observed_partial.append(True)
+
+            observer = threading.Thread(target=observe_publication)
+            observer.start()
+            saved_a = publish_record(record_a, row_id="row-a", endpoint=endpoint_a,
+                                     thread_id="thread-a", process=server_a)
+            observing = False
+            observer.join(timeout=1)
+            saved_b = publish_record(record_b, row_id="row-b", endpoint=endpoint_b,
+                                     thread_id="thread-b", process=server_b)
+            assert not observed_partial
+            assert record_a.exists() and record_b.exists()
+            assert not list(root.glob(".*.tmp")), "atomic publication leaked a temp record"
+            assert remote_tui_argv(endpoint_a, saved_a["thread_id"], "/tmp")[-2:] == ["resume", "thread-a"]
+            assert remote_tui_argv(endpoint_a, None, "/tmp") == [
+                "codex", "--remote", f"unix://{endpoint_a}", "--cd", "/tmp"
+            ]
+
+            # Restart gets a new private endpoint but reuses the saved thread id exactly.
+            stop_owned(record_a, row_id="row-a")
+            endpoint_a2 = endpoint_for("row-a", root)
+            server_a2 = _fake_server(endpoint_a2)
+            record_a2 = endpoint_a2.with_suffix(".json")
+            try:
+                assert endpoint_a2 != endpoint_b and codex_app_server.wait_ready(endpoint_a2, timeout=1.0)
+                restarted = publish_record(record_a2, row_id="row-a", endpoint=endpoint_a2,
+                                            thread_id=saved_a["thread_id"], process=server_a2)
+                assert remote_tui_argv(endpoint_a2, restarted["thread_id"], "/tmp")[-1] == "thread-a"
+            finally:
+                stop_owned(record_a2, row_id="row-a")
+
+            # A readiness failure publishes nothing and therefore cannot launch a remote client.
+            missing = endpoint_for("row-missing", root)
+            remote_calls = []
+            if codex_app_server.wait_ready(missing, timeout=0.05):
+                remote_calls.append(remote_tui_argv(missing, None, "/tmp"))
+            assert remote_calls == [] and not missing.with_suffix(".json").exists()
+
+            # Binding validation permits stale cleanup but never accepts an ambiguous owner set.
+            stale_endpoint = endpoint_for("row-stale", root)
+            stale_record = stale_endpoint.with_suffix(".json")
+            stale_endpoint.touch()
+            stale_record.write_text(json.dumps({
+                "schema": SCHEMA_VERSION, "row_id": "row-stale",
+                "endpoint": str(stale_endpoint), "pid": os.getpid(), "start_time": "",
+            }))
+            assert codex_app_server.discard_stale_record(stale_record, row_id="row-stale")
+            assert not stale_record.exists() and not stale_endpoint.exists()
+            first = root / "ambiguous-1.json"
+            second = root / "ambiguous-2.json"
+            for path in (first, second):
+                endpoint = path.with_suffix(".sock")
+                endpoint.touch()
+                path.write_text(json.dumps({
+                    "schema": SCHEMA_VERSION, "row_id": "row-ambiguous",
+                    "endpoint": str(endpoint), "pid": os.getpid(), "start_time": "",
+                }))
+            try:
+                record_for_row("row-ambiguous", root)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("ambiguous owner set was accepted")
+            assert first.exists() and second.exists()
+        finally:
+            observing = False
+            for process in (server_a, server_b):
+                _stop_fake_server(process)
 
 
 def _record(path: Path, endpoint: Path, row_id: str):
@@ -56,6 +177,9 @@ def main() -> int:
         assert tui[-2:] == ["resume", "thread-123"]
         # A restart rebuilds argv from the same saved thread, never a replacement id.
         assert remote_tui_argv(endpoint, "thread-123", "/tmp/project") == tui
+        assert remote_tui_argv(endpoint, None, "/tmp/project") == [
+            "codex", "--remote", f"unix://{endpoint}", "--cd", "/tmp/project"
+        ]
         assert "tmux" not in " ".join(tui)
 
         record = _record(record_path, endpoint, "group:/tmp/project#VAMP-worker5")
@@ -108,9 +232,12 @@ def main() -> int:
         else:
             raise AssertionError("ambiguous owner records were accepted")
 
+    _fake_lifecycle_control()
+
     source = inspect.getsource(codex_app_server)
     assert "wait_ready" in source and "not record.get(\"start_time\")" in source
     assert "endpoint.name != f\"{path.stem}.sock\"" in source
+    assert "os.replace(tmp, path)" in source and "discard_stale_record" in source
 
     # Mutation control: readiness must precede publication and remote-client launch.
     hub_source = Path(__file__).with_name("session_hub.py").read_text()
@@ -141,7 +268,7 @@ def main() -> int:
         if isinstance(call, ast.Call)
     )
     assert "stop_all_codex_app_servers" in hub_source
-    print("[CodexAppServerCheck] PASS readiness-before-publish exact-thread atomic-registry stale/cross-row-fail-closed lifecycle-owned")
+    print("[CodexAppServerCheck] PASS fake readiness/failure unique-endpoint restart-thread atomic-publication stale-cleanup fresh-row-client lifecycle-owned")
     return 0
 
 
