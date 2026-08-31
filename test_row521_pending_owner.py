@@ -65,6 +65,16 @@ def main():
     # or routes through group_row_candidates, which does the same before matching.
     for consumer in ("discover_sessions", "group_row_candidates", "refresh_running_tab", "sessions_json_cli"):
         assert call_lines(funcs[consumer], "resolve_pending_codex_group_rows"), consumer
+    discover_body = funcs["discover_sessions"]
+    assert call_lines(discover_body, "compute_codex_tmux_owner_census")
+    assert any(
+        any(keyword.arg == "tmux_owner_by_native_key" for keyword in node.keywords)
+        for node in ast.walk(discover_body)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "resolve_pending_codex_group_rows"
+    )
+    assert not call_lines(discover_body, "codex_tmux_native_key")
     assert "tmux_owner_by_native_key" in {
         arg.arg for arg in funcs["group_row_candidates"].args.kwonlyargs
     } or "tmux_owner_by_native_key" in {
@@ -80,6 +90,11 @@ def main():
             and isinstance(node.func, ast.Name)
             and node.func.id == "resolve_pending_codex_group_rows"
         )
+
+    # A multi-row discovery pass receives one shared census map; the one-name
+    # subprocess lookup remains available only to explicitly map-less direct callers.
+    assert "tmux_owner_by_native_key=tmux_owner_by_native_key" in ast.unparse(discover_body)
+    assert "if tmux_owner_by_native_key is None" in ast.unparse(discover_body)
 
     # Launch must repair before it clears a pending marker; otherwise an exact owner is
     # converted into a fresh duplicate before the shared resolver can see it.

@@ -3077,7 +3077,11 @@ def pending_codex_exact_owner(
     return match
 
 
-def discover_sessions(metadata: dict) -> list[Session]:
+def discover_sessions(
+    metadata: dict,
+    *,
+    tmux_owner_by_native_key: dict[str, str] | None = None,
+) -> list[Session]:
     settings = metadata.get("settings", {})
     sessions = []
     if settings.get("enable_codex", True):
@@ -3086,8 +3090,14 @@ def discover_sessions(metadata: dict) -> list[Session]:
         sessions += claude_sessions()
     if settings.get("enable_antigravity", True):
         sessions += antigravity_sessions()
+    if tmux_owner_by_native_key is None:
+        # One batched pane/native-key census is the authority for every pending
+        # row in this discovery pass; never fall back to one tmux subprocess per row.
+        tmux_owner_by_native_key = compute_codex_tmux_owner_census()
     changed = sync_group_row_names(metadata)
-    if resolve_pending_codex_group_rows(metadata, sessions):
+    if resolve_pending_codex_group_rows(
+        metadata, sessions, tmux_owner_by_native_key=tmux_owner_by_native_key
+    ):
         changed = True
     if resolve_pending_links(metadata, sessions):
         changed = True
@@ -8604,7 +8614,10 @@ class SessionHub(QMainWindow):
         # this method.
         reconcile_tmux_desktop_env(self.desktop_clipboard_env_overrides())
         self.metadata = read_metadata()
-        self.sessions = discover_sessions(self.metadata)
+        tmux_owner_by_native_key = compute_codex_tmux_owner_census()
+        self.sessions = discover_sessions(
+            self.metadata, tmux_owner_by_native_key=tmux_owner_by_native_key
+        )
         self._search_member_rows = [
             (cwd, row["name"], row.get("session_key"), row.get("provider", "Claude"),
              group.get("display_name") or Path(cwd).name or cwd)
@@ -8616,9 +8629,11 @@ class SessionHub(QMainWindow):
             self.SESSION_TABLE_COLUMNS.index("Last updated"), Qt.SortOrder.DescendingOrder
         )
         self.apply_filter()
-        self.refresh_running_tab()
+        self.refresh_running_tab(tmux_owner_by_native_key=tmux_owner_by_native_key)
 
-    def refresh_running_tab(self) -> None:
+    def refresh_running_tab(
+        self, *, tmux_owner_by_native_key: dict[str, str] | None = None,
+    ) -> None:
         """Flat list of every currently-running tmux group row, across every project.
 
         Reuses group_row_status/tmux_session_alive - the exact same signal
@@ -8645,7 +8660,11 @@ class SessionHub(QMainWindow):
         # Recomputed fresh every refresh (never cached across calls), so a rollout
         # that moves to a different live tmux session is re-resolved on the very
         # next tick and no stale owner can survive into it (replacement control).
-        tmux_name_by_native_key = compute_codex_tmux_owner_census()
+        tmux_name_by_native_key = (
+            tmux_owner_by_native_key
+            if tmux_owner_by_native_key is not None
+            else compute_codex_tmux_owner_census()
+        )
         if resolve_pending_codex_group_rows(
             self.metadata, live, tmux_owner_by_native_key=tmux_name_by_native_key
         ):
@@ -11368,7 +11387,8 @@ def sessions_json_cli() -> int:
     diagnostic().
     """
     metadata = read_metadata()
-    sessions = discover_sessions(metadata)
+    tmux_name_by_native_key = compute_codex_tmux_owner_census()
+    sessions = discover_sessions(metadata, tmux_owner_by_native_key=tmux_name_by_native_key)
     settings = metadata.get("settings", {})
     live: list[Session] = []
     if settings.get("enable_codex", True):
@@ -11384,7 +11404,6 @@ def sessions_json_cli() -> int:
     # task-2156: same shared batched identity view refresh_running_tab uses, so the
     # TUI/JSON path stops reading a live-but-externally-renamed row as Stopped/
     # unknown too (the brief names this path explicitly).
-    tmux_name_by_native_key = compute_codex_tmux_owner_census()
     if resolve_pending_codex_group_rows(
         metadata, live, tmux_owner_by_native_key=tmux_name_by_native_key
     ):
