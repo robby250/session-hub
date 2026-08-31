@@ -11831,6 +11831,11 @@ def sessions_json_cli() -> int:
     """
     metadata = read_metadata()
     tmux_name_by_native_key = compute_codex_tmux_owner_census()
+    # Keep the headless/TUI snapshot on the same authority as refresh_running_tab.
+    # A managed Codex remote client does not have to expose its rollout through a
+    # transcript FD, so the pane census can legitimately miss it even while the
+    # App Server registry proves the exact row -> tmux owner live.
+    codex_owner_by_row_id = live_remote_owner_names()
     sessions = discover_sessions(metadata, tmux_owner_by_native_key=tmux_name_by_native_key)
     settings = metadata.get("settings", {})
     live: list[Session] = []
@@ -11874,10 +11879,15 @@ def sessions_json_cli() -> int:
             )
             if match:
                 claimed.add(match.native_key)
-            resolved_name = (
-                tmux_name_by_native_key.get(match.native_key)
-                if match and match.provider == "Codex" else row["name"]
-            )
+            row_provider = row.get("provider", "Claude")
+            row_id = row.get("override_key") or f"group:{cwd}#{row['name']}"
+            registry_name = codex_owner_by_row_id.get(row_id)
+            if row_provider == "Codex" and registry_name in live_names:
+                resolved_name = registry_name
+            elif match and match.provider == "Codex":
+                resolved_name = tmux_name_by_native_key.get(match.native_key)
+            else:
+                resolved_name = row["name"]
             # task-2156 REWORK #2 (18be076): a matched Codex row whose exact native key is
             # missing/ambiguous must fail closed -- never guess the saved row name is the live
             # owner, since that name can itself be a live tmux session under an unrelated

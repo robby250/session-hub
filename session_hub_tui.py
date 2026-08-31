@@ -498,6 +498,13 @@ class UsagePane(VerticalScroll):
     BINDINGS = [("r", "refresh", "Refresh")]
     PROVIDERS = ("Codex", "Claude", "Antigravity")
 
+    @staticmethod
+    def _visible_windows(provider: str, windows: list[dict]) -> list[dict]:
+        """Omit Spark's redundant model-specific quota rows from the phone TUI."""
+        if provider != "Codex":
+            return windows
+        return [window for window in windows if "spark" not in str(window.get("name", "")).lower()]
+
     def __init__(self) -> None:
         super().__init__()
         self.data: dict = {}
@@ -543,7 +550,7 @@ class UsagePane(VerticalScroll):
             if info.get("error"):
                 await self.mount(Label(f"Unavailable: {info['error']}", classes="usage-detail"))
                 continue
-            for window in info.get("windows", []):
+            for window in self._visible_windows(provider, info.get("windows", [])):
                 remaining = 100 - window["used_percent"]
                 await self.mount(Label(f"{window['name']} — {remaining}% left ({window['used_percent']}% used)"))
                 bar = ProgressBar(total=100, show_eta=False)

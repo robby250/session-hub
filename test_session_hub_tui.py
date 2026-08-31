@@ -167,6 +167,18 @@ class RunningCardPureContractTests(unittest.TestCase):
         tiny, _ = session_hub_tui.running_card_lines(row, 2)
         self.assertLessEqual(len(tiny), 2)
 
+    def test_usage_hides_only_spark_quota_windows(self):
+        windows = [
+            {"name": "Weekly"},
+            {"name": "GPT-5.3-Codex-Spark 5-hour"},
+            {"name": "GPT-5.3-Codex-Spark Weekly"},
+        ]
+        self.assertEqual(
+            session_hub_tui.UsagePane._visible_windows("Codex", windows),
+            [{"name": "Weekly"}],
+        )
+        self.assertEqual(session_hub_tui.UsagePane._visible_windows("Claude", windows), windows)
+
 
 _FAKE_SESSIONS = {
     "sessions": [
