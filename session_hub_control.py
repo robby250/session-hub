@@ -183,8 +183,12 @@ class SessionHubController:
         self.registry_dir.mkdir(parents=True, exist_ok=True)
         endpoint = endpoint_for(row_id, self.registry_dir)
         record_path = endpoint.with_suffix(".json")
-        server = self.popen(app_server_argv(endpoint, cwd), cwd=cwd,
-                            env={k: v for k, v in os.environ.items() if k != "TMUX"})
+        server = self.popen(
+            app_server_argv(endpoint, cwd), cwd=cwd,
+            env={k: v for k, v in os.environ.items() if k != "TMUX"},
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True, start_new_session=True,
+        )
         try:
             if not wait_ready(endpoint):
                 raise ControlError("Codex App Server did not become ready")

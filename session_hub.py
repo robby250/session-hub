@@ -7123,6 +7123,9 @@ class ManageGroupDialog(QDialog):
             action.triggered.connect(slot)
             menu.addAction(action)
         menu.addSeparator()
+        stop_action = QAction("Stop session", self)
+        stop_action.triggered.connect(lambda: self.hub.stop_group_row(self.cwd, row["name"]))
+        menu.addAction(stop_action)
         remove_action = QAction("Remove from group", self)
         remove_action.triggered.connect(lambda: self.remove_row(row["name"]))
         menu.addAction(remove_action)
@@ -8952,9 +8955,28 @@ class SessionHub(QMainWindow):
         # running headless forever.
         row_id = self.codex_app_server_row_id(cwd, name, _session_id)
         if row_id:
-            self.stop_codex_app_server(row_id)
-        stop_tmux_session(tmux_name)
+            result = self.stop_group_row(cwd, name)
+            if result.get("status") == "error":
+                QMessageBox.critical(self, "Could not stop session", result["message"])
+                return
+        else:
+            stop_tmux_session(tmux_name)
         self.refresh_running_tab()
+
+    def stop_group_row(self, cwd: str, name: str) -> dict:
+        """Stop a managed row through its provider-aware lifecycle boundary."""
+        group = self.metadata.get("groups", {}).get(cwd) or {}
+        row = next((item for item in group.get("rows", []) if item.get("name") == name), None)
+        if not row:
+            return {"status": "error", "message": f"No row named {name!r} in this group"}
+        if row.get("provider") == "Codex":
+            from session_hub_control import ControlError, SessionHubController
+            try:
+                return SessionHubController(METADATA_PATH).stop(cwd, name)
+            except (ControlError, OSError, RuntimeError, ValueError) as error:
+                return {"status": "error", "message": str(error)}
+        stop_tmux_session(name)
+        return {"status": "stopped", "name": name}
 
     def codex_app_server_row_id(
         self, cwd: str | None, name: str | None, session_id: str | None = None
@@ -10257,7 +10279,11 @@ class SessionHub(QMainWindow):
         self.stop_codex_app_server(row_id)
         endpoint = endpoint_for(row_id)
         record_path = REGISTRY_DIR / f"{endpoint.stem}.json"
-        server = subprocess.Popen(app_server_argv(endpoint, cwd), cwd=source_cwd or cwd)
+        server = subprocess.Popen(
+            app_server_argv(endpoint, cwd), cwd=source_cwd or cwd,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True, start_new_session=True,
+        )
         self._codex_app_servers[row_id] = (server, record_path)
         try:
             if not wait_ready(endpoint):
@@ -11806,10 +11832,16 @@ def stop_group_row_cli(argv: list[str]) -> int:
         print(json.dumps({"status": "error", "message": f"No row named {name!r} in group {cwd!r}."}))
         return 1
     if row.get("provider") == "Codex":
-        stop_owned_for_row(row.get("override_key") or row.get("session_key") or name)
-    stop_tmux_session(name)
-    print(json.dumps({"status": "ok"}))
-    return 0
+        from session_hub_control import ControlError, SessionHubController
+        try:
+            result = SessionHubController(METADATA_PATH).stop(cwd, name)
+        except (ControlError, OSError, RuntimeError, ValueError) as error:
+            result = {"status": "error", "message": str(error)}
+    else:
+        stop_tmux_session(name)
+        result = {"status": "stopped", "name": name}
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result.get("status") != "error" else 1
 
 
 def stop_session_cli(argv: list[str]) -> int:
