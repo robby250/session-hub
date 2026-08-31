@@ -12065,6 +12065,35 @@ class RunningTabStandaloneCodexCensusTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_standalone_codex_census_owner_wins_over_live_guessed_name_collision(self):
+        session = session_hub.Session(
+            "Codex", "id-orch", "Fix the login bug", "/tmp/vamp", "/tmp/vamp", 100,
+            Path("/tmp/orch.jsonl"),
+        )
+        metadata = {"sessions": {}, "settings": {}, "groups": {}}
+        with (
+            patch("session_hub.claude_sessions", return_value=[]),
+            patch("session_hub.codex_sessions", return_value=[session]),
+            patch("session_hub.antigravity_sessions", return_value=[]),
+            patch("session_hub.tmux_live_session_names",
+                  return_value=frozenset({"wrong-live", "VAMP-orchestrator"})),
+            patch("session_hub.standalone_tmux_status",
+                  return_value=(True, "wrong-live", "Running")),
+            patch("session_hub.compute_codex_tmux_owner_census",
+                  return_value={session.native_key: "VAMP-orchestrator"}),
+        ):
+            window = self._window(metadata)
+        try:
+            found = [
+                window.running_table.item(row, 0).data(session_hub.Qt.ItemDataRole.UserRole)
+                for row in range(window.running_table.rowCount())
+                if window.running_table.item(row, 0) is not None
+                and window.running_table.item(row, 0).data(session_hub.Qt.ItemDataRole.UserRole)
+            ]
+            self.assertEqual({data[3] for data in found}, {"VAMP-orchestrator"})
+        finally:
+            window.close()
+
 
 class RunningNameAgeDelegateTests(unittest.TestCase):
     """task-2191 REWORK (VAMP-reviewer): pure model/formatting controls for the delegate that
