@@ -3995,6 +3995,29 @@ def read_session_status(session_id: str) -> dict | None:
 # _resolve_claude_state.
 _BLOCKING_NOTIFICATION_TYPES = {"permission_prompt", "agent_needs_input"}
 
+# Claude's Stop hook can carry an explicit lifecycle reason when the user
+# aborts the current turn with Escape.  These values are machine evidence;
+# ordinary assistant prose (including the word "interrupted") is never parsed
+# as a status signal.
+_CLAUDE_INTERRUPTION_REASONS = frozenset({
+    "interrupted", "cancelled", "canceled", "aborted", "abort",
+})
+
+
+def _claude_interruption_reason(payload: dict) -> str | None:
+    """Return an explicit Claude abort reason, never a prose inference."""
+    event = payload.get("hook_event_name")
+    if event == "Notification":
+        value = payload.get("notification_type")
+    elif event == "Stop":
+        value = payload.get("stop_reason", payload.get("reason"))
+    else:
+        value = None
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower().replace(" ", "_")
+    return normalized if normalized in _CLAUDE_INTERRUPTION_REASONS else None
+
 
 def hook_event_to_status(payload: dict) -> tuple[str, str, str] | None:
     """(state, detail, reason) for one hook stdin payload, or None if this
@@ -4013,6 +4036,9 @@ def hook_event_to_status(payload: dict) -> tuple[str, str, str] | None:
     if event == "Notification":
         notification_type = payload.get("notification_type", "")
         message = str(payload.get("message", ""))
+        interruption = _claude_interruption_reason(payload)
+        if interruption is not None:
+            return "idle", message or interruption, ""
         if notification_type == "idle_prompt":
             # A live agent sitting at its own idle prompt is Idle, never
             # Needs input - there is no actual blocker here.
@@ -4023,6 +4049,9 @@ def hook_event_to_status(payload: dict) -> tuple[str, str, str] | None:
             return "done", message, ""
         return None
     if event == "Stop":
+        interruption = _claude_interruption_reason(payload)
+        if interruption is not None:
+            return "idle", str(payload.get("last_assistant_message", "")) or interruption, ""
         return "done", str(payload.get("last_assistant_message", "")), ""
     return None
 

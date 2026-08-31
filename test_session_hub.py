@@ -8481,6 +8481,73 @@ class SessionActivityTests(unittest.TestCase):
         })
         self.assertEqual(mapped, ("idle", "waiting", ""))
 
+    def test_claude_explicit_interrupt_clears_working_and_reconstructs_after_restart(self):
+        session_id = "id-esc-interrupted"
+        session_hub.write_session_status(session_id, "working", "before Esc")
+        mapped = session_hub.hook_event_to_status({
+            "hook_event_name": "Stop",
+            "stop_reason": "interrupted",
+            "last_assistant_message": "",
+        })
+        self.assertEqual(mapped, ("idle", "interrupted", ""))
+        session_hub.write_session_status(session_id, *mapped)
+        session = session_hub.Session(
+            "Claude", session_id, "mln", "/tmp", "/tmp", 0, Path("/tmp/x.jsonl")
+        )
+        with patch.object(session_hub, "session_is_tracked_alive", return_value=True):
+            self.assertEqual(session_hub.session_activity(session)[0], "idle")
+        # A fresh module read of the persisted record is the restart boundary.
+        persisted = session_hub.read_session_status(session_id)
+        self.assertEqual(persisted["state"], "idle")
+
+    def test_claude_newer_work_and_completion_supersede_interrupt(self):
+        self.assertEqual(
+            session_hub.hook_event_to_status({
+                "hook_event_name": "Stop", "stop_reason": "cancelled"
+            }),
+            ("idle", "cancelled", ""),
+        )
+        self.assertEqual(
+            session_hub.hook_event_to_status({"hook_event_name": "UserPromptSubmit"}),
+            ("working", "", ""),
+        )
+        self.assertEqual(
+            session_hub.hook_event_to_status({
+                "hook_event_name": "Notification", "notification_type": "agent_completed"
+            }),
+            ("done", "", ""),
+        )
+
+    def test_claude_answered_ask_user_question_clears_needs_input_to_working(self):
+        # An unanswered AskUserQuestion remains a real blocker; the next user
+        # submission is authoritative newer work and must clear that badge.
+        needs_input = session_hub.hook_event_to_status({
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt",
+            "message": "AskUserQuestion",
+        })
+        self.assertEqual(needs_input, ("needs_input", "AskUserQuestion", "permission_prompt"))
+        self.assertEqual(
+            session_hub.hook_event_to_status({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "answered",
+            }),
+            ("working", "", ""),
+        )
+
+    def test_claude_interrupt_requires_structured_reason_not_ordinary_prose(self):
+        self.assertIsNone(session_hub.hook_event_to_status({
+            "hook_event_name": "Notification",
+            "notification_type": "assistant_message",
+            "message": "Interrupted while explaining the answer?",
+        }))
+        self.assertEqual(
+            session_hub.hook_event_to_status({
+                "hook_event_name": "Stop", "last_assistant_message": "Interrupted"
+            }),
+            ("done", "Interrupted", ""),
+        )
+
     def test_needs_input_record_with_no_reason_fails_closed_to_idle(self):
         session_id = "id-legacy-needs-input"
         # Simulates a status file written before "reason" existed, or by any
