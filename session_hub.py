@@ -4782,16 +4782,19 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
         geometry = running_card_text_geometry(
             rect.left(), rect.top(), rect.width(), rect.height(), age_width
         )
-        # One wrapped identity block owns the card's full height.  The age owns only its
-        # narrow right-hand strip and is centered vertically through that same full height.
+        # One wrapped identity block owns the card's full height and begins at its top. The
+        # age keeps its independent strip and remains centered vertically.
         painter.setClipRect(rect)
         identity_rect = QRect(*geometry["identity"])
+        painter.save()
+        painter.setClipRect(identity_rect, Qt.ClipOperation.IntersectClip)
         painter.drawText(
             identity_rect,
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
             | Qt.TextFlag.TextWordWrap,
             identity,
         )
+        painter.restore()
         if age:
             age_rect = QRect(*geometry["age"])
             painter.setPen(QColor("#9aa0a6"))
@@ -10287,6 +10290,7 @@ class SessionHub(QMainWindow):
             row_id=row_id, name=name, cwd=cwd, thread_id=session_id,
             process_cwd=source_cwd or cwd,
         )
+        self._announce_running_launch(name)
 
     def stop_codex_app_server(self, row_id: str) -> None:
         owned = self._codex_app_servers.pop(row_id, None)
@@ -11064,9 +11068,11 @@ class SessionHub(QMainWindow):
         if provider == "Codex":
             from session_hub_control import ControlError, SessionHubController
             try:
-                return SessionHubController(METADATA_PATH).launch(
+                result = SessionHubController(METADATA_PATH).launch(
                     cwd, name, resume=bool(row.get("session_key"))
                 )
+                self._announce_running_launch(result.get("name") or name)
+                return result
             except (ControlError, OSError, RuntimeError) as error:
                 return {"status": "error", "message": str(error)}
         # No tmux-alive short-circuit here (task-2142): a live-but-detached row (no window open)
@@ -11192,7 +11198,9 @@ class SessionHub(QMainWindow):
         if row.get("provider", "Claude") == "Codex":
             from session_hub_control import ControlError, SessionHubController
             try:
-                return SessionHubController(METADATA_PATH).launch(cwd, name, resume=True)
+                result = SessionHubController(METADATA_PATH).launch(cwd, name, resume=True)
+                self._announce_running_launch(result.get("name") or name)
+                return result
             except (ControlError, OSError, RuntimeError) as error:
                 return {"status": "error", "message": str(error)}
         # group_row_candidates(), not a same-provider-only claude_sessions()/
