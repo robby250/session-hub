@@ -511,9 +511,7 @@ class RunningPane(Vertical):
         return "\n".join(running_card_lines(row, content_width))
 
     def _render_item(self, row: dict) -> ListItem:
-        item = ListItem(RunningCard(row), classes="running-row")
-        item.name = self._identity(row)
-        return item
+        return ListItem(RunningCard(row), classes="running-row")
 
     def apply_sessions(self, data: dict) -> None:
         self.rows = [
