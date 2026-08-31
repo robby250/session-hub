@@ -82,6 +82,27 @@ def test_remote_identity_validation_and_exact_creation_cleanup_are_pure():
     controller._remove_created_remote_window("worker", "@9")
     assert calls == [(("kill-window", "-t", "=worker:@9"), {"check": False})]
 
+    controller._windows = lambda _session: [("@4", control.REMOTE_WINDOW)]
+    try:
+        controller._ensure_remote_window("worker", "/tmp", Path("/tmp/e.sock"), None)
+    except control.ControlError as error:
+        assert "without an owner" in str(error)
+    else:
+        raise AssertionError("ownerless reserved window was adopted")
+
+    for invalid in (
+        {"remote_window_id": "@7", "remote_pid": 123},
+        {"remote_window_id": "@8", "remote_pid": 123, "remote_start_time": "start-123"},
+        {"remote_window_id": "@7", "remote_pid": 456, "remote_start_time": "start-123"},
+        {"remote_window_id": "@7", "remote_pid": 123, "remote_start_time": "reused"},
+    ):
+        try:
+            controller._validate_remote_identity("worker", invalid)
+        except control.ControlError:
+            pass
+        else:
+            raise AssertionError(f"invalid remote identity was accepted: {invalid}")
+
 
 def test_exact_tmux_target_preserves_legacy_windows(tmp_path):
     metadata = tmp_path / "metadata.json"
