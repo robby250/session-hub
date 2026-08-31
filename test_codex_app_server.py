@@ -131,10 +131,12 @@ def _fake_lifecycle_control() -> None:
             stale_endpoint.touch()
             stale_record.write_text(json.dumps({
                 "schema": SCHEMA_VERSION, "row_id": "row-stale",
-                "endpoint": str(stale_endpoint), "pid": os.getpid(), "start_time": "",
+                "endpoint": str(stale_endpoint), "thread_id": "thread-stale",
+                "pid": os.getpid(), "start_time": "",
             }))
             assert codex_app_server.discard_stale_record(stale_record, row_id="row-stale")
-            assert not stale_record.exists() and not stale_endpoint.exists()
+            assert not stale_record.exists() and stale_endpoint.exists()
+            stale_endpoint.unlink()
             first = root / "ambiguous-1.json"
             second = root / "ambiguous-2.json"
             for path in (first, second):
@@ -151,6 +153,23 @@ def _fake_lifecycle_control() -> None:
             else:
                 raise AssertionError("ambiguous owner set was accepted")
             assert first.exists() and second.exists()
+
+            # Malformed/scalar and wrong-shaped records are ownership errors, never "no owner".
+            bad_root = root / "malformed"
+            bad_root.mkdir()
+            for bad in ("[]", json.dumps({"schema": SCHEMA_VERSION, "row_id": "same-row"}),
+                        json.dumps({"schema": SCHEMA_VERSION, "row_id": "same-row",
+                                    "endpoint": str(root / "bad.sock"), "thread_id": "t",
+                                    "pid": "not-an-int", "start_time": "1"})):
+                bad_path = bad_root / "bad.json"
+                bad_path.write_text(bad)
+                try:
+                    record_for_row("same-row", bad_root)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("malformed owner record was treated as absent")
+                bad_path.unlink()
         finally:
             observing = False
             for process in (server_a, server_b):
@@ -327,7 +346,7 @@ def main() -> int:
     _fake_session_hub_launch_control()
 
     source = inspect.getsource(codex_app_server)
-    assert "wait_ready" in source and "not record.get(\"start_time\")" in source
+    assert "wait_ready" in source and "not record[\"start_time\"]" in source
     assert "endpoint.name != f\"{path.stem}.sock\"" in source
     assert "os.replace(tmp, path)" in source and "discard_stale_record" in source
 

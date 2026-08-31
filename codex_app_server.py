@@ -74,13 +74,42 @@ def process_start_time(pid: int) -> str:
     except (OSError, IndexError):
         return ""
 
+def _read_owner_record(path: Path) -> dict:
+    """Read the ownership authority strictly; malformed state is never treated as absence."""
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"malformed Codex App Server owner record: {path}") from error
+    if not isinstance(record, dict):
+        raise RuntimeError("Codex App Server owner record must be a JSON object")
+    required = {"schema", "row_id", "endpoint", "thread_id", "pid", "start_time"}
+    optional = {"name", "aliases"}
+    if set(record) - required - optional or not required.issubset(record):
+        raise RuntimeError("Codex App Server owner record has the wrong shape")
+    if (
+        record["schema"] != SCHEMA_VERSION
+        or not isinstance(record["row_id"], str)
+        or not isinstance(record["endpoint"], str)
+        or not isinstance(record["thread_id"], str)
+        or not isinstance(record["pid"], int)
+        or isinstance(record["pid"], bool)
+        or not isinstance(record["start_time"], str)
+        or ("name" in record and not isinstance(record["name"], str))
+        or ("aliases" in record and (
+            not isinstance(record["aliases"], list)
+            or any(not isinstance(alias, str) for alias in record["aliases"])
+        ))
+    ):
+        raise RuntimeError("Codex App Server owner record has invalid fields")
+    return record
+
 
 def live_record(path: Path, *, row_id: str) -> dict:
-    record = json.loads(path.read_text())
-    if record.get("schema") != SCHEMA_VERSION or record.get("row_id") != row_id:
+    record = _read_owner_record(path)
+    if record["row_id"] != row_id:
         raise RuntimeError("Codex App Server owner record mismatch")
-    pid = int(record["pid"])
-    if not record.get("start_time") or process_start_time(pid) != record.get("start_time"):
+    pid = record["pid"]
+    if not record["start_time"] or process_start_time(pid) != record["start_time"]:
         raise RuntimeError("Codex App Server owner is stale or PID was reused")
     endpoint = Path(record["endpoint"])
     if endpoint.parent != path.parent or endpoint.name != f"{path.stem}.sock":
@@ -101,11 +130,8 @@ def record_for_row(row_id: str, registry_dir: Path = REGISTRY_DIR) -> Path | Non
     """Return the sole owner record for ``row_id``; ambiguity fails closed."""
     matches = []
     for path in registry_dir.glob("*.json"):
-        try:
-            record = json.loads(path.read_text())
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
-        if record.get("schema") == SCHEMA_VERSION and record.get("row_id") == row_id:
+        record = _read_owner_record(path)
+        if record["row_id"] == row_id:
             matches.append(path)
     if len(matches) > 1:
         raise RuntimeError("Multiple Codex App Server owner records for row")
@@ -119,20 +145,15 @@ def discard_stale_record(path: Path, *, row_id: str) -> bool:
     The endpoint is removed only when the record's schema, row id, registry
     directory, and filename-derived socket name all agree.
     """
-    try:
-        record = json.loads(path.read_text())
-    except (OSError, ValueError, json.JSONDecodeError):
+    record = _read_owner_record(path)
+    if record["row_id"] != row_id:
         return False
-    if record.get("schema") != SCHEMA_VERSION or record.get("row_id") != row_id:
-        return False
-    try:
-        endpoint = Path(record["endpoint"])
-    except (KeyError, TypeError):
-        return False
+    endpoint = Path(record["endpoint"])
     if endpoint.parent != path.parent or endpoint.name != f"{path.stem}.sock":
         return False
+    # A stale PID cannot prove that the pathname still belongs to this owner. Retire only the
+    # registry claim; never unlink a replacement process's socket at the same endpoint.
     path.unlink(missing_ok=True)
-    endpoint.unlink(missing_ok=True)
     return True
 
 
