@@ -786,6 +786,18 @@ def main() -> int:
                 file=sys.stderr,
             )
         return 2
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        # A non-PTY SSH command (e.g. a phone client's default exec) hands Textual an
+        # immediate stdin EOF, which app.run() ends normally with -- not a crash, just a
+        # silent no-op that looks like a hang to the user. A forced pseudo-terminal is an
+        # invocation property only the client can supply; naming it is the whole fix.
+        print(
+            "Session Hub TUI needs an interactive terminal (stdin/stdout are not a TTY). "
+            "Run it over a forced pseudo-terminal: ssh -tt <host> session-hub-tui "
+            "(an existing interactive Termius shell may run session-hub-tui directly).",
+            file=sys.stderr,
+        )
+        return 2
     app = SessionHubTUI()
     result = app.run()
     if isinstance(result, tuple) and len(result) == 2:
