@@ -4678,13 +4678,10 @@ def _codex_activity(session: "Session", status: dict | None) -> tuple[str, str]:
         # the NEXT turn's task_started record. That newer wall-clock Done still belongs to the
         # older turn and must not mask durable evidence that a turn is open. Idle is the one safe
         # exception: Session Hub writes it deliberately on resume/acknowledgement so an old,
-        # unfinished rollout marker cannot resurrect historical work.
-        if not (
-            status
-            and status.get("state") == "idle"
-            and status.get("ts", 0) > turn[1]
-        ):
-            return "working", ""
+        # unfinished rollout marker cannot resurrect historical work. That exception was wrong:
+        # the baseline can be newer than task_started while the turn is still open, and must not
+        # mask the transcript's ordering authority.
+        return "working", ""
     if status:
         if (
             turn is not None
