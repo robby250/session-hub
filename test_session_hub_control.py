@@ -58,6 +58,31 @@ def test_group_stop_paths_use_controller_for_codex():
         ), function_name
 
 
+def test_remote_identity_validation_and_exact_creation_cleanup_are_pure():
+    controller = control.SessionHubController(Path("/tmp/unused-metadata"), which=lambda _: "/usr/bin/tmux")
+    controller._windows = lambda _session: [("@7", control.REMOTE_WINDOW)]
+    controller._remote_pid = lambda _session, _window: 123
+    with patch.object(control, "_start_time", return_value="start-123"):
+        owner = {
+            "remote_window_id": "@7", "remote_pid": 123, "remote_start_time": "start-123"
+        }
+        controller._validate_remote_identity("worker", owner)
+        try:
+            controller._validate_remote_identity(
+                "worker", {**owner, "remote_pid": 456}
+            )
+        except control.ControlError:
+            pass
+        else:
+            raise AssertionError("replaced remote PID was accepted")
+
+    calls = []
+    controller._windows = lambda _session: [("@9", control.REMOTE_WINDOW), ("@1", "composer")]
+    controller._tmux = lambda *args, **kwargs: calls.append((args, kwargs))
+    controller._remove_created_remote_window("worker", "@9")
+    assert calls == [(("kill-window", "-t", "=worker:@9"), {"check": False})]
+
+
 def test_exact_tmux_target_preserves_legacy_windows(tmp_path):
     metadata = tmp_path / "metadata.json"
     metadata.write_text(json.dumps({"groups": {"/tmp": {"rows": [
