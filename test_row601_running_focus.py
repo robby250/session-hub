@@ -90,6 +90,26 @@ class RunningFocusDeferredTests(unittest.TestCase):
             callbacks[0]()
             self.assertEqual(entry.controller.focus_calls, 0)
 
+    def test_missing_empty_and_malformed_identity_fail_closed_at_selection_boundary(self):
+        state = session_hub.RunningSelection("worker", 9)
+        for identity in (None, "", "worker:name", "worker name", "=worker"):
+            self.assertEqual(session_hub.running_selection_clicked(state, identity), state)
+
+    def test_malformed_deferred_identity_cannot_focus_or_reuse_embed(self):
+        for identity in (None, "", "worker:name", "worker name", "=worker"):
+            entry = self._entry(tmux_name=identity)
+            window = self._window(entry)
+            window._selected_tmux_name = identity
+            window._running_selection = session_hub.RunningSelection(identity, 9)
+            callbacks = []
+            with patch.object(
+                session_hub.QTimer, "singleShot",
+                side_effect=lambda delay, callback: callbacks.append(callback),
+            ):
+                window._schedule_running_terminal_focus(entry, 9, 12)
+            callbacks[0]()
+            self.assertEqual(entry.controller.focus_calls, 0)
+
     def test_focus_failure_evicts_and_falls_back_for_promotion_and_reselect(self):
         class _Stack:
             def __init__(self, current):
@@ -141,8 +161,12 @@ class RunningFocusDeferredTests(unittest.TestCase):
         self.assertIn("self.running_table.itemClicked.connect(self._activate_running_row)", setup)
         self.assertIn("self.running_table.itemActivated.connect(self._activate_running_row)", setup)
         self.assertIn("defer_focus=True", activate)
+        self.assertIn("valid_tmux_session_identity", activate)
         self.assertIn("QTimer.singleShot", inspect.getsource(
             session_hub.SessionHub._schedule_running_terminal_focus
+        ))
+        self.assertIn("valid_tmux_session_identity", inspect.getsource(
+            session_hub.SessionHub._focus_running_terminal_if_current
         ))
 
 

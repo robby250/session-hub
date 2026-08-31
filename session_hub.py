@@ -845,6 +845,24 @@ def env_int(value, fallback: int) -> int:
 _TMUX_NAME_UNSAFE = re.compile(r"[.:]")
 
 
+def valid_tmux_session_identity(identity: object) -> bool:
+    """Whether IDENTITY is safe to use as a discovered, exact tmux session name.
+
+    Running-row identities are live authority, not user-entered names.  They must already be
+    in the canonical form used by the tmux launch paths: non-empty, not an exact-target marker,
+    and unchanged by the target-separator sanitizer.  Rejecting whitespace also keeps a
+    malformed table payload from becoming a different target at the attach/focus boundary.
+    """
+    return (
+        isinstance(identity, str)
+        and bool(identity)
+        and identity == identity.strip()
+        and not identity.startswith("=")
+        and not any(char.isspace() for char in identity)
+        and sanitize_tmux_session_name(identity) == identity
+    )
+
+
 def sanitize_tmux_session_name(name: str) -> str:
     """Replace characters tmux treats as target-spec separators ('.' between
     window/pane, ':' between session/window) with '_'.
@@ -1296,8 +1314,10 @@ class RunningSelection:
     generation: int = 0
 
 
-def running_selection_clicked(state: RunningSelection, identity: str) -> RunningSelection:
+def running_selection_clicked(state: RunningSelection, identity: str | None) -> RunningSelection:
     """Record one exact Running-row selection at its event boundary."""
+    if not valid_tmux_session_identity(identity):
+        return state
     return RunningSelection(identity=identity, generation=state.generation + 1)
 
 
@@ -9354,6 +9374,8 @@ class SessionHub(QMainWindow):
         if not isinstance(data, (tuple, list)) or len(data) != 4:
             return
         cwd, name, session_id, tmux_name = data
+        if not valid_tmux_session_identity(tmux_name):
+            return
         # The embed target is always the ACTUAL live tmux session (task-2156) -- embedding never
         # cares about the saved row name, only `name` is carried through for the fallback path.
         self._running_selection = running_selection_clicked(self._running_selection, tmux_name)
@@ -9466,7 +9488,7 @@ class SessionHub(QMainWindow):
         """Apply a deferred row focus only if its exact selection/entry is still authoritative."""
         selection = self._running_selection
         if (
-            identity is None
+            not valid_tmux_session_identity(identity)
             or self._selected_tmux_name != identity
             or selection.identity != identity
             or selection.generation != selection_generation
@@ -9542,6 +9564,8 @@ class SessionHub(QMainWindow):
         # Sampled BEFORE any async work starts -- see _note_embed_focus_grabbed's docstring for
         # why completion must use this value and not a later live read.
         attach_start_serial = self._qt_interaction_serial
+        if not valid_tmux_session_identity(name):
+            return
         self._selected_tmux_name = name
         entry = self._entry_for(name)
         if entry is not None and entry.state == "ready" and entry.controller.poll_alive():
