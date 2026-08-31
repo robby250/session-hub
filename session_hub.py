@@ -11909,11 +11909,14 @@ def sessions_json_cli() -> int:
             "age": relative_activity_age(item.updated_ms),
         }
 
+    # Materialize session_out first: it contributes standalone activity records to the
+    # same census used by the snapshot. Publishing before this comprehension would omit them.
+    sessions_out = [session_out(item) for item in sessions]
     publish_activity_snapshot(activity_records)
     print(
         json.dumps(
             {
-                "sessions": [session_out(item) for item in sessions],
+                "sessions": sessions_out,
                 "groups": groups,
             },
             indent=2,

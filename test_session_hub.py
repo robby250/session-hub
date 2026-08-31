@@ -1,6 +1,7 @@
 import atexit
 import contextlib
 import io
+import inspect
 import os
 import json
 import select
@@ -8466,6 +8467,13 @@ class SessionActivityTests(unittest.TestCase):
             [("Worker5", "done")], runtime_dir=runtime, created_at=2,
         ))
         self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel")
+
+    def test_activity_snapshot_publication_follows_standalone_collection(self):
+        source = inspect.getsource(session_hub.sessions_json_cli)
+        self.assertLess(
+            source.index("sessions_out = [session_out(item) for item in sessions]"),
+            source.index("publish_activity_snapshot(activity_records)"),
+        )
 
     # --- live + active turn => Working -------------------------------
     def test_codex_working_when_task_started_is_the_latest_turn_event(self):
