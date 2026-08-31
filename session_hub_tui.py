@@ -129,12 +129,26 @@ class OssTmuxTerminalAdapter:
             raise RuntimeError(f"Install the terminal adapter first: {TEXTUAL_TERMINAL_INSTALL}")
         self.identity = name
         self.argv = tmux_attach_argv(name)
+        self.active = False
         # textual-terminal parses this with shlex.split then execvpe (no shell), preserving the
         # exact argv and rebuilding an environment without the parent's TMUX marker.
         self.widget = factory(command=shlex.join(self.argv), id="running-terminal")
 
     def start(self) -> None:
+        if self.active:
+            return
         self.widget.start()
+        self.active = True
+
+    def switch(self, name: str) -> None:
+        """Retarget the existing terminal surface to another exact tmux client."""
+        if name == self.identity and self.active:
+            return
+        self.close()
+        self.identity = name
+        self.argv = tmux_attach_argv(name)
+        self.widget.command = shlex.join(self.argv)
+        self.start()
 
     def resize(self, width: int, height: int) -> None:
         # textual-terminal forwards resize events to its PTY; keep this call behind
@@ -144,7 +158,9 @@ class OssTmuxTerminalAdapter:
             resize(width, height)
 
     def close(self) -> None:
-        self.widget.stop()
+        if self.active:
+            self.widget.stop()
+        self.active = False
 
 
 class ConfirmScreen(ModalScreen[bool]):
@@ -402,7 +418,9 @@ class RunningPane(Vertical):
         age = str(row.get("age", ""))
         first = row["name"] + (f"  {age}" if age else "")
         second = f"{row['provider']} · {row['display']}"
-        return f"{first}\n{second}" + (f"\n{detail}" if detail else "")
+        if detail:
+            second += f" · {detail}"
+        return f"{first}\n{second}"
 
     def apply_sessions(self, data: dict) -> None:
         self.rows = [
@@ -466,10 +484,6 @@ class RunningPane(Vertical):
     def _close_adapter(self) -> None:
         if self.adapter is not None:
             self.adapter.close()
-            self.adapter = None
-        host = self.query_one("#terminal-host", Vertical)
-        host.remove_children()
-        host.mount(Static("Select a running session", id="terminal-empty"))
 
     def selected(self) -> dict | None:
         list_view = self.query_one("#running-list", ListView)
@@ -488,17 +502,20 @@ class RunningPane(Vertical):
         target = picked.get("tmux_name") or picked["name"]
         if self.selected_key == identity and self.adapter is not None:
             return
-        self._close_adapter()
-        self.selected_key = identity
         try:
-            adapter = self.adapter_factory(target)
+            if self.adapter is None:
+                adapter = self.adapter_factory(target)
+                host = self.query_one("#terminal-host", Vertical)
+                await host.mount(adapter.widget)
+                self.adapter = adapter
+                adapter.start()
+            else:
+                self.adapter.switch(target)
+                adapter = self.adapter
         except (RuntimeError, ValueError) as exc:
             self.notify(str(exc), severity="error")
             return
-        host = self.query_one("#terminal-host", Vertical)
-        await host.mount(adapter.widget)
-        self.adapter = adapter
-        adapter.start()
+        self.selected_key = identity
         adapter.widget.focus()
 
     def action_focus_list(self) -> None:
@@ -506,7 +523,13 @@ class RunningPane(Vertical):
 
     def on_resize(self, event: Resize) -> None:
         if self.adapter is not None:
-            self.adapter.resize(event.size.width, event.size.height)
+            host = self.query_one("#terminal-host", Vertical)
+            size = host.content_size
+            self.adapter.resize(size.width, size.height)
+
+    def on_unmount(self) -> None:
+        # App/pane teardown owns the terminal client, never the tmux session itself.
+        self._close_adapter()
 
     @work
     async def action_stop(self) -> None:

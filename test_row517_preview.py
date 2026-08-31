@@ -30,6 +30,13 @@ def main() -> None:
                    if isinstance(node, ast.FunctionDef) and node.name == "apply_sessions")
     source = ast.unparse(running)
     assert "assistant_preview" in source and "activity_detail" not in source
+    tui_source = Path(__file__).with_name("session_hub_tui.py").read_text()
+    pane_source = tui_source[tui_source.index("class RunningPane"):]
+    assert "self.adapter.switch(target)" in pane_source
+    assert "host.content_size" in pane_source
+    assert "def on_unmount" in pane_source
+    assert "return f\"{first}\\n{second}\"" in pane_source
+    assert ".running-row { height: 2;" in pane_source
 
     hub = ast.parse(Path(__file__).with_name("session_hub.py").read_text())
     json_cli = next(node for node in ast.walk(hub)
