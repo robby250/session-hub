@@ -45,7 +45,7 @@ class RunningCardContractTests(unittest.TestCase):
         sub_x, sub_y, sub_width, sub_height = geometry["subtitle"]
         age_x, age_y, age_rect_width, age_height = geometry["age"]
         self.assertLessEqual(name_x + name_width, age_x)
-        self.assertLessEqual(sub_x + sub_width, age_x)
+        self.assertEqual(sub_x + sub_width, cell_right)
         for x, y, width, height in geometry.values():
             self.assertGreaterEqual(x, cell_left)
             self.assertGreaterEqual(y, cell_top)
@@ -68,12 +68,12 @@ class RunningCardContractTests(unittest.TestCase):
             self.assertLessEqual(x + width, 22)
             self.assertLessEqual(y + height, 31)
         self.assertEqual(geometry["name"][2], 0)
-        self.assertEqual(geometry["subtitle"][2], 0)
+        self.assertEqual(geometry["subtitle"][2], 12)
 
     def test_identity_stack_uses_the_full_height_card(self):
         geometry = session_hub.running_card_text_geometry(4, 2, 240, 58, 28)
         self.assertEqual(geometry["name"], (4, 2, 212, 29))
-        self.assertEqual(geometry["subtitle"], (4, 31, 212, 29))
+        self.assertEqual(geometry["subtitle"], (4, 31, 240, 29))
         self.assertEqual(geometry["age"][1], 2)
         self.assertEqual(geometry["age"][3], 29)
         self.assertEqual(geometry["name"][3] + geometry["subtitle"][3], 58)

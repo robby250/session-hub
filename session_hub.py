@@ -4739,7 +4739,9 @@ def running_card_text_geometry(
     subtitle_height = height - name_height
     geometry = {
         "name": (left, top, text_width, name_height),
-        "subtitle": (left, top + name_height, text_width, subtitle_height),
+        # The age occupies only the upper band.  The provider/project line is vertically
+        # disjoint from it and therefore owns the full lower-band width.
+        "subtitle": (left, top + name_height, width, subtitle_height),
     }
     if age_width:
         geometry["age"] = (left + width - age_width + 1, top, age_width - 1, name_height)
@@ -4773,12 +4775,13 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
         geometry = running_card_text_geometry(
             rect.left(), rect.top(), rect.width(), rect.height(), age_width
         )
-        text_width = geometry["name"][2]
         # Clip the custom paint to the cell and elide each identity line independently.  In
         # particular, a long name must not paint underneath the age or into Last message.
         painter.setClipRect(rect)
         top_rect = QRect(*geometry["name"])
-        name = fm.elidedText(lines[0] if lines else "", Qt.TextElideMode.ElideRight, text_width)
+        name = fm.elidedText(
+            lines[0] if lines else "", Qt.TextElideMode.ElideRight, geometry["name"][2]
+        )
         painter.drawText(
             top_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name
         )
@@ -4790,7 +4793,9 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
         if len(lines) > 1:
             sub_rect = QRect(*geometry["subtitle"])
             painter.setPen(QColor("#9aa0a6"))
-            subtitle = fm.elidedText(lines[1], Qt.TextElideMode.ElideRight, text_width)
+            subtitle = fm.elidedText(
+                lines[1], Qt.TextElideMode.ElideRight, geometry["subtitle"][2]
+            )
             painter.drawText(sub_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, subtitle)
         painter.restore()
 
