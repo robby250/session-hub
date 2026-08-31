@@ -8420,6 +8420,53 @@ class SessionActivityTests(unittest.TestCase):
     def _event(self, epoch: float, kind: str) -> dict:
         return {"timestamp": _iso(epoch), "type": "event_msg", "payload": {"type": kind}}
 
+    def test_activity_snapshot_publishes_schema_and_normalized_names(self):
+        runtime = self.temp / "runtime"
+        runtime.mkdir(mode=0o700)
+        self.assertTrue(session_hub.publish_activity_snapshot(
+            [("VAMP-Worker5", "working"), ("worker4", "needs_input")],
+            runtime_dir=runtime, created_at=123.5,
+        ))
+        path = runtime / "session-hub" / "activity-snapshot.json"
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {
+            "schema": 1,
+            "created_at": 123.5,
+            "by_name": {"vamp-worker5": "working", "worker4": "needs_input"},
+        })
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_activity_snapshot_rejects_invalid_or_ambiguous_input_without_replacement(self):
+        runtime = self.temp / "runtime"
+        runtime.mkdir(mode=0o700)
+        self.assertTrue(session_hub.publish_activity_snapshot(
+            [("Worker5", "working")], runtime_dir=runtime, created_at=1,
+        ))
+        path = runtime / "session-hub" / "activity-snapshot.json"
+        before = path.read_bytes()
+        for records in (
+            [("Worker5", "bogus")],
+            [("Worker5", "working"), ("worker5", "done")],
+            [("", "idle")],
+        ):
+            self.assertFalse(session_hub.publish_activity_snapshot(records, runtime_dir=runtime))
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_activity_snapshot_refuses_target_symlink_and_preserves_outside_file(self):
+        runtime = self.temp / "runtime"
+        runtime.mkdir(mode=0o700)
+        self.assertTrue(session_hub.publish_activity_snapshot(
+            [("Worker5", "working")], runtime_dir=runtime, created_at=1,
+        ))
+        path = runtime / "session-hub" / "activity-snapshot.json"
+        outside = self.temp / "outside.json"
+        outside.write_text("sentinel", encoding="utf-8")
+        path.unlink()
+        path.symlink_to(outside)
+        self.assertFalse(session_hub.publish_activity_snapshot(
+            [("Worker5", "done")], runtime_dir=runtime, created_at=2,
+        ))
+        self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel")
+
     # --- live + active turn => Working -------------------------------
     def test_codex_working_when_task_started_is_the_latest_turn_event(self):
         path = self._rollout([self._event(time.time(), "task_started")])
