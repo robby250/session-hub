@@ -230,6 +230,133 @@ PID_DIR = DATA_DIR / "pids"
 # by refresh_running_tab - see install_status_hooks/install_status_hooks_codex.
 STATUS_DIR = DATA_DIR / "status"
 
+# Read-only activity handoff for the VAMPULSE watchdog. This lives in the user's runtime dir,
+# never in metadata or the project tree, and is replaced atomically after an existing refresh has
+# already computed its activity states.
+ACTIVITY_SNAPSHOT_SCHEMA = 1
+ACTIVITY_SNAPSHOT_FILENAME = "activity-snapshot.json"
+ACTIVITY_SNAPSHOT_VOCAB = frozenset(("working", "needs_input", "done", "idle", "unknown"))
+
+
+def _activity_snapshot_path(runtime_dir: str | Path | None = None) -> Path | None:
+    """Return a private runtime path, refusing missing/unsafe/symlinked roots."""
+    configured = runtime_dir if runtime_dir is not None else os.environ.get("XDG_RUNTIME_DIR")
+    if not configured:
+        configured = f"/run/user/{os.getuid()}"
+    root = Path(configured)
+    try:
+        root_stat = root.lstat()
+    except OSError:
+        return None
+    if not root.is_absolute() or not root.is_dir() or root.is_symlink():
+        return None
+    if root_stat.st_uid != os.getuid() or root_stat.st_mode & 0o022:
+        return None
+    directory = root / "session-hub"
+    try:
+        if directory.exists() and directory.is_symlink():
+            return None
+        directory.mkdir(mode=0o700, exist_ok=True)
+        directory_stat = directory.lstat()
+    except OSError:
+        return None
+    if (not directory.is_dir() or directory.is_symlink() or directory_stat.st_uid != os.getuid()
+            or directory_stat.st_mode & 0o022):
+        return None
+    path = directory / ACTIVITY_SNAPSHOT_FILENAME
+    try:
+        if path.is_symlink():
+            return None
+    except OSError:
+        return None
+    return path
+
+
+def _activity_snapshot_map(records) -> dict[str, str] | None:
+    """Normalize already-computed (name, activity) pairs, rejecting ambiguity."""
+    result: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for name, activity in records:
+        if not isinstance(name, str) or not name or not isinstance(activity, str) \
+                or activity not in ACTIVITY_SNAPSHOT_VOCAB:
+            return None
+        key = name.lower()
+        if key in result and result[key] != activity:
+            ambiguous.add(key)
+        elif key not in ambiguous:
+            result[key] = activity
+    return None if ambiguous else result
+
+
+def publish_activity_snapshot(records, *, runtime_dir: str | Path | None = None,
+                              created_at: float | None = None) -> bool:
+    """Atomically publish one validated activity snapshot; leave the old one on any failure."""
+    path = _activity_snapshot_path(runtime_dir)
+    activity = _activity_snapshot_map(records)
+    if path is None or activity is None:
+        return False
+    payload = {
+        "schema": ACTIVITY_SNAPSHOT_SCHEMA,
+        "created_at": float(time.time() if created_at is None else created_at),
+        "by_name": activity,
+    }
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    previous = None
+    had_previous = False
+    try:
+        previous = path.read_bytes()
+        had_previous = True
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+
+    def restore_previous() -> None:
+        """Undo a replacement if post-replace durability confirmation fails."""
+        if had_previous:
+            restore = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.restore")
+            try:
+                with restore.open("xb") as handle:
+                    handle.write(previous)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(restore, 0o600)
+                os.replace(restore, path)
+            except OSError:
+                try:
+                    restore.unlink()
+                except OSError:
+                    pass
+        else:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    replaced = False
+    try:
+        with temp.open("x", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp, 0o600)
+        os.replace(temp, path)
+        replaced = True
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return True
+    except (OSError, ValueError, TypeError):
+        if replaced:
+            restore_previous()
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+        return False
+
 # Fresh-install UI defaults captured from the user's settled desktop layout on 2026-08-30.
 # These are Qt geometry/header/splitter state only: no session, group, directory, provider,
 # account, model, or launch setting belongs here. Existing saved values always win via
@@ -8927,6 +9054,11 @@ class SessionHub(QMainWindow):
                 (state, display_name, cwd, row, match, resolved_name, last_message, message_ms)
             )
 
+        publish_activity_snapshot([
+            (resolved_name, state) for state, _display_name, _cwd, _row, _match, resolved_name,
+            _last_message, _message_ms in view_rows
+        ])
+
         state_order = ("needs_input", "working", "done", "idle", "unknown")
         buckets = {
             state: [record for record in view_rows if record[0] == state]
@@ -11715,6 +11847,7 @@ def sessions_json_cli() -> int:
     )
 
     claimed: set[str] = set()
+    activity_records: list[tuple[str, str]] = []
     groups = {}
     for cwd, group in metadata.get("groups", {}).items():
         rows_out = []
@@ -11747,6 +11880,7 @@ def sessions_json_cli() -> int:
                 )
                 if match else ("unknown", "")
             )
+            activity_records.append((resolved_name or row["name"], activity_state))
             rows_out.append(
                 {
                     "name": row["name"],
@@ -11787,6 +11921,8 @@ def sessions_json_cli() -> int:
         activity_state, activity_detail = session_activity(
             item, tmux_enabled=tmux_enabled, tmux_name=tmux_name, live_names=live_names
         )
+        if not is_group:
+            activity_records.append((tmux_name or item.title, activity_state))
         return {
             "provider": item.provider,
             "key": item.key,
@@ -11806,10 +11942,14 @@ def sessions_json_cli() -> int:
             "age": relative_activity_age(item.updated_ms),
         }
 
+    # Materialize session_out first: it contributes standalone activity records to the
+    # same census used by the snapshot. Publishing before this comprehension would omit them.
+    sessions_out = [session_out(item) for item in sessions]
+    publish_activity_snapshot(activity_records)
     print(
         json.dumps(
             {
-                "sessions": [session_out(item) for item in sessions],
+                "sessions": sessions_out,
                 "groups": groups,
             },
             indent=2,
