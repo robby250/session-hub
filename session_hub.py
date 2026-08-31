@@ -9358,7 +9358,9 @@ class SessionHub(QMainWindow):
         # cares about the saved row name, only `name` is carried through for the fallback path.
         self._running_selection = running_selection_clicked(self._running_selection, tmux_name)
         self._selected_tmux_name = self._running_selection.identity
-        self._select_running_terminal(cwd, tmux_name, session_id, saved_name=name)
+        self._select_running_terminal(
+            cwd, tmux_name, session_id, saved_name=name, defer_focus=True,
+        )
 
     def eventFilter(self, obj, event) -> bool:
         """Use real pointer intent as the focus boundary; never infer it from Qt focus bounces."""
@@ -9436,7 +9438,53 @@ class SessionHub(QMainWindow):
     def _entry_for(self, tmux_name: str) -> "_TerminalCacheEntry | None":
         return next((e for e in self._terminal_cache if e.tmux_name == tmux_name), None)
 
-    def _promote_entry(self, entry: "_TerminalCacheEntry", attach_start_serial: int) -> bool:
+    def _schedule_running_terminal_focus(
+        self, entry: "_TerminalCacheEntry", selection_generation: int,
+        interaction_serial: int,
+    ) -> None:
+        """Defer one activation focus grab until Qt finishes dispatching the row event.
+
+        Every captured value is an authority boundary: a later selection, cache replacement,
+        attach generation, or interaction must make this callback a no-op.  This is deliberately
+        one event-loop turn, never a recurring timer (task-2238 row601).
+        """
+        identity = entry.tmux_name
+        controller_generation = entry.controller.generation
+        QTimer.singleShot(
+            0,
+            lambda: self._focus_running_terminal_if_current(
+                entry, identity, selection_generation, interaction_serial,
+                controller_generation,
+            ),
+        )
+
+    def _focus_running_terminal_if_current(
+        self, entry: "_TerminalCacheEntry", identity: str | None,
+        selection_generation: int, interaction_serial: int,
+        controller_generation: int,
+    ) -> None:
+        """Apply a deferred row focus only if its exact selection/entry is still authoritative."""
+        selection = self._running_selection
+        if (
+            identity is None
+            or self._selected_tmux_name != identity
+            or selection.identity != identity
+            or selection.generation != selection_generation
+            or self._qt_interaction_serial != interaction_serial
+            or self._entry_for(identity) is not entry
+            or entry.state != "ready"
+            or entry.controller.generation != controller_generation
+            or not entry.controller.poll_alive()
+        ):
+            return
+        if entry.controller.focus():
+            self._focused_entry = entry
+            self._note_embed_focus_grabbed(interaction_serial)
+
+    def _promote_entry(
+        self, entry: "_TerminalCacheEntry", attach_start_serial: int,
+        *, defer_focus: bool = False,
+    ) -> bool:
         """Make ENTRY the visible/focused terminal for the first time (task-2172 row491): the
         ready-cache-hit fast path in `_select_running_terminal` for an entry that was NEVER
         visible before (only ever preloaded in the background), or a background preload that
@@ -9444,7 +9492,12 @@ class SessionHub(QMainWindow):
         focus grab -- the same contract `EmbeddedTerminalController.finish_attach` enforces for a
         foreground attach (task-2166 EXIT): a terminal nobody can type into is as unusable as a
         failed map/resize."""
-        if not entry.controller.focus():
+        if defer_focus:
+            self._running_terminal_stack.setCurrentWidget(entry.container)
+            self._schedule_running_terminal_focus(
+                entry, self._running_selection.generation, self._qt_interaction_serial,
+            )
+        elif not entry.controller.focus():
             cwd, session_id, saved_name = entry.meta or (None, None, None)
             name = entry.tmux_name
             self._evict_entry(entry)
@@ -9455,7 +9508,9 @@ class SessionHub(QMainWindow):
             return False
         entry.last_used = time.monotonic()
         self._running_terminal_stack.setCurrentWidget(entry.container)
-        if self._qt_interaction_serial > attach_start_serial:
+        if defer_focus:
+            pass
+        elif self._qt_interaction_serial > attach_start_serial:
             self._embed_focus_grab_serial = self._qt_interaction_serial
             entry.controller.release_focus(int(self.winId()))
         else:
@@ -9471,6 +9526,7 @@ class SessionHub(QMainWindow):
 
     def _select_running_terminal(
         self, cwd: str, name: str, session_id: str | None, *, saved_name: str | None = None,
+        defer_focus: bool = False,
     ) -> None:
         """task-2172 row491: select NAME's (the resolved live tmux identity) cached terminal, if
         any -- a ready, already-cached entry is only ever a stack swap plus one explicit focus
@@ -9488,12 +9544,16 @@ class SessionHub(QMainWindow):
                 # an already-embedded row is itself a real "select/click it" gesture (task-2166
                 # EXIT) and must re-grab keyboard focus the same as a fresh attach does.
                 entry.last_used = time.monotonic()
-                if entry.controller.focus():
+                if defer_focus:
+                    self._schedule_running_terminal_focus(
+                        entry, self._running_selection.generation, self._qt_interaction_serial,
+                    )
+                elif entry.controller.focus():
                     self._focused_entry = entry
                     self._note_embed_focus_grabbed(attach_start_serial)
                 return
             # Ready from a background preload, never shown before -- promote it now.
-            self._promote_entry(entry, attach_start_serial)
+            self._promote_entry(entry, attach_start_serial, defer_focus=defer_focus)
             return
         if entry is not None and entry.state == "preparing":
             # A background (or a prior selection's) attach is already in flight for this exact
