@@ -374,6 +374,7 @@ class RunningPane(Vertical):
     # Hug one/few cards with only a small intentional gap; overflow past the cap scrolls.
     #running-list { height: auto; max-height: 12; min-height: 3; border: round $panel; }
     .running-row { height: 3; padding: 0 1; }
+    .running-row-sep { border-top: solid $panel; }
     .running-card { height: 2; content-align: left middle; }
     .running-group { height: 1; padding: 0 1; color: $text-muted; text-style: bold; }
     """
@@ -397,8 +398,9 @@ class RunningPane(Vertical):
     def _row_text(row: dict, content_width: int | None = None) -> str:
         return "\n".join(running_card_lines(row, content_width))
 
-    def _render_item(self, row: dict) -> ListItem:
-        return ListItem(RunningCard(row), classes="running-row")
+    def _render_item(self, row: dict, sep: bool = False) -> ListItem:
+        classes = "running-row running-row-sep" if sep else "running-row"
+        return ListItem(RunningCard(row), classes=classes)
 
     def apply_sessions(self, data: dict) -> None:
         self.rows = [
@@ -441,14 +443,14 @@ class RunningPane(Vertical):
                 continue
             list_view.append(ListItem(Label(f"{heading} ({len(heading_rows)})", classes="running-group")))
             self._visible_rows.append(None)
-            for row in heading_rows:
-                list_view.append(self._render_item(row))
+            for idx, row in enumerate(heading_rows):
+                list_view.append(self._render_item(row, sep=idx > 0))
                 self._visible_rows.append(row)
         for heading, rows in groups.items():
             list_view.append(ListItem(Label(f"{heading} ({len(rows)})", classes="running-group")))
             self._visible_rows.append(None)
-            for row in rows:
-                list_view.append(self._render_item(row))
+            for idx, row in enumerate(rows):
+                list_view.append(self._render_item(row, sep=idx > 0))
                 self._visible_rows.append(row)
 
     def selected(self) -> dict | None:
