@@ -5261,7 +5261,9 @@ def group_row_status(
     *,
     tmux_name: str | None = None,
 ) -> str:
-    """"Running" or "Stopped" for one group row - the only two states shown anywhere.
+    """"Running" or "Stopped" for one group row - LIVENESS only, a separate fact
+    from activity (see group_row_activity_status for the richer Working/Needs
+    input/Done/Idle verdict a presentation layer should actually show).
 
     tmux-enabled rows trust tmux_session_alive outright (provider-agnostic,
     authoritative). Non-tmux rows fall back to the older PID-tracking signal,
@@ -5279,6 +5281,52 @@ def group_row_status(
     if tmux_enabled:
         return "Running" if tmux_session_alive(tmux_name or row["name"], live_names) else "Stopped"
     return "Running" if match and session_is_tracked_alive(match) else "Stopped"
+
+
+def group_row_activity_status(
+    row: dict,
+    cwd: str,
+    match: "Session | None",
+    tmux_enabled: bool,
+    live_names: frozenset[str] | None,
+    tmux_name_by_native_key: dict[str, str],
+    codex_owner_by_row_id: dict[str, str],
+) -> tuple[str, str, str, str | None]:
+    """(status, activity_state, activity_detail, resolved_tmux_name) for one
+    group row -- the exact identity census (task-2156) plus activity join
+    (session_activity) that refresh_running_tab and sessions_json_cli already
+    share, extracted here (task-2243) so ManageGroupDialog reuses the same
+    authority instead of inventing a second classifier. `status` is
+    "Running"/"Stopped" (liveness only, from group_row_status);
+    `activity_state` is one of needs_input/working/done/idle/unknown -- pass
+    it through activity_label() for display text/color. `resolved_tmux_name`
+    may be None (see below).
+
+    A matched Codex row whose exact live tmux owner the census cannot resolve
+    fails closed to "Stopped"/"unknown" rather than guessing the row's saved
+    name is the live owner -- that name can itself be a DIFFERENT live tmux
+    session under an unrelated rollout (see sessions_json_cli's identical
+    `unresolved` guard, which this is extracted from verbatim).
+    """
+    row_provider = row.get("provider", "Claude")
+    row_id = row.get("override_key") or f"group:{cwd}#{row['name']}"
+    registry_name = codex_owner_by_row_id.get(row_id)
+    if row_provider == "Codex" and registry_name in live_names:
+        resolved_name = registry_name
+    elif match and match.provider == "Codex":
+        resolved_name = tmux_name_by_native_key.get(match.native_key)
+    else:
+        resolved_name = row["name"]
+    unresolved = match is not None and match.provider == "Codex" and resolved_name is None
+    activity_state, activity_detail = (
+        session_activity(match, tmux_enabled=tmux_enabled, tmux_name=resolved_name, live_names=live_names)
+        if match else ("unknown", "")
+    )
+    status = (
+        "Stopped" if unresolved
+        else group_row_status(row, match, tmux_enabled, live_names, tmux_name=resolved_name)
+    )
+    return status, activity_state, activity_detail, resolved_name
 
 
 def standalone_tmux_status(
@@ -7130,9 +7178,13 @@ class ManageGroupDialog(QDialog):
         pairs = self.matched_sessions()
         row_sessions = [self.row_session(row, match) for row, match in pairs]
         self.hub.populate_session_table(self.table, row_sessions, self.SHARED_COLUMNS)
-        # One tmux snapshot for every row in this dialog, not one subprocess
-        # per row (see tmux_live_session_names).
+        # One tmux/census snapshot for every row in this dialog, not one subprocess per row
+        # (see tmux_live_session_names) -- task-2243: the SAME census refresh_running_tab uses,
+        # so a Codex row's actual live tmux owner (which can diverge from its saved row["name"]
+        # after an external restart) resolves identically here instead of reading Stopped/wrong.
         live_names = tmux_live_session_names()
+        tmux_name_by_native_key = compute_codex_tmux_owner_census()
+        codex_owner_by_row_id = live_remote_owner_names()
         for index, ((row, match), row_session) in enumerate(zip(pairs, row_sessions)):
             self.table.setItem(
                 index, self.SESSION_ID_COLUMN, QTableWidgetItem(row_session.session_id)
@@ -7144,10 +7196,20 @@ class ManageGroupDialog(QDialog):
             )
             self.table.setCellWidget(index, self.TRANSCRIPTS_COLUMN, checkbox)
 
-            status = group_row_status(
-                row, match, self.hub.effective_tmux(row.get("provider", "Claude")), live_names
+            # task-2243: reuse the Running tab's own identity/verdict join (session_activity via
+            # group_row_activity_status) instead of the old liveness-only group_row_status call,
+            # which is what produced mismatched Running/Stopped labels for rows the Running tab
+            # showed active. Launch/stop button enablement elsewhere is untouched -- this only
+            # changes what text the STATUS_COLUMN cell shows.
+            tmux_enabled = self.hub.effective_tmux(row.get("provider", "Claude"))
+            status, activity_state, _detail, _resolved_name = group_row_activity_status(
+                row, self.cwd, match, tmux_enabled, live_names,
+                tmux_name_by_native_key, codex_owner_by_row_id,
             )
-            self.table.setItem(index, self.STATUS_COLUMN, QTableWidgetItem(status))
+            display_status = (
+                (activity_label(activity_state)[0] or "Running") if status == "Running" else "Stopped"
+            )
+            self.table.setItem(index, self.STATUS_COLUMN, QTableWidgetItem(display_status))
         if select_override_keys:
             for row_index in range(self.table.rowCount()):
                 item = self.table.item(row_index, 0)
@@ -11980,28 +12042,10 @@ def sessions_json_cli() -> int:
             )
             if match:
                 claimed.add(match.native_key)
-            row_provider = row.get("provider", "Claude")
-            row_id = row.get("override_key") or f"group:{cwd}#{row['name']}"
-            registry_name = codex_owner_by_row_id.get(row_id)
-            if row_provider == "Codex" and registry_name in live_names:
-                resolved_name = registry_name
-            elif match and match.provider == "Codex":
-                resolved_name = tmux_name_by_native_key.get(match.native_key)
-            else:
-                resolved_name = row["name"]
-            # task-2156 REWORK #2 (18be076): a matched Codex row whose exact native key is
-            # missing/ambiguous must fail closed -- never guess the saved row name is the live
-            # owner, since that name can itself be a live tmux session under an unrelated
-            # rollout. session_activity already treats tmux_name=None safely (only skips the
-            # tmux-liveness half of its check); `status` needs an explicit override since
-            # group_row_status falls back to row["name"] internally when given no tmux_name.
-            # Scoped to Codex, the only provider the census resolves at all.
-            unresolved = match is not None and match.provider == "Codex" and resolved_name is None
-            activity_state, activity_detail = (
-                session_activity(
-                    match, tmux_enabled=tmux_enabled, tmux_name=resolved_name, live_names=live_names
-                )
-                if match else ("unknown", "")
+            # task-2243: identity census + activity join extracted into group_row_activity_status
+            # (task-2156 REWORK #2's fail-closed `unresolved` guard lives there now, unchanged).
+            status, activity_state, activity_detail, resolved_name = group_row_activity_status(
+                row, cwd, match, tmux_enabled, live_names, tmux_name_by_native_key, codex_owner_by_row_id,
             )
             activity_records.append((resolved_name or row["name"], activity_state))
             rows_out.append(
@@ -12011,10 +12055,7 @@ def sessions_json_cli() -> int:
                     "tmux_name": resolved_name,
                     "provider": row.get("provider", "Claude"),
                     # Liveness (process/tmux) - separate fact from activity below.
-                    "status": (
-                        "Stopped" if unresolved
-                        else group_row_status(row, match, tmux_enabled, live_names, tmux_name=resolved_name)
-                    ),
+                    "status": status,
                     "activity": activity_state,
                     "activity_label": activity_label(activity_state)[0],
                     "activity_detail": activity_detail,
