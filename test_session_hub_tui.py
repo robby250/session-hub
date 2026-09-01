@@ -122,6 +122,84 @@ class RunningPaneColumnsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(pane.rows[0]["detail"], "")
 
 
+class RunningPaneSeparatorTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _session(key: str, label: str = "Working") -> dict:
+        return {
+            "is_group": False, "provider": "Claude", "title": key, "key": key,
+            "tmux_name": key, "age": "1m", "status": "Running", "activity_label": label,
+        }
+
+    async def test_no_rows_has_no_separators(self):
+        pane = session_hub_tui.RunningPane()
+        app = _PaneHost(pane)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            pane.apply_sessions({"sessions": [], "groups": {}})
+            await pilot.pause()
+            list_view = pane.query_one("#running-list")
+            self.assertEqual(
+                [c for c in list_view.children if c.has_class("running-row-sep")], []
+            )
+
+    async def test_single_row_has_no_separator(self):
+        pane = session_hub_tui.RunningPane()
+        app = _PaneHost(pane)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            pane.apply_sessions({"sessions": [self._session("solo")], "groups": {}})
+            await pilot.pause()
+            list_view = pane.query_one("#running-list")
+            rows = [c for c in list_view.children if c.has_class("running-row")]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(
+                [c for c in list_view.children if c.has_class("running-row-sep")], []
+            )
+
+    async def test_multiple_rows_have_exactly_one_separator_between_each_pair(self):
+        pane = session_hub_tui.RunningPane()
+        app = _PaneHost(pane)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            pane.apply_sessions({
+                "sessions": [
+                    self._session("first"), self._session("second"), self._session("third"),
+                ],
+                "groups": {},
+            })
+            await pilot.pause()
+            list_view = pane.query_one("#running-list")
+            children = list(list_view.children)
+            rows = [c for c in children if c.has_class("running-row")]
+            self.assertEqual(len(rows), 3)
+            seps = [c.has_class("running-row-sep") for c in rows]
+            self.assertEqual(seps, [False, True, True])
+            self.assertFalse(children[0].has_class("running-row-sep"))
+
+    async def test_first_row_after_a_group_heading_has_no_separator(self):
+        pane = session_hub_tui.RunningPane()
+        app = _PaneHost(pane)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            pane.apply_sessions({
+                "sessions": [
+                    self._session("w1", "Working"),
+                    self._session("i1", "Idle"),
+                    self._session("i2", "Idle"),
+                ],
+                "groups": {},
+            })
+            await pilot.pause()
+            list_view = pane.query_one("#running-list")
+            children = list(list_view.children)
+            headings = [i for i, c in enumerate(children) if not c.has_class("running-row")]
+            self.assertEqual(len(headings), 2)
+            for heading_idx in headings:
+                first_row_after = children[heading_idx + 1]
+                self.assertTrue(first_row_after.has_class("running-row"))
+                self.assertFalse(first_row_after.has_class("running-row-sep"))
+
+
 class RunningCardPureContractTests(unittest.TestCase):
     def row(self, **overrides):
         row = {
