@@ -3105,6 +3105,32 @@ def all_linked_member_keys(metadata: dict) -> frozenset[str]:
     )
 
 
+def pending_link_placeholder(link: dict, by_key: dict[str, "Session"]) -> "Session | None":
+    """A stand-in Session for link["active"] while its transcript does not exist yet.
+
+    Only Claude launches with a pre-minted --session-id, so only a `Claude:` key can be pending.
+    cwd/title come from the newest surviving member (the provider being switched away from); the
+    path is where Claude WILL write the transcript, so every reader that opens it fails softly
+    (OSError) exactly as it does for an empty discovered session."""
+    key = str(link.get("active") or "")
+    provider, _, session_id = key.partition(":")
+    if provider != "Claude" or not session_id:
+        return None
+    siblings = [by_key[k] for k in link.get("members", []) if k in by_key]
+    newest = max(siblings, key=lambda s: (s.updated_ms, s.native_key)) if siblings else None
+    cwd = newest.cwd if newest else str(HOME)
+    title = (newest.title if newest else f"Claude {session_id[:8]}") + " (starting)"
+    return Session(
+        "Claude",
+        session_id,
+        title,
+        cwd,
+        newest.source_cwd if newest else cwd,
+        int(time.time() * 1000),
+        CLAUDE_PROJECTS / claude_project_key(cwd) / f"{session_id}.jsonl",
+    )
+
+
 def resolve_link_active(link: dict, by_key: dict[str, "Session"]) -> "Session | None":
     """The link's current target: link["active"] if that member still
     exists, else the newest surviving member by updated_ms (native_key
@@ -3120,10 +3146,12 @@ def resolve_link_active(link: dict, by_key: dict[str, "Session"]) -> "Session | 
     # the 300 ms post-launch refresh always beats it. Repairing then re-points active at the
     # OLD provider's still-present transcript and persists it, hiding the new session as a
     # non-active member for good (VAMP-reviewer, 2026-09-01). Inside the grace window, leave
-    # active alone and report no match.
+    # active alone and stand in a placeholder for the not-yet-discovered member: returning None
+    # here made BOTH callers hide every member (they hide members before testing the result), so
+    # the row vanished from every tab for the whole window (user 2026-09-01, Music_Download).
     pending_until = link.get("active_pending_until_ms")
     if pending_until and time.time() * 1000 < float(pending_until):
-        return None
+        return pending_link_placeholder(link, by_key)
     candidates = [by_key[key] for key in link.get("members", []) if key in by_key]
     if not candidates:
         return None
