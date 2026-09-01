@@ -46,6 +46,14 @@ if _HEADLESS_ROW_FLAGS.intersection(sys.argv):
     _headless_data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
     raise SystemExit(_headless_row_cli(sys.argv, _headless_data_home / "session-hub" / "metadata.json"))
 
+# ``session-hub attach NAME`` is the phone/SSH fast path.  Keep it before the PyQt import so an
+# existing target is one tmux probe plus an exec-replaced attach, even on machines where the GUI
+# dependencies are unavailable (or there is no DISPLAY).
+if len(sys.argv) > 1 and sys.argv[1] in {"attach", "--attach", "--attach-session"}:
+    from session_hub_attach import cli as _attach_cli
+    _attach_data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+    raise SystemExit(_attach_cli(sys.argv, _attach_data_home / "session-hub" / "metadata.json"))
+
 from PyQt6.QtCore import (
     QByteArray, QEvent, QItemSelectionModel, QObject, QRect, QRunnable, QSocketNotifier,
     QThreadPool, QTimer, QUrl, Qt, pyqtSignal,

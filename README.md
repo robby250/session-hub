@@ -53,6 +53,17 @@ Run a non-GUI discovery check with:
 session-hub --diagnose
 ```
 
+For a fast phone/SSH connection to one named session, use:
+
+```bash
+session-hub attach VAMP-orchestrator
+```
+
+The command first checks the exact tmux name and immediately attaches when it is already alive.
+If it is absent, it resolves the exact saved Session Hub row, launches its Claude or Codex
+session, and then attaches. An unknown or ambiguous name fails with an error; names containing
+tmux target separators such as `.` or `:` must be entered exactly as Session Hub displays them.
+
 ### Phone / SSH TUI
 
 For tmux-launched session groups (see "Launch in tmux" in a group's Manage dialog), a text UI is
