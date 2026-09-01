@@ -3114,7 +3114,16 @@ def resolve_link_active(link: dict, by_key: dict[str, "Session"]) -> "Session | 
     whichever member was linked first, not most recently active."""
     active = by_key.get(link.get("active"))
     if active:
+        link.pop("active_pending_until_ms", None)
         return active
+    # A just-launched Claude continuation has no transcript on disk for its first seconds, and
+    # the 300 ms post-launch refresh always beats it. Repairing then re-points active at the
+    # OLD provider's still-present transcript and persists it, hiding the new session as a
+    # non-active member for good (VAMP-reviewer, 2026-09-01). Inside the grace window, leave
+    # active alone and report no match.
+    pending_until = link.get("active_pending_until_ms")
+    if pending_until and time.time() * 1000 < float(pending_until):
+        return None
     candidates = [by_key[key] for key in link.get("members", []) if key in by_key]
     if not candidates:
         return None
@@ -8813,7 +8822,19 @@ class SessionHub(QMainWindow):
             cwd = session_key.split(":group:", 1)[1]
         else:
             return None
-        return cwd if cwd in self.metadata.get("groups", {}) else None
+        groups = self.metadata.get("groups", {})
+        if cwd in groups:
+            return cwd
+        # A row's override_key embeds the ROW's own cwd (register_group_row), which for a
+        # worktree row differs from the group cwd it is filed under - so the parse above names
+        # a directory that is not a group at all. Resolve by the exact override_key instead;
+        # without this continue_with_other_agent_for never found the group row and left its
+        # saved provider stale (VAMP-reviewer, 2026-09-01).
+        if session_key.startswith("group:"):
+            for group_cwd, group in groups.items():
+                if any(row.get("override_key") == session_key for row in group.get("rows", [])):
+                    return group_cwd
+        return None
 
     def group_launch_options(self, session_key: str | None) -> tuple[dict, dict]:
         """(env, flags) saved on the session group `session_key` belongs to, if any."""
@@ -11257,6 +11278,10 @@ class SessionHub(QMainWindow):
             target_key = f"Claude:{target_id}"
             link["members"].append(target_key)
             link["active"] = target_key
+            # See resolve_link_active: target_key has no transcript on disk yet.
+            link["active_pending_until_ms"] = (
+                int(datetime.now().timestamp() * 1000) + 15 * 60 * 1000
+            )
             if model:
                 self.metadata.setdefault("sessions", {}).setdefault(
                     target_key, {}
@@ -11352,6 +11377,25 @@ class SessionHub(QMainWindow):
                 if provider in ("Claude", "Codex")
                 else None
             )
+            session_key = None
+            flag_overrides = None
+            if provider == "Claude":
+                # Without --name/--session-id a fresh Claude session had no identity Session Hub
+                # could tie to its tmux session: standalone_tmux_status derives the tmux name
+                # from the saved name/transcript title, which never equals the suggested tmux
+                # name, so a "New session" never appeared in Running (user 2026-09-01). Mint the
+                # id up front, exactly as continue_with_other_agent_for does, and save the name
+                # so the first discovery already resolves to the live tmux session.
+                session_id = str(uuid.uuid4())
+                session_key = f"Claude:{session_id}"
+                entry = self.metadata.setdefault("sessions", {}).setdefault(session_key, {})
+                entry["name"] = tmux_name
+                if dialog.model:
+                    entry.setdefault("env", {})["ANTHROPIC_MODEL"] = dialog.model
+                if dialog.account_config_dir:
+                    entry.setdefault("env", {})["CLAUDE_CONFIG_DIR"] = dialog.account_config_dir
+                write_metadata(self.metadata)
+                flag_overrides = {"--name": tmux_name, "--session-id": session_id}
             self.launch(
                 provider,
                 None,
@@ -11360,6 +11404,8 @@ class SessionHub(QMainWindow):
                 reasoning_effort=dialog.reasoning_effort,
                 account_config_dir=dialog.account_config_dir,
                 tmux_name=tmux_name,
+                session_key=session_key,
+                flag_overrides=flag_overrides,
             )
 
     def launch_selected_provider(self) -> None:
