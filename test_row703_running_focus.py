@@ -106,7 +106,9 @@ class RunningFocusActivationTests(unittest.TestCase):
         self.assertEqual(controller.focus_calls, 0)
         for _delay, callback in callbacks:
             callback()
-        self.assertEqual(controller.focus_calls, 3)
+        # Each gesture schedules its own callback, but only the final activation remains
+        # authoritative after the selection generation advances twice.
+        self.assertEqual(controller.focus_calls, 1)
 
     def test_synchronous_only_focus_is_rejected_until_the_event_loop_callback(self):
         controller = _FakeController()
@@ -134,7 +136,7 @@ class RunningFocusActivationTests(unittest.TestCase):
             lambda window, entry: setattr(entry.controller, "alive", False),
             lambda window, entry: setattr(window, "_qt_interaction_serial", 13),
             lambda window, entry: setattr(
-                window, "_running_selection", session_hub.RunningSelection("worker", 10)
+                window, "_running_selection", session_hub.RunningSelection("worker", 11)
             ),
             lambda window, entry: window._terminal_cache.clear(),
         )
