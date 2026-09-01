@@ -8187,6 +8187,16 @@ class SessionHub(QMainWindow):
         tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.main_tabs = tabs
         self.running_page = running_page
+        self.all_sessions_page = all_sessions_page
+        # task-2240 row733: keyed by the stable page WIDGET, never tabText() -- Running's tab
+        # label is temporarily decorated ("Running  •") by _announce_running_launch while the
+        # user is on another tab, and _on_main_tab_changed applies the destination's usage state
+        # BEFORE it resets that label. A text-keyed lookup at that moment misses and silently
+        # forces compact, discarding whatever the destination tab actually had saved.
+        self._usage_expanded_page_keys = {
+            all_sessions_page: SessionHub.USAGE_EXPANDED_SETTINGS_KEYS["All Sessions"],
+            running_page: SessionHub.USAGE_EXPANDED_SETTINGS_KEYS["Running"],
+        }
         tabs.currentChanged.connect(self._on_main_tab_changed)
         content_layout.addWidget(tabs, 1)
 
@@ -8303,7 +8313,7 @@ class SessionHub(QMainWindow):
     def _usage_expanded_settings_key(self, tab_index: int | None = None) -> str | None:
         if tab_index is None:
             tab_index = self.main_tabs.currentIndex()
-        return SessionHub.USAGE_EXPANDED_SETTINGS_KEYS.get(self.main_tabs.tabText(tab_index))
+        return self._usage_expanded_page_keys.get(self.main_tabs.widget(tab_index))
 
     def _apply_usage_expanded_for_tab(self, tab_index: int) -> None:
         """Read-only: applies TAB_INDEX's remembered expand/collapse state to the
