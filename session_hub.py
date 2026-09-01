@@ -5298,6 +5298,21 @@ def uninstall_status_hooks_codex() -> None:
     _write_codex_config_text(text)
 
 
+def table_rows_by_key(table) -> dict[str, int]:
+    """{session key -> current VISUAL row} for a table populate_session_table filled.
+
+    Column 0's UserRole+1 is the stable key (override_key for group rows). Any caller that adds
+    cells AFTER populate_session_table must place them through this map, never by the index of
+    the list it passed in -- the table may already be sorted by then.
+    """
+    out: dict[str, int] = {}
+    for visual_row in range(table.rowCount()):
+        item = table.item(visual_row, 0)
+        if item is not None:
+            out[item.data(Qt.ItemDataRole.UserRole + 1)] = visual_row
+    return out
+
+
 def group_row_status(
     row: dict,
     match: "Session | None",
@@ -7230,7 +7245,19 @@ class ManageGroupDialog(QDialog):
         live_names = tmux_live_session_names()
         tmux_name_by_native_key = compute_codex_tmux_owner_census()
         codex_owner_by_row_id = live_remote_owner_names()
-        for index, ((row, match), row_session) in enumerate(zip(pairs, row_sessions)):
+        # populate_session_table ends with setSortingEnabled(True), which re-sorts the table by the
+        # last-clicked header on the spot -- so `pairs` order is NOT the visual row order any more.
+        # Writing the group-only columns by enumerate() index put Status / Session ID / Transcripts
+        # on whichever row landed in that slot (user 2026-09-01: statuses and ids on the wrong rows
+        # once the group table had been sorted). Resolve each pair to its visual row by the stable
+        # override_key populate_session_table stored in column 0, with sorting off while writing so
+        # a setItem on the sort column cannot move rows mid-loop.
+        self.table.setSortingEnabled(False)
+        visual_row_by_key = table_rows_by_key(self.table)
+        for (row, match), row_session in zip(pairs, row_sessions):
+            index = visual_row_by_key.get(row_session.key)
+            if index is None:
+                continue
             self.table.setItem(
                 index, self.SESSION_ID_COLUMN, QTableWidgetItem(row_session.session_id)
             )
@@ -7255,6 +7282,7 @@ class ManageGroupDialog(QDialog):
                 (activity_label(activity_state)[0] or "Running") if status == "Running" else "Stopped"
             )
             self.table.setItem(index, self.STATUS_COLUMN, QTableWidgetItem(display_status))
+        self.table.setSortingEnabled(True)
         if select_override_keys:
             for row_index in range(self.table.rowCount()):
                 item = self.table.item(row_index, 0)
