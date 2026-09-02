@@ -5122,6 +5122,34 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
             painter.drawText(age_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, age)
             painter.setPen(pen.color())
         painter.restore()
+        _paint_running_row_separator(painter, option)
+
+
+def _paint_running_row_separator(painter, option) -> None:
+    """1px divider under each Running-tab row (task-2191 follow-up: the user asked
+    for this twice and it was never delivered). Painted by the delegates rather than
+    a table-wide stylesheet -- setStyleSheet on a QTableWidget routes item painting
+    through QStyleSheetStyle, which stopped honoring the status-colored group headers
+    set via header_item.setForeground/setBackground below (regression caught in the
+    same session this was added). Color comes from the option's own palette (Mid) so
+    it stays legible under both light and dark desktop themes.
+    """
+    painter.save()
+    painter.setPen(option.palette.color(QPalette.ColorRole.Mid))
+    y = option.rect.bottom()
+    painter.drawLine(option.rect.left(), y, option.rect.right(), y)
+    painter.restore()
+
+
+class RunningRowSeparatorDelegate(QStyledItemDelegate):
+    """Column 1 ('Last message') has no custom paint of its own -- this exists solely
+    to add the same row-bottom divider as RunningNameAgeDelegate without disturbing
+    native item rendering (so setForeground/setBackground on any item keep working).
+    """
+
+    def paint(self, painter, option, index) -> None:
+        super().paint(painter, option, index)
+        _paint_running_row_separator(painter, option)
 
 
 def hook_notify_cli() -> int:
@@ -8382,16 +8410,7 @@ class SessionHub(QMainWindow):
         self.running_table.setAlternatingRowColors(False)
         self.running_table.setWordWrap(True)
         self.running_table.setShowGrid(False)
-        self.running_table.setObjectName("runningTable")
-        # setShowGrid(False) drops Qt's native grid (it draws full cell borders on
-        # every side, including double-thickness where adjacent columns meet); a
-        # scoped QSS border-bottom gives just the requested row separator instead.
-        # Derived from the widget's own palette (Mid) rather than a literal hex so
-        # it stays legible under both light and dark desktop themes.
-        separator_color = self.running_table.palette().color(QPalette.ColorRole.Mid).name()
-        self.running_table.setStyleSheet(
-            f"QTableWidget#runningTable::item {{ border-bottom: 1px solid {separator_color}; }}"
-        )
+        self.running_table.setItemDelegateForColumn(1, RunningRowSeparatorDelegate(self.running_table))
         self.running_table.verticalHeader().setDefaultSectionSize(62)
         self.running_table.verticalHeader().setVisible(False)
         # The identity card keeps a usable minimum while Last message owns all recovered width;
