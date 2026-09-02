@@ -231,6 +231,9 @@ def _cached_file_scan(path: Path, scan) -> dict:
         result, state = _scan_claude_file_state(path, state)
     else:
         result = scan(path)
+    if state is not None:
+        state = dict(state)
+        state.update({"dev": stat.st_dev, "ino": stat.st_ino})
     _FILE_SCAN_CACHE[key] = (signature, result, state)
     index[key] = {"dev": stat.st_dev, "ino": stat.st_ino, "size": stat.st_size,
                   "mtime": stat.st_mtime, "result": result}
@@ -5807,6 +5810,8 @@ def executable(name: str) -> str:
 # global file (which would also affect every non-Session-Hub codex
 # invocation and the user's other configured MCPs).
 VAMPULSE_PROJECT_ROOT = Path("/home/user/projects/vampulse/VAMPULSE-game")
+IDLE_WATCHDOG_STATE_PATH = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "vampulse/idle-worker-watchdog.json"
+IDLE_WATCHDOG_LOG_PATH = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "vampulse/idle-worker-watchdog.log"
 
 
 def _vampulse_queue_has_lane_rows() -> bool:
@@ -5824,20 +5829,25 @@ def _vampulse_queue_has_lane_rows() -> bool:
 
 
 def _idle_watchdog_status() -> str:
-    """Return an honest status chip without starting a Hub/session probe."""
+    """Read watchdog state/log directly; never spawn a status process per census tick."""
     try:
-        result = subprocess.run(
-            ["python3", "scripts/tools/review_ctl.py", "idle-watchdog", "status"],
-            cwd=VAMPULSE_PROJECT_ROOT, capture_output=True, text=True, timeout=2, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return "BLIND"
-    text = result.stdout + result.stderr
-    if "ON" in text.upper() and "BLIND" not in text.upper():
+        state = json.loads(IDLE_WATCHDOG_STATE_PATH.read_text(encoding="utf-8"))
+        pid = state.get("pid") if isinstance(state, dict) else None
+        if not isinstance(pid, int) or pid <= 0 or not Path(f"/proc/{pid}").exists():
+            return "OFF"
+        try:
+            tail = IDLE_WATCHDOG_LOG_PATH.read_text(encoding="utf-8")[-8192:]
+        except OSError:
+            return "ON"
+        last = tail.splitlines()[-1] if tail.splitlines() else ""
+        age_match = re.search(r"snapshot_age=([0-9]+(?:\.[0-9]+)?)s", last)
+        if "stale" in last.lower() or "unknown" in last.lower() or (
+            age_match and float(age_match.group(1)) >= 300
+        ):
+            return "BLIND"
         return "ON"
-    if "BLIND" in text.upper() or "STALE" in text.upper() or result.returncode not in (0, 1):
-        return "BLIND"
-    return "OFF"
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return "OFF"
 
 
 def _start_idle_watchdog_if_needed() -> bool:
