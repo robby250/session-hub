@@ -1247,6 +1247,33 @@ class SessionHubTests(unittest.TestCase):
         self.assertNotIn("--model", default_command)
         window.close()
 
+    @patch("session_hub.shutil.which")
+    def test_advisor_launch_flag_is_claude_only_and_not_set_is_inert(self, which):
+        which.side_effect = lambda name: {
+            "gnome-terminal": "/usr/bin/gnome-terminal",
+            "claude": "/home/user/.local/bin/claude",
+            "codex": "/home/user/.local/bin/codex",
+        }.get(name)
+        window = session_hub.SessionHub()
+        try:
+            spec = session_hub.CLI_FLAG_SPECS["--advisor"]
+            self.assertEqual(
+                spec["choices"],
+                [("Not set", ""), ("Opus", "opus"), ("Fable", "fable"), ("Sonnet", "sonnet")],
+            )
+            claude = window.terminal_command(
+                "Claude", None, "/home/user", flags=["--advisor", "opus"]
+            )
+            self.assertEqual(claude[-2:], ["--advisor", "opus"])
+            codex = window.terminal_command(
+                "Codex", None, "/home/user", flags=["--advisor", "opus"]
+            )
+            self.assertNotIn("--advisor", codex)
+            default = window.terminal_command("Claude", None, "/home/user")
+            self.assertNotIn("--advisor", default)
+        finally:
+            window.close()
+
     def test_new_session_dialog_offers_models_only_for_claude(self):
         claude_dialog = session_hub.NewSessionDialog("Claude", {})
         self.assertIsNotNone(claude_dialog.model_combo)
