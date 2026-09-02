@@ -65,6 +65,7 @@ from PyQt6.QtGui import (
     QFontMetrics,
     QIcon,
     QKeySequence,
+    QPalette,
     QShortcut,
 )
 from PyQt6.QtWidgets import (
@@ -8381,6 +8382,16 @@ class SessionHub(QMainWindow):
         self.running_table.setAlternatingRowColors(False)
         self.running_table.setWordWrap(True)
         self.running_table.setShowGrid(False)
+        self.running_table.setObjectName("runningTable")
+        # setShowGrid(False) drops Qt's native grid (it draws full cell borders on
+        # every side, including double-thickness where adjacent columns meet); a
+        # scoped QSS border-bottom gives just the requested row separator instead.
+        # Derived from the widget's own palette (Mid) rather than a literal hex so
+        # it stays legible under both light and dark desktop themes.
+        separator_color = self.running_table.palette().color(QPalette.ColorRole.Mid).name()
+        self.running_table.setStyleSheet(
+            f"QTableWidget#runningTable::item {{ border-bottom: 1px solid {separator_color}; }}"
+        )
         self.running_table.verticalHeader().setDefaultSectionSize(62)
         self.running_table.verticalHeader().setVisible(False)
         # The identity card keeps a usable minimum while Last message owns all recovered width;

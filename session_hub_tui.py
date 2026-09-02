@@ -374,7 +374,7 @@ class RunningPane(Vertical):
     # Hug one/few cards with only a small intentional gap; overflow past the cap scrolls.
     #running-list { height: auto; max-height: 12; min-height: 3; border: round $panel; }
     .running-row { height: 3; padding: 0 1; }
-    .running-row-sep { border-top: solid $panel; }
+    .running-row-sep { border-top: heavy $panel-lighten-2; }
     .running-card { height: 2; content-align: left middle; }
     .running-group { height: 1; padding: 0 1; color: $text-muted; text-style: bold; }
     """
