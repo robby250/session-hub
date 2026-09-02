@@ -275,7 +275,13 @@ class MainPane(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Input(placeholder="Filter by name, provider, directory, or ID…", id="search")
-        yield DataTable(id="main")
+        # DataTable has no per-row border/rule primitive (checked against textual 8.2.8's
+        # DEFAULT_CSS: only datatable--odd-row/--even-row component classes exist) -- the
+        # RunningPane's ListView-based .running-row-sep divider isn't available here without
+        # inserting fake spacer rows, which would desync table.cursor_row from self.filtered
+        # (on_data_table_row_selected below indexes self.filtered[table.cursor_row] directly).
+        # zebra_stripes is Textual's own answer to "make adjacent rows visually distinct".
+        yield DataTable(id="main", zebra_stripes=True)
 
     def on_mount(self) -> None:
         # Shell paints immediately with an empty, correctly-columned table;
