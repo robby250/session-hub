@@ -5841,6 +5841,7 @@ def executable(name: str) -> str:
 VAMPULSE_PROJECT_ROOT = Path("/home/user/projects/vampulse/VAMPULSE-game")
 IDLE_WATCHDOG_STATE_PATH = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "vampulse/idle-worker-watchdog.json"
 IDLE_WATCHDOG_LOG_PATH = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "vampulse/idle-worker-watchdog.log"
+_IDLE_WATCHDOG_HEALTH_RE = re.compile(r"(?:^|\s)health=(ok|stale|unknown)(?=\s|$)")
 
 
 def _vampulse_queue_has_lane_rows() -> bool:
@@ -5867,14 +5868,12 @@ def _idle_watchdog_status() -> str:
         try:
             tail = IDLE_WATCHDOG_LOG_PATH.read_text(encoding="utf-8")[-8192:]
         except OSError:
-            return "ON"
-        last = tail.splitlines()[-1] if tail.splitlines() else ""
-        age_match = re.search(r"snapshot_age=([0-9]+(?:\.[0-9]+)?)s", last)
-        if "stale" in last.lower() or "unknown" in last.lower() or (
-            age_match and float(age_match.group(1)) >= 300
-        ):
             return "BLIND"
-        return "ON"
+        for line in reversed(tail.splitlines()):
+            match = _IDLE_WATCHDOG_HEALTH_RE.search(line)
+            if match:
+                return "ON" if match.group(1) == "ok" else "BLIND"
+        return "BLIND"
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return "OFF"
 
@@ -8080,10 +8079,35 @@ class SessionHub(QMainWindow):
             return
         status = status if status in {"ON", "OFF", "BLIND"} else "BLIND"
         self._watchdog_status_chip.setText(f"Watchdog: {status}")
+        if hasattr(self, "_watchdog_toggle_button"):
+            self._watchdog_toggle_button.setText(
+                "Start watchdog" if status == "OFF" else "Stop watchdog"
+            )
         color = {"ON": "#2f9e44", "OFF": "#777777", "BLIND": "#d97706"}[status]
         self._watchdog_status_chip.setStyleSheet(
             f"padding: 2px 8px; border-radius: 8px; background: {color}; color: white;"
         )
+
+    def _toggle_idle_watchdog(self) -> None:
+        """Toggle the watchdog through its own lifecycle command, independently of auto-start."""
+        action = "start" if _idle_watchdog_status() == "OFF" else "stop"
+        try:
+            result = subprocess.run(
+                ["python3", "scripts/tools/review_ctl.py", "idle-watchdog", action],
+                cwd=VAMPULSE_PROJECT_ROOT, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            self.status.setText(f"Watchdog {action} failed: {error}")
+            self._set_watchdog_status(_idle_watchdog_status())
+            return
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown error").strip()
+            self.status.setText(f"Watchdog {action} failed: {detail}")
+        else:
+            self.status.setText(f"Watchdog {action} requested")
+        self._set_watchdog_status(_idle_watchdog_status())
 
     def _on_main_tab_changed(self, index: int) -> None:
         is_running = index == self.main_tabs.indexOf(self.running_page)
@@ -8372,7 +8396,6 @@ class SessionHub(QMainWindow):
         actions = QHBoxLayout()
         self.status = QLabel()
         actions.addWidget(self.status, 1)
-        actions.addWidget(self._watchdog_status_chip)
         for label, slot in (
             ("Rename", self.rename_selected),
             ("Change directory", self.change_directory),
@@ -8440,9 +8463,10 @@ class SessionHub(QMainWindow):
         running_list_layout.addWidget(self.running_table, 1)
         running_actions = QHBoxLayout()
         running_actions.addStretch(1)
-        stop_button = QPushButton("Stop")
-        stop_button.clicked.connect(self.stop_selected_running)
-        running_actions.addWidget(stop_button)
+        self._watchdog_toggle_button = QPushButton("Stop watchdog")
+        self._watchdog_toggle_button.clicked.connect(self._toggle_idle_watchdog)
+        running_actions.addWidget(self._watchdog_status_chip)
+        running_actions.addWidget(self._watchdog_toggle_button)
         running_list_layout.addLayout(running_actions)
 
         running_terminal_page = QWidget()
