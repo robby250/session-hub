@@ -123,7 +123,7 @@ METADATA_PATH = DATA_DIR / "metadata.json"
 # manual refresh, ...) is the dominant cost in this file, so scan results are
 # cached per path and invalidated by (mtime, size). Unchanged files - the
 # overwhelming majority on any given refresh - cost a single stat() call.
-_FILE_SCAN_CACHE: dict[str, tuple[tuple[float, int], dict]] = {}
+_FILE_SCAN_CACHE: dict[str, tuple[tuple[float, int], dict, dict | None]] = {}
 
 # task-2142: the above cache is per-process only, so a cold TUI/CLI
 # `--sessions-json` invocation - a brand-new interpreter every call -
@@ -213,18 +213,29 @@ def _cached_file_scan(path: Path, scan) -> dict:
         and isinstance(entry.get("result"), dict)
     ):
         result = entry["result"]
-        _FILE_SCAN_CACHE[key] = (signature, result)
+        state = entry if scan is _scan_claude_file and isinstance(entry.get("offset"), int) else None
+        _FILE_SCAN_CACHE[key] = (signature, result, state)
         return result
 
-    result = scan(path)
-    _FILE_SCAN_CACHE[key] = (signature, result)
-    index[key] = {
-        "dev": stat.st_dev,
-        "ino": stat.st_ino,
-        "size": stat.st_size,
-        "mtime": stat.st_mtime,
-        "result": result,
-    }
+    state = None
+    previous = cached[2] if cached is not None else None
+    # Carry the persistent cursor across interpreter launches too.  An appended
+    # transcript must resume at its stored byte offset, not fall back to a full
+    # UTF-8/JSON scan merely because the in-memory cache is cold.
+    if previous is None and isinstance(entry, dict):
+        previous = entry
+    if scan is _scan_claude_file:
+        if (previous and previous.get("dev") == stat.st_dev and previous.get("ino") == stat.st_ino
+                and stat.st_size >= int(previous.get("offset", 0))):
+            state = previous
+        result, state = _scan_claude_file_state(path, state)
+    else:
+        result = scan(path)
+    _FILE_SCAN_CACHE[key] = (signature, result, state)
+    index[key] = {"dev": stat.st_dev, "ino": stat.st_ino, "size": stat.st_size,
+                  "mtime": stat.st_mtime, "result": result}
+    if state is not None:
+        index[key].update(state)
     _SCAN_INDEX_DIRTY = True
     return result
 TRASH_DIR = DATA_DIR / "trash"
@@ -421,12 +432,27 @@ TMUX_AUTO_UPDATE_STRIP_NAMES = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY")
 # Claude's CLI has no command to enumerate models, but --model accepts these
 # family aliases, which always resolve to the latest model of each family, so
 # they stay valid across model refreshes. "Default" omits --model entirely.
+#
+# The "(legacy)" entries below are pinned dated/named IDs rather than family
+# aliases -- Anthropic's deprecation table (platform.claude.com/docs/en/
+# about-claude/model-deprecations, checked 2026-09-01) lists them "Active"
+# but each has its own tentative retirement date and will eventually need
+# removing from this list once retired (a retired ID makes every request
+# fail, not silently fall back). Haiku has no still-active legacy pin --
+# 3.5 and 3 both already retired, only current haiku-4-5 remains.
 CLAUDE_MODELS = (
     ("Default", None),
     ("Opus", "opus"),
     ("Sonnet", "sonnet"),
     ("Haiku", "haiku"),
     ("Fable", "fable"),
+    ("Opus 4.8 (legacy) [1m]", "claude-opus-4-8"),
+    ("Opus 4.7 (legacy) [1m]", "claude-opus-4-7"),
+    ("Opus 4.6 (legacy) [1m]", "claude-opus-4-6"),
+    ("Opus 4.5 (legacy) [1m]", "claude-opus-4-5-20251101"),
+    ("Sonnet 4.6 (legacy) [1m]", "claude-sonnet-4-6"),
+    ("Sonnet 4.5 (legacy) [1m]", "claude-sonnet-4-5-20250929"),
+    ("Fable 5 (legacy) [1m]", "claude-fable-5"),
 )
 
 # Name -> CLAUDE_CONFIG_DIR, edited via SettingsDialog's "Claude accounts"
@@ -1238,9 +1264,21 @@ class SessionLaunchOptionsDialog(QDialog):
             inherited.setWordWrap(True)
             inherited.setStyleSheet("color: #888;")
             layout.addWidget(inherited)
+        self.claude_model_combo: QComboBox | None = None
         self.codex_model_combo: QComboBox | None = None
         self.codex_effort_combo: QComboBox | None = None
-        if provider == "Codex":
+        if provider == "Claude":
+            model_row = QHBoxLayout()
+            model_row.addWidget(QLabel("Model:"))
+            self.claude_model_combo = QComboBox()
+            for label, alias in CLAUDE_MODELS:
+                self.claude_model_combo.addItem(label, alias)
+            index = self.claude_model_combo.findData(model) if model else -1
+            if index >= 0:
+                self.claude_model_combo.setCurrentIndex(index)
+            model_row.addWidget(self.claude_model_combo)
+            layout.addLayout(model_row)
+        elif provider == "Codex":
             # Codex has no ANTHROPIC_MODEL-equivalent env var (its model is a
             # plain -m/--model argv, see effective_model/terminal_command),
             # so it gets its own fields here instead of living in the env tab.
@@ -1278,6 +1316,8 @@ class SessionLaunchOptionsDialog(QDialog):
         return self.editor.flags()
 
     def model(self) -> str | None:
+        if self.claude_model_combo:
+            return self.claude_model_combo.currentData()
         return codex_combo_value(self.codex_model_combo) if self.codex_model_combo else None
 
     def reasoning_effort(self) -> str | None:
@@ -2543,16 +2583,30 @@ def _scan_claude_file(
     # against a pathological single file, not a real limit in practice.
     # `updated_ms` is intentionally not tracked here: the file's own mtime
     # (used by callers as a fallback) already is the last-write time.
-    result: dict = {}
+    result, _state = _scan_claude_file_state(path, None, max_lines=max_lines, max_bytes=max_bytes)
+    return result
+
+
+def _scan_claude_file_state(
+    path: Path, state: dict | None, *, max_lines: int = 200_000, max_bytes: int = 200_000_000
+) -> tuple[dict, dict]:
+    result: dict = dict(state.get("result") or {}) if state else {}
     project_key = path.parent.name
-    cwd_counts: dict[str, int] = {}
-    bytes_read = 0
+    cwd_counts: dict[str, int] = dict(state.get("cwd_counts") or {}) if state else {}
+    offset = int(state.get("offset", 0)) if state else 0
+    line_number = int(state.get("line_number", 0)) if state else 0
+    bytes_read = int(state.get("bytes_read", offset)) if state else 0
     try:
-        with path.open(encoding="utf-8", errors="replace") as handle:
-            for line_number, line in enumerate(handle):
-                bytes_read += len(line)
-                if line_number >= max_lines or bytes_read >= max_bytes:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            while line_number < max_lines and bytes_read < max_bytes:
+                raw = handle.readline()
+                if not raw or not raw.endswith(b"\n"):
                     break
+                offset = handle.tell()
+                line_number += 1
+                bytes_read += len(raw)
+                line = raw.decode("utf-8", errors="replace")
                 if len(line) > 2_000_000:
                     continue
                 try:
@@ -2589,7 +2643,13 @@ def _scan_claude_file(
         pass
     if not result.get("project_cwd") and cwd_counts:
         result["observed_cwd"] = max(cwd_counts, key=cwd_counts.get)
-    return result
+    return result, {
+        "offset": offset,
+        "line_number": line_number,
+        "bytes_read": bytes_read,
+        "cwd_counts": cwd_counts,
+        "result": result,
+    }
 
 
 def inspect_claude_file(path: Path) -> dict:
@@ -5749,6 +5809,51 @@ def executable(name: str) -> str:
 VAMPULSE_PROJECT_ROOT = Path("/home/user/projects/vampulse/VAMPULSE-game")
 
 
+def _vampulse_queue_has_lane_rows() -> bool:
+    """Read the committed queue only; never infer work from mutable worktrees."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(VAMPULSE_PROJECT_ROOT), "show", "HEAD:docs/orchestration/vault/QUEUE.md"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    return bool(re.search(r"(?im)^\s*#{1,6}\s*Lane\s+[A-Z]\b", result.stdout))
+
+
+def _idle_watchdog_status() -> str:
+    """Return an honest status chip without starting a Hub/session probe."""
+    try:
+        result = subprocess.run(
+            ["python3", "scripts/tools/review_ctl.py", "idle-watchdog", "status"],
+            cwd=VAMPULSE_PROJECT_ROOT, capture_output=True, text=True, timeout=2, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "BLIND"
+    text = result.stdout + result.stderr
+    if "ON" in text.upper() and "BLIND" not in text.upper():
+        return "ON"
+    if "BLIND" in text.upper() or "STALE" in text.upper() or result.returncode not in (0, 1):
+        return "BLIND"
+    return "OFF"
+
+
+def _start_idle_watchdog_if_needed() -> bool:
+    if not _vampulse_queue_has_lane_rows() or _idle_watchdog_status() != "OFF":
+        return False
+    try:
+        subprocess.Popen(
+            ["python3", "scripts/tools/review_ctl.py", "idle-watchdog", "start"],
+            cwd=VAMPULSE_PROJECT_ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
+        )
+    except OSError:
+        return False
+    return True
+
+
 def _resolve_real_path(path: Path) -> Path | None:
     try:
         return path.resolve()
@@ -6019,6 +6124,15 @@ class SettingsDialog(QDialog):
         )
         launch_note.setWordWrap(True)
         launch_layout.addWidget(launch_note)
+        self.global_claude_model = QComboBox()
+        for label, alias in CLAUDE_MODELS:
+            self.global_claude_model.addItem(label, alias)
+        global_model = settings.get("global_claude_model")
+        index = self.global_claude_model.findData(global_model) if global_model else -1
+        if index >= 0:
+            self.global_claude_model.setCurrentIndex(index)
+        launch_layout.addWidget(QLabel("Default Claude model:"))
+        launch_layout.addWidget(self.global_claude_model)
         self.launch_options = LaunchOptionsEditor(
             settings.get("global_env") or {}, settings.get("global_flags") or {}
         )
@@ -6123,6 +6237,7 @@ class SettingsDialog(QDialog):
                 ),
                 "global_env": self.env_editor.env(),
                 "global_flags": self.flags_editor.env(),
+                "global_claude_model": self.global_claude_model.currentData(),
                 "claude_accounts_enabled": self.enable_accounts.isChecked(),
                 "claude_accounts": self.accounts_editor.env(),
                 "status_hooks_enabled": self.status_hooks_enabled.isChecked(),
@@ -6206,6 +6321,10 @@ class NewSessionDialog(QDialog):
             self.model_combo = QComboBox()
             for label, alias in CLAUDE_MODELS:
                 self.model_combo.addItem(label, alias)
+            global_model = settings.get("global_claude_model")
+            index = self.model_combo.findData(global_model) if global_model else -1
+            if index >= 0:
+                self.model_combo.setCurrentIndex(index)
             form.addRow("Model:", self.model_combo)
             if settings.get("claude_accounts_enabled"):
                 self.account_combo = QComboBox()
@@ -7869,6 +7988,9 @@ class SessionHub(QMainWindow):
         )
         self.resize(1280, 900)
         self.setMinimumSize(900, 650)
+        self._watchdog_status_chip = QLabel()
+        self._watchdog_status_chip.setToolTip("Idle-worker watchdog status")
+        self._watchdog_status_chip.setStyleSheet("padding: 2px 8px; border-radius: 8px;")
         self.build_ui()
         self._apply_usage_expanded_for_tab(self.main_tabs.currentIndex())
         self.update_usage_visibility()
@@ -7893,6 +8015,8 @@ class SessionHub(QMainWindow):
         self._status_timer.setInterval(2000)
         self._status_timer.timeout.connect(self._on_running_status_tick)
         self._status_timer.start()
+        self._set_watchdog_status(_idle_watchdog_status())
+        QTimer.singleShot(0, _start_idle_watchdog_if_needed)
 
     def _running_tab_visible(self) -> bool:
         """task-2142: the tmux census (session-level list-sessions AND the pane-level
@@ -7905,9 +8029,22 @@ class SessionHub(QMainWindow):
         )
 
     def _on_running_status_tick(self) -> None:
-        if self._running_tab_visible():
-            self.refresh_running_tab()
+        visible = self._running_tab_visible()
+        self._status_timer.setInterval(2000 if visible else 5000)
+        self.refresh_running_tab(render=visible)
+        self._set_watchdog_status(_idle_watchdog_status())
+        if visible:
             self._check_embedded_terminal_liveness()
+
+    def _set_watchdog_status(self, status: str) -> None:
+        if not hasattr(self, "_watchdog_status_chip"):
+            return
+        status = status if status in {"ON", "OFF", "BLIND"} else "BLIND"
+        self._watchdog_status_chip.setText(f"Watchdog: {status}")
+        color = {"ON": "#2f9e44", "OFF": "#777777", "BLIND": "#d97706"}[status]
+        self._watchdog_status_chip.setStyleSheet(
+            f"padding: 2px 8px; border-radius: 8px; background: {color}; color: white;"
+        )
 
     def _on_main_tab_changed(self, index: int) -> None:
         is_running = index == self.main_tabs.indexOf(self.running_page)
@@ -8196,6 +8333,7 @@ class SessionHub(QMainWindow):
         actions = QHBoxLayout()
         self.status = QLabel()
         actions.addWidget(self.status, 1)
+        actions.addWidget(self._watchdog_status_chip)
         for label, slot in (
             ("Rename", self.rename_selected),
             ("Change directory", self.change_directory),
@@ -8939,8 +9077,10 @@ class SessionHub(QMainWindow):
             ).get("env") or {}
         return (
             overrides.get("ANTHROPIC_MODEL")
+            or overrides.get("model")
             or group_env.get("ANTHROPIC_MODEL")
             or global_env.get("ANTHROPIC_MODEL")
+            or self.settings().get("global_claude_model")
             or None
         )
 
@@ -9079,7 +9219,7 @@ class SessionHub(QMainWindow):
         self.refresh_running_tab(tmux_owner_by_native_key=tmux_owner_by_native_key)
 
     def refresh_running_tab(
-        self, *, tmux_owner_by_native_key: dict[str, str] | None = None,
+        self, *, tmux_owner_by_native_key: dict[str, str] | None = None, render: bool = True,
     ) -> None:
         """Flat list of every currently-running tmux group row, across every project.
 
@@ -9247,6 +9387,13 @@ class SessionHub(QMainWindow):
             (resolved_name, state) for state, _display_name, _cwd, _row, _match, resolved_name,
             _last_message, _message_ms in view_rows
         ])
+
+        # Census and the atomic watchdog snapshot are deliberately independent
+        # of whether the Running tab is visible.  Avoid only the expensive Qt
+        # table work while hidden/minimized; the next visible tick renders the
+        # already-current census.
+        if not render:
+            return
 
         state_order = ("needs_input", "working", "done", "idle", "unknown")
         buckets = {
@@ -10389,7 +10536,13 @@ class SessionHub(QMainWindow):
                 entry["flags"] = flags
             else:
                 entry.pop("flags", None)
-            if session.provider == "Codex":
+            if session.provider == "Claude":
+                model = dialog.model()
+                if model:
+                    entry["model"] = model
+                else:
+                    entry.pop("model", None)
+            elif session.provider == "Codex":
                 model = dialog.model()
                 if model:
                     entry["model"] = model
@@ -11572,6 +11725,7 @@ class SessionHub(QMainWindow):
                     cwd, name, resume=bool(row.get("session_key"))
                 )
                 self._announce_running_launch(result.get("name") or name)
+                QTimer.singleShot(0, _start_idle_watchdog_if_needed)
                 return result
             except (ControlError, OSError, RuntimeError) as error:
                 return {"status": "error", "message": str(error)}
@@ -11655,6 +11809,7 @@ class SessionHub(QMainWindow):
             strip_env=strip_env,
             wait_for_tracking=wait_for_tracking,
         )
+        QTimer.singleShot(0, _start_idle_watchdog_if_needed)
         return {"status": "launched", "name": name}
 
     def rename_group_row(self, cwd: str, old: str, new: str) -> dict:
