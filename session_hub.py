@@ -5127,17 +5127,56 @@ class RunningNameAgeDelegate(QStyledItemDelegate):
         _paint_running_row_separator(painter, option)
 
 
+def _running_separator_color(base: QColor) -> QColor:
+    """The divider colour for a row whose background is ``base``.
+
+    NOT `QPalette.Mid`, which is what the first two attempts used and why the user
+    reported the separators as invisible three times running: on this desktop's dark
+    theme Mid resolves close enough to Base that a 1px line at that colour cannot be
+    seen. Deriving from Base instead guarantees contrast in the only direction that
+    has any -- lighter on a dark row, darker on a light one -- rather than trusting a
+    palette role the theme is free to define however it likes.
+
+    The step is ADDITIVE in HSL lightness, not `QColor.lighter()`, which scales HSV
+    value and therefore returns pure black unchanged -- a real OLED-dark base, and
+    the exact case the ramp test below caught.
+    """
+    lightness = base.lightness()
+    target = min(255, lightness + 60) if lightness < 128 else max(0, lightness - 55)
+    hue, saturation, _lightness, alpha = base.getHsl()
+    separator = QColor(base)
+    separator.setHsl(max(hue, 0), saturation, target, alpha)
+    return separator
+
+
+def _running_alternate_base(base: QColor, alternate: QColor) -> QColor:
+    """The AlternateBase to actually use for the Running table.
+
+    Prefer the desktop theme's own, so the tab matches All Sessions exactly -- that is
+    what the user asked for. Only when the theme leaves the two roles visually identical
+    (some themes set AlternateBase == Base, which reads as "striping is broken") is a
+    derived step substituted, so enabling striping cannot silently do nothing.
+    """
+    if abs(alternate.lightness() - base.lightness()) >= 4:
+        return alternate
+    lightness = base.lightness()
+    target = min(255, lightness + 14) if lightness < 128 else max(0, lightness - 14)
+    hue, saturation, _lightness, alpha = base.getHsl()
+    derived = QColor(base)
+    derived.setHsl(max(hue, 0), saturation, target, alpha)
+    return derived
+
+
 def _paint_running_row_separator(painter, option) -> None:
     """1px divider under each Running-tab row (task-2191 follow-up: the user asked
     for this twice and it was never delivered). Painted by the delegates rather than
     a table-wide stylesheet -- setStyleSheet on a QTableWidget routes item painting
     through QStyleSheetStyle, which stopped honoring the status-colored group headers
     set via header_item.setForeground/setBackground below (regression caught in the
-    same session this was added). Color comes from the option's own palette (Mid) so
-    it stays legible under both light and dark desktop themes.
+    same session this was added).
     """
     painter.save()
-    painter.setPen(option.palette.color(QPalette.ColorRole.Mid))
+    painter.setPen(_running_separator_color(option.palette.color(QPalette.ColorRole.Base)))
     y = option.rect.bottom()
     painter.drawLine(option.rect.left(), y, option.rect.right(), y)
     painter.restore()
@@ -8427,7 +8466,19 @@ class SessionHub(QMainWindow):
         self.running_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.running_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.running_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.running_table.setAlternatingRowColors(False)
+        # Alternating row colours, exactly as the All Sessions table above (user 2026-09-03:
+        # *"i've asked to make it look the same as the All sessions tab which has alternating row
+        # colors in order to separate the rows"*). Safe alongside the status-coloured group
+        # headers: an item with an explicit setBackground keeps it, and both Running delegates
+        # let Qt's own CE_ItemViewItem draw the background before painting over it.
+        self.running_table.setAlternatingRowColors(True)
+        _running_palette = self.running_table.palette()
+        _running_palette.setColor(
+            QPalette.ColorRole.AlternateBase,
+            _running_alternate_base(_running_palette.color(QPalette.ColorRole.Base),
+                                    _running_palette.color(QPalette.ColorRole.AlternateBase)),
+        )
+        self.running_table.setPalette(_running_palette)
         self.running_table.setWordWrap(True)
         self.running_table.setShowGrid(False)
         self.running_table.setItemDelegateForColumn(1, RunningRowSeparatorDelegate(self.running_table))
