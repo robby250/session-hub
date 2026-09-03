@@ -56,7 +56,7 @@ if len(sys.argv) > 1 and sys.argv[1] in {"attach", "--attach", "--attach-session
 
 from PyQt6.QtCore import (
     QByteArray, QEvent, QItemSelectionModel, QObject, QRect, QRunnable, QSocketNotifier,
-    QThreadPool, QTimer, QUrl, Qt, pyqtSignal,
+    QFileSystemWatcher, QThreadPool, QTimer, QUrl, Qt, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QAction,
@@ -1669,7 +1669,7 @@ class EmbeddedTerminalController:
         # superseded this one.
         self.generation = 0
 
-    def begin_attach(self, name: str) -> tuple[bool, str]:
+    def begin_attach(self, name: str, session_id: str | None = None) -> tuple[bool, str]:
         """Phase 1 of attaching: precheck + launch the helper ONLY -- does not block waiting for
         its XID line (task-2142 row453 REWORK -- orchestrator audit, 2026-08-30: a blocking read
         here froze the GUI thread for up to 3s). The caller (the Qt GUI thread) waits for
@@ -1697,6 +1697,8 @@ class EmbeddedTerminalController:
         self.generation += 1
         argv = [self._which("python3"), self._helper_script,
                 "--socket-id", str(winid), "--tmux-session", name]
+        if session_id:
+            argv += ["--session-id", session_id]
         profile_uuid = self._profile_uuid()
         if profile_uuid:
             argv += ["--profile-uuid", profile_uuid]
@@ -8036,6 +8038,7 @@ class SessionHub(QMainWindow):
         self.update_new_provider_list()
         self.restore_window_geometry()
         self.purge_expired_trash()
+        self._install_activity_invalidation_watcher()
         self.refresh()
         # Usage bars refresh only on demand (startup, the Refresh button, or F5);
         # there is no automatic periodic polling.
@@ -8074,6 +8077,23 @@ class SessionHub(QMainWindow):
         self._set_watchdog_status(_idle_watchdog_status())
         if visible:
             self._check_embedded_terminal_liveness()
+
+    def _install_activity_invalidation_watcher(self) -> None:
+        """Refresh the visible Running tab when a hook or embedded answer changes a status file."""
+        self._activity_status_watcher = QFileSystemWatcher(self)
+        try:
+            STATUS_DIR.mkdir(parents=True, exist_ok=True)
+            self._activity_status_watcher.addPath(str(STATUS_DIR))
+        except OSError:
+            return
+        self._activity_status_watcher.directoryChanged.connect(
+            self._on_activity_status_directory_changed
+        )
+
+    def _on_activity_status_directory_changed(self, _path: str) -> None:
+        """Event-driven activity invalidation; the existing census interval remains unchanged."""
+        if self._running_tab_visible():
+            self.refresh_running_tab()
 
     def _set_watchdog_status(self, status: str) -> None:
         if not hasattr(self, "_watchdog_status_chip"):
@@ -9942,7 +9962,7 @@ class SessionHub(QMainWindow):
             # closed to the placeholder rather than crash; extremely unlikely at 8 slots.
             self._running_terminal_stack.setCurrentWidget(self.running_terminal_placeholder)
             return
-        ok, detail = entry.controller.begin_attach(name)
+        ok, detail = entry.controller.begin_attach(name, session_id=session_id)
         if not ok:
             entry.state = "failed"
             entry.tmux_name = None
@@ -10243,7 +10263,7 @@ class SessionHub(QMainWindow):
                 continue  # evicted, or already claimed by a foreground select, while queued
             name = entry.tmux_name
             cwd, session_id, saved_name = entry.meta
-            ok, detail = entry.controller.begin_attach(name)
+            ok, detail = entry.controller.begin_attach(name, session_id=session_id)
             if not ok:
                 entry.state = "failed"
                 entry.tmux_name = None
