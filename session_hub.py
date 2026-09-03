@@ -1268,21 +1268,9 @@ class SessionLaunchOptionsDialog(QDialog):
             inherited.setWordWrap(True)
             inherited.setStyleSheet("color: #888;")
             layout.addWidget(inherited)
-        self.claude_model_combo: QComboBox | None = None
         self.codex_model_combo: QComboBox | None = None
         self.codex_effort_combo: QComboBox | None = None
-        if provider == "Claude":
-            model_row = QHBoxLayout()
-            model_row.addWidget(QLabel("Model:"))
-            self.claude_model_combo = QComboBox()
-            for label, alias in CLAUDE_MODELS:
-                self.claude_model_combo.addItem(label, alias)
-            index = self.claude_model_combo.findData(model) if model else -1
-            if index >= 0:
-                self.claude_model_combo.setCurrentIndex(index)
-            model_row.addWidget(self.claude_model_combo)
-            layout.addLayout(model_row)
-        elif provider == "Codex":
+        if provider == "Codex":
             # Codex has no ANTHROPIC_MODEL-equivalent env var (its model is a
             # plain -m/--model argv, see effective_model/terminal_command),
             # so it gets its own fields here instead of living in the env tab.
@@ -1320,8 +1308,6 @@ class SessionLaunchOptionsDialog(QDialog):
         return self.editor.flags()
 
     def model(self) -> str | None:
-        if self.claude_model_combo:
-            return self.claude_model_combo.currentData()
         return codex_combo_value(self.codex_model_combo) if self.codex_model_combo else None
 
     def reasoning_effort(self) -> str | None:
@@ -10671,13 +10657,7 @@ class SessionHub(QMainWindow):
                 entry["flags"] = flags
             else:
                 entry.pop("flags", None)
-            if session.provider == "Claude":
-                model = dialog.model()
-                if model:
-                    entry["model"] = model
-                else:
-                    entry.pop("model", None)
-            elif session.provider == "Codex":
+            if session.provider == "Codex":
                 model = dialog.model()
                 if model:
                     entry["model"] = model
