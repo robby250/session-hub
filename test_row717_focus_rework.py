@@ -19,6 +19,7 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import _test_sandbox  # noqa: F401  -- MUST precede session_hub; see _test_sandbox.py
 import session_hub
 from PyQt6.QtWidgets import QApplication, QMainWindow, QTableWidgetItem
 

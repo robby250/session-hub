@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 from textual.app import App, ComposeResult
 from textual.widgets import TabbedContent
 
+import _test_sandbox  # noqa: F401  -- MUST precede session_hub; see _test_sandbox.py
 import session_hub_tui
 
 

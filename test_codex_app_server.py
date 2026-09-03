@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import _test_sandbox  # noqa: F401  -- MUST precede session_hub; see _test_sandbox.py
 import codex_app_server
 from codex_app_server import (
     SCHEMA_VERSION,
