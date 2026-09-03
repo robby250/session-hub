@@ -850,6 +850,19 @@ CLI_FLAG_SPECS: dict[str, dict] = {
         "placeholder": "sonnet / full model id",
         "description": "Model to fall back to automatically if the primary model is overloaded.",
     },
+    "--advisor": {
+        "kind": "choice",
+        "choices": [
+            ("Not set", ""),
+            ("Opus", "opus"),
+            ("Fable", "fable"),
+            ("Sonnet", "sonnet"),
+        ],
+        "description": (
+            "Select the Anthropic advisor model for this Claude session. "
+            "The flag is provider-specific and is ignored for Codex."
+        ),
+    },
     "--name": {
         "kind": "text",
         "placeholder": "session-name",
