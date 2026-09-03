@@ -126,6 +126,15 @@ METADATA_PATH = DATA_DIR / "metadata.json"
 # overwhelming majority on any given refresh - cost a single stat() call.
 _FILE_SCAN_CACHE: dict[str, tuple[tuple[float, int], dict, dict | None]] = {}
 
+# Status hooks replace one small JSON file per native session.  The Running tab polls these
+# files at a fixed cadence, so keep the parsed value until its identity/mtime/size changes.  The
+# filesystem watcher still causes an immediate refresh; this cache only removes duplicate reads
+# during the normal timer tick and from the GUI's other presentation paths.
+_STATUS_CACHE_MAX = 512
+_STATUS_CACHE: collections.OrderedDict[str, tuple[int, int, tuple[int, int], dict | None]] = (
+    collections.OrderedDict()
+)
+
 # task-2142: the above cache is per-process only, so a cold TUI/CLI
 # `--sessions-json` invocation - a brand-new interpreter every call -
 # re-scans every transcript from nothing. This on-disk index, keyed by path
@@ -849,6 +858,19 @@ CLI_FLAG_SPECS: dict[str, dict] = {
         "suggestions": ["opus", "sonnet", "haiku", "fable"],
         "placeholder": "sonnet / full model id",
         "description": "Model to fall back to automatically if the primary model is overloaded.",
+    },
+    "--advisor": {
+        "kind": "choice",
+        "choices": [
+            ("Not set", ""),
+            ("Opus", "opus"),
+            ("Fable", "fable"),
+            ("Sonnet", "sonnet"),
+        ],
+        "description": (
+            "Select the Anthropic advisor model for this Claude session. "
+            "The flag is provider-specific and is ignored for Codex."
+        ),
     },
     "--name": {
         "kind": "text",
@@ -2382,6 +2404,24 @@ def read_metadata() -> dict:
     return data
 
 
+def _source_change_token(path: Path) -> tuple[int, int, int, int] | None:
+    """Cheap identity/size/mtime token for a source whose contents are cached by the GUI."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def _directory_change_token(path: Path) -> tuple[int, int, int] | None:
+    """Token directory entry additions/removals without opening every child transcript."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino, stat.st_mtime_ns
+
+
 METADATA_BACKUP_DIR = DATA_DIR / "backups" / "metadata"
 METADATA_BACKUP_RETENTION_DAYS = 30
 
@@ -3792,6 +3832,38 @@ def session_is_tracked_alive(session: Session) -> bool:
     return False
 
 
+def tmux_live_pane_snapshot() -> dict[str, tuple[str, str, str]]:
+    """One bounded snapshot of every live tmux session and its first pane.
+
+    Every tmux session has at least one pane, so ``list-panes -a`` supplies both live-session
+    membership and the pane activity/identity inputs. The Running timer can therefore pay one
+    subprocess instead of separate ``list-sessions`` and ``list-panes`` calls.
+    """
+    tmux = shutil.which("tmux")
+    if not tmux:
+        return {}
+    try:
+        result = subprocess.run(
+            [tmux, "list-panes", "-a", "-F",
+             "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{window_activity}"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if result.returncode != 0:
+        return {}
+    snapshot: dict[str, tuple[str, str, str]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4:
+            continue
+        name, pane_id, pane_pid, activity = parts
+        snapshot.setdefault(name, (pane_id, pane_pid, activity))
+    return snapshot
+
+
 def tmux_live_session_names() -> frozenset[str]:
     """One bounded snapshot of every currently-alive tmux session name.
 
@@ -3815,14 +3887,8 @@ def tmux_live_session_names() -> frozenset[str]:
             timeout=2,
         )
     except (OSError, subprocess.TimeoutExpired):
-        # OSError covers the tmux binary vanishing/becoming unexecutable between the
-        # shutil.which() resolution above and this spawn, and any other launch-time OS
-        # failure (e.g. permission, resource limits) - same fail-closed reading as the
-        # "no tmux server running" branch below, not a crash of the whole census.
         return frozenset()
     if result.returncode != 0:
-        # Also the correct (and common) reading for "no tmux server running
-        # at all" - has-session's per-name equivalent already fails closed.
         return frozenset()
     return frozenset(line for line in result.stdout.splitlines() if line)
 
@@ -4131,15 +4197,18 @@ def tmux_name_by_native_key_failing_closed(census: dict[str, str]) -> dict[str, 
     return {key: owners[0] for key, owners in owners_by_key.items() if len(owners) == 1}
 
 
-def compute_codex_tmux_owner_census() -> dict[str, str]:
+def compute_codex_tmux_owner_census(
+    pane_snapshot: dict[str, tuple[str, str, str]] | None = None,
+) -> dict[str, str]:
     """One batched {native_key: tmux_name} view of which live tmux session currently owns
     each open Codex rollout -- ONE `tmux list-panes -a` plus its /proc walk, the same shape
     refresh_running_tab/sessions_json_cli already computed independently (task-2156). Factored
     out so codex_duplicate_row_losers's callers share one call site instead of re-deriving the
     census inline; call once per refresh/CLI/dialog/click pass, never from inside a per-row loop.
     """
+    pane_snapshot = tmux_pane_activity_snapshot() if pane_snapshot is None else pane_snapshot
     pane_pid_by_name = {
-        name: pid for name, (_pane_id, pid, _activity) in tmux_pane_activity_snapshot().items()
+        name: pid for name, (_pane_id, pid, _activity) in pane_snapshot.items()
     }
     return tmux_name_by_native_key_failing_closed(tmux_native_key_census(pane_pid_by_name))
 
@@ -4264,10 +4333,34 @@ def write_session_status(session_id: str, state: str, detail: str = "", reason: 
 
 
 def read_session_status(session_id: str) -> dict | None:
+    path = STATUS_DIR / f"{session_id}.json"
     try:
-        return json.loads((STATUS_DIR / f"{session_id}.json").read_text())
-    except (OSError, ValueError):
+        stat = path.stat()
+    except OSError:
+        _STATUS_CACHE.pop(str(path), None)
         return None
+    key = str(path)
+    identity = (stat.st_dev, stat.st_ino)
+    cached = _STATUS_CACHE.get(key)
+    if (
+        cached is not None
+        and cached[0] == stat.st_mtime_ns
+        and cached[1] == stat.st_size
+        and cached[2] == identity
+    ):
+        _STATUS_CACHE.move_to_end(key)
+        return cached[3]
+    try:
+        status = json.loads(path.read_text())
+    except (OSError, ValueError):
+        status = None
+    if not isinstance(status, dict):
+        status = None
+    _STATUS_CACHE[key] = (stat.st_mtime_ns, stat.st_size, identity, status)
+    _STATUS_CACHE.move_to_end(key)
+    if len(_STATUS_CACHE) > _STATUS_CACHE_MAX:
+        _STATUS_CACHE.popitem(last=False)
+    return status
 
 
 # Notification types that are a genuine blocker on the agent - the ONLY
@@ -8028,6 +8121,10 @@ class SessionHub(QMainWindow):
         super().__init__()
         self.metadata = read_metadata()
         self.sessions: list[Session] = []
+        self._running_sessions_cache: list[Session] | None = None
+        self._running_sessions_source_token = None
+        self._running_sessions_enabled: tuple[str, ...] | None = None
+        self._running_render_signature = None
         self.usage_widgets: dict[str, list[tuple[QLabel, QProgressBar, QLabel]]] = {}
         self.usage_headers: dict[str, QLabel] = {}
         self.usage_workers: dict[str, UsageWorker] = {}
@@ -8101,6 +8198,46 @@ class SessionHub(QMainWindow):
         self._set_watchdog_status(_idle_watchdog_status())
         if visible:
             self._check_embedded_terminal_liveness()
+
+    def _running_provider_sessions(self, settings: dict) -> list[Session]:
+        """Return provider sessions, rediscovering only when a source can have changed.
+
+        The status timer needs fresh liveness/activity, but the provider session list itself only
+        changes when a state database, history file, or provider session directory changes. The
+        provider readers already cache transcript contents; this outer cache avoids repeating
+        their database queries/glob walks on every 2s tick while retaining a cheap source token.
+        Respect provider checkboxes before collecting, matching the pre-cache behavior and
+        preserving their purpose as a cost gate. Include the enabled set in the cache key so a
+        checkbox toggle immediately discovers a provider that was previously disabled.
+        """
+        enabled = tuple(
+            provider
+            for provider in ("codex", "claude", "antigravity")
+            if settings.get(f"enable_{provider}", True)
+        )
+        token = (
+            _source_change_token(CODEX_STATE),
+            _source_change_token(CLAUDE_HISTORY),
+            _directory_change_token(CLAUDE_PROJECTS),
+            _directory_change_token(ANTIGRAVITY_CONVERSATIONS),
+        )
+        if (
+            self._running_sessions_cache is not None
+            and token == self._running_sessions_source_token
+            and enabled == self._running_sessions_enabled
+        ):
+            return self._running_sessions_cache
+        sessions: list[Session] = []
+        if "codex" in enabled:
+            sessions += codex_sessions()
+        if "claude" in enabled:
+            sessions += claude_sessions()
+        if "antigravity" in enabled:
+            sessions += antigravity_sessions()
+        self._running_sessions_source_token = token
+        self._running_sessions_enabled = enabled
+        self._running_sessions_cache = sessions
+        return sessions
 
     def _install_activity_invalidation_watcher(self) -> None:
         """Refresh the visible Running tab when a hook or embedded answer changes a status file."""
@@ -9354,18 +9491,17 @@ class SessionHub(QMainWindow):
         # stale at the apply boundary below.
         snapshot_generation = self._running_selection.generation
         settings = self.metadata.get("settings", {})
-        live: list[Session] = []
-        if settings.get("enable_codex", True):
-            live += codex_sessions()
-        if settings.get("enable_claude", True):
-            live += claude_sessions()
-        if settings.get("enable_antigravity", True):
-            live += antigravity_sessions()
+        discovered = self._running_provider_sessions(settings)
+        live = [
+            session for session in discovered
+            if settings.get(f"enable_{session.provider.lower()}", True)
+        ]
 
         # One tmux snapshot for the whole refresh - every group row and every
         # standalone session below shares it instead of each spawning its own
         # `tmux has-session` (was up to 2 subprocesses per row).
-        live_names = tmux_live_session_names()
+        pane_snapshot = tmux_live_pane_snapshot()
+        live_names = frozenset(pane_snapshot)
         codex_owner_by_row_id = live_remote_owner_names()
 
         # task-2156: ONE shared batched identity view, computed before the group-row
@@ -9377,7 +9513,7 @@ class SessionHub(QMainWindow):
         tmux_name_by_native_key = (
             tmux_owner_by_native_key
             if tmux_owner_by_native_key is not None
-            else compute_codex_tmux_owner_census()
+            else compute_codex_tmux_owner_census(pane_snapshot)
         )
         if resolve_pending_codex_group_rows(
             self.metadata, live, tmux_owner_by_native_key=tmux_name_by_native_key
@@ -9515,6 +9651,19 @@ class SessionHub(QMainWindow):
         # already-current census.
         if not render:
             return
+
+        render_signature = tuple(
+            (
+                state, display_name, cwd, row.get("provider", "Claude"), row.get("name"),
+                row.get("session_key"), row.get("override_key"), resolved_name,
+                last_message, message_ms,
+            )
+            for state, display_name, cwd, row, _match, resolved_name, last_message, message_ms
+            in view_rows
+        )
+        if render_signature == self._running_render_signature:
+            return
+        self._running_render_signature = render_signature
 
         state_order = ("needs_input", "working", "done", "idle", "unknown")
         buckets = {
