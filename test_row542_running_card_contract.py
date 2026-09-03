@@ -3,6 +3,7 @@
 import inspect
 import unittest
 
+import _test_sandbox  # noqa: F401  -- MUST precede session_hub; see _test_sandbox.py
 import session_hub
 
 
