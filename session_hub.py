@@ -910,15 +910,18 @@ def valid_tmux_session_identity(identity: object) -> bool:
 
     Running-row identities are live authority, not user-entered names.  They must already be
     in the canonical form used by the tmux launch paths: non-empty, not an exact-target marker,
-    and unchanged by the target-separator sanitizer.  Rejecting whitespace also keeps a
-    malformed table payload from becoming a different target at the attach/focus boundary.
+    and unchanged by the target-separator sanitizer.  Every attach/focus call passes this as one
+    argv element (never through a shell), so an internal space is a legitimate tmux session name,
+    not an injection risk -- only leading/trailing whitespace is rejected, since that can't
+    round-trip through `identity.strip()` and signals a malformed table payload. A real session
+    named with a bare space ("Session Hub") used to fail this check and silently leave the
+    embedded panel on whatever was selected before (2026-09-04).
     """
     return (
         isinstance(identity, str)
         and bool(identity)
         and identity == identity.strip()
         and not identity.startswith("=")
-        and not any(char.isspace() for char in identity)
         and sanitize_tmux_session_name(identity) == identity
     )
 
