@@ -29,6 +29,7 @@ from gi.repository import Gdk, GLib, Gtk, Pango, Vte  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from terminal_profile import gnome_terminal_profile_style, tmux_exact_target  # noqa: E402
+from session_status import mark_needs_input_answered, status_dir_from_environment  # noqa: E402
 
 
 def _rgba(spec: str) -> Gdk.RGBA:
@@ -59,7 +60,9 @@ def apply_style(terminal: "Vte.Terminal", style: dict) -> None:
         terminal.set_cursor_shape(shapes[cursor_shape])
 
 
-def build_plug(socket_id: int, tmux_session: str, profile_uuid: str | None) -> tuple:
+def build_plug(
+    socket_id: int, tmux_session: str, profile_uuid: str | None, session_id: str | None = None
+) -> tuple:
     plug = Gtk.Plug.new(socket_id)
     terminal = Vte.Terminal()
     apply_style(terminal, gnome_terminal_profile_style(profile_uuid))
@@ -79,6 +82,14 @@ def build_plug(socket_id: int, tmux_session: str, profile_uuid: str | None) -> t
     plug.add(terminal)
     plug.connect("destroy", lambda *_a: Gtk.main_quit())
     terminal.connect("child-exited", lambda *_a: Gtk.main_quit())
+
+    def invalidate_needs_input(_widget, event) -> bool:
+        """Clear the blocker when Return submits an answer in the embedded terminal."""
+        if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and session_id:
+            mark_needs_input_answered(status_dir_from_environment(), session_id)
+        return False
+
+    terminal.connect("key-press-event", invalidate_needs_input)
     return plug, terminal
 
 
@@ -87,9 +98,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--socket-id", type=int, required=True)
     parser.add_argument("--tmux-session", required=True)
     parser.add_argument("--profile-uuid", default=None)
+    parser.add_argument("--session-id", default=None)
     args = parser.parse_args(argv)
 
-    plug, terminal = build_plug(args.socket_id, args.tmux_session, args.profile_uuid)
+    plug, terminal = build_plug(
+        args.socket_id, args.tmux_session, args.profile_uuid, args.session_id
+    )
     plug.show_all()
     # task-2166: GTK's own toplevel-focus flag (has-toplevel-focus) IS set correctly the moment
     # the embedder gives this window real X11 input focus (see EmbeddedTerminalController.focus /
