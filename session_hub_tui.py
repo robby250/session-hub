@@ -376,16 +376,26 @@ class RunningPane(Vertical):
         ("ctrl+l", "focus_list", "Focus list"),
     ]
 
-    CSS = """
-    # Hug one/few cards with only a small intentional gap; overflow past the cap scrolls.
+    # DEFAULT_CSS, NOT `CSS`. Textual only reads `CSS` on an App; on a Widget it is an
+    # inert class attribute, so this whole block -- the row heights, the border, and every
+    # attempt at striping the Running rows -- had never been applied to anything. That is
+    # why the user reported invisible separators three times while the tests, which only
+    # ever asserted that the CSS CLASS was attached, stayed green. Measured before the
+    # rename: every row, striped or not, resolved to the identical background Color(39,39,39).
+    DEFAULT_CSS = """
+    /* Hug one/few cards with only a small intentional gap; overflow past the cap scrolls.
+       A `#` line is an ID SELECTOR in Textual CSS, never a comment, and parses as a rule
+       the moment this block takes effect -- which is why the line below had to change
+       shape along with the rename. Comments do not nest either. */
     #running-list { height: auto; max-height: 12; min-height: 3; border: round $panel; }
     .running-row { height: 3; padding: 0 1; }
-    /* Same token DataTable's own zebra_stripes uses for its dark-mode even row
-       (textual/widgets/_data_table.py DEFAULT_CSS, &:dark > .datatable--even-row)
-       -- a ListView has no zebra_stripes primitive, so this mirrors it by hand
-       to match the All Sessions tab's look instead of the old border-line divider. */
+    /* Mirrors DataTable's zebra_stripes, which is what the All Sessions tab uses and what
+       the user asked this tab to match -- a ListView has no zebra primitive. The value was
+       always right (measured: DataTable's own even row is Color(13,13,13,a=0.4), and this
+       token lands within one step of it over the same surface); it simply never applied.
+       Keep it DARKER, not lighter, or the two tabs stripe in opposite directions. */
     .running-row-even { background: $surface-darken-1 40%; }
-    .running-card { height: 2; content-align: left middle; }
+    .running-card { height: 2; content-align: left middle; background: transparent; }
     .running-group { height: 1; padding: 0 1; color: $text-muted; text-style: bold; }
     """
 
