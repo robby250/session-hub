@@ -8138,6 +8138,7 @@ class SessionHub(QMainWindow):
         self.sessions: list[Session] = []
         self._running_sessions_cache: list[Session] | None = None
         self._running_sessions_source_token = None
+        self._running_sessions_enabled: tuple[str, ...] | None = None
         self._running_render_signature = None
         self.usage_widgets: dict[str, list[tuple[QLabel, QProgressBar, QLabel]]] = {}
         self.usage_headers: dict[str, QLabel] = {}
@@ -8213,24 +8214,43 @@ class SessionHub(QMainWindow):
         if visible:
             self._check_embedded_terminal_liveness()
 
-    def _running_provider_sessions(self) -> list[Session]:
+    def _running_provider_sessions(self, settings: dict) -> list[Session]:
         """Return provider sessions, rediscovering only when a source can have changed.
 
         The status timer needs fresh liveness/activity, but the provider session list itself only
         changes when a state database, history file, or provider session directory changes. The
         provider readers already cache transcript contents; this outer cache avoids repeating
         their database queries/glob walks on every 2s tick while retaining a cheap source token.
+        Respect provider checkboxes before collecting, matching the pre-cache behavior and
+        preserving their purpose as a cost gate. Include the enabled set in the cache key so a
+        checkbox toggle immediately discovers a provider that was previously disabled.
         """
+        enabled = tuple(
+            provider
+            for provider in ("codex", "claude", "antigravity")
+            if settings.get(f"enable_{provider}", True)
+        )
         token = (
             _source_change_token(CODEX_STATE),
             _source_change_token(CLAUDE_HISTORY),
             _directory_change_token(CLAUDE_PROJECTS),
             _directory_change_token(ANTIGRAVITY_CONVERSATIONS),
         )
-        if self._running_sessions_cache is not None and token == self._running_sessions_source_token:
+        if (
+            self._running_sessions_cache is not None
+            and token == self._running_sessions_source_token
+            and enabled == self._running_sessions_enabled
+        ):
             return self._running_sessions_cache
-        sessions = codex_sessions() + claude_sessions() + antigravity_sessions()
+        sessions: list[Session] = []
+        if "codex" in enabled:
+            sessions += codex_sessions()
+        if "claude" in enabled:
+            sessions += claude_sessions()
+        if "antigravity" in enabled:
+            sessions += antigravity_sessions()
         self._running_sessions_source_token = token
+        self._running_sessions_enabled = enabled
         self._running_sessions_cache = sessions
         return sessions
 
@@ -9461,7 +9481,7 @@ class SessionHub(QMainWindow):
         # stale at the apply boundary below.
         snapshot_generation = self._running_selection.generation
         settings = self.metadata.get("settings", {})
-        discovered = self._running_provider_sessions()
+        discovered = self._running_provider_sessions(settings)
         live = [
             session for session in discovered
             if settings.get(f"enable_{session.provider.lower()}", True)

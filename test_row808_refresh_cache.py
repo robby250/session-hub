@@ -19,13 +19,13 @@ class RunningRefreshCacheTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def _window_patches(self, root: Path, calls: dict[str, int]):
+    def _window_patches(self, root: Path, calls: dict[str, int], settings=None):
         session = session_hub.Session(
             "Claude", "id-808", "demo", "/tmp/row808", "/tmp/row808", 100,
             root / "transcript.jsonl",
         )
         metadata = {
-            "settings": {}, "sessions": {},
+            "settings": settings or {}, "sessions": {},
             "groups": {"/tmp/row808": {"tmux": True, "rows": [{"name": "demo"}]}},
         }
 
@@ -88,6 +88,36 @@ class RunningRefreshCacheTests(unittest.TestCase):
                     window.refresh_running_tab()
                     window.refresh_running_tab()
                 self.assertEqual(clear.call_count, 1)
+                window.close()
+            finally:
+                for item in reversed(patches):
+                    item.stop()
+
+    def test_disabled_provider_is_not_collected_and_toggle_reopens_its_cache_slot(self):
+        calls = {"codex": 0, "claude": 0, "antigravity": 0}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            patches = self._window_patches(
+                root,
+                calls,
+                settings={"enable_codex": False, "enable_antigravity": False},
+            )
+            for item in patches:
+                item.start()
+            try:
+                window = session_hub.SessionHub()
+                window.refresh_running_tab()
+                self.assertEqual(calls, {"codex": 0, "claude": 1, "antigravity": 0})
+                self.assertTrue(
+                    all(
+                        session.provider == "Claude"
+                        for session in window._running_sessions_cache
+                    )
+                )
+
+                window.metadata["settings"]["enable_codex"] = True
+                window.refresh_running_tab()
+                self.assertEqual(calls, {"codex": 1, "claude": 2, "antigravity": 0})
                 window.close()
             finally:
                 for item in reversed(patches):
