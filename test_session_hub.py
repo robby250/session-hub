@@ -4371,6 +4371,86 @@ class SessionHubTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(metadata.get("links", {}), {})
 
+    def test_resolve_clear_continuations_detects_a_clear_on_an_identified_group_row(self):
+        # row772 (user 2026-09-04, VAMP-work2): a /clear never deletes the session it left, so
+        # "the old transcript still exists" was true forever and the identified-session guard
+        # above made /clear permanently undetectable for every named or grouped Claude row.
+        # Order is what separates the two cases -- the continuation takes its first prompt AFTER
+        # the predecessor's last, while the orchestrator incident's thief was taking prompts
+        # alongside it the whole time. Real ids/timestamps from the live incident.
+        history = {
+            "a8029483": {"started_ms": 1_788_296_336_000, "updated_ms": 1_788_507_334_000},
+            "9b1ee8d0": {"started_ms": 1_788_507_336_000, "updated_ms": 1_788_507_348_000},
+            # Concurrent sibling: started long before a8029483's last prompt, so it must stay
+            # ineligible however recently it was itself updated.
+            "b2a5d02f": {"started_ms": 1_788_364_215_000, "updated_ms": 1_788_507_330_000},
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / "241548.json").write_text(
+                json.dumps({"cwd": "/home/user/vamp", "session_id": "a8029483"})
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", key, "title", "/home/user/vamp", "/home/user/vamp",
+                    entry["updated_ms"], Path(f"/tmp/{key}.jsonl"),
+                )
+                for key, entry in history.items()
+            ]
+            metadata = {
+                "sessions": {"Claude:a8029483": {"name": "VAMP-work2"}},
+                "groups": {
+                    "/home/user/vamp": {
+                        "rows": [{
+                            "name": "VAMP-work2",
+                            "provider": "Claude",
+                            "override_key": "group:/home/user/vamp#VAMP-work2",
+                            "session_key": "Claude:a8029483",
+                        }]
+                    }
+                },
+            }
+            with (
+                patch("session_hub.PID_DIR", pid_dir),
+                patch("session_hub.process_alive", return_value=True),
+                patch("session_hub.claude_history_index", return_value=history),
+            ):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+        self.assertTrue(changed)
+        (link,) = metadata["links"].values()
+        self.assertEqual(set(link["members"]), {"Claude:a8029483", "Claude:9b1ee8d0"})
+        self.assertEqual(link["active"], "Claude:9b1ee8d0")
+        # The concurrent sibling is never absorbed, even though it shares the cwd.
+        self.assertNotIn("Claude:b2a5d02f", link["members"])
+
+    def test_resolve_clear_continuations_needs_prompt_order_to_supersede_an_identified_session(self):
+        """Without history for the old session there is no order to judge by, so an identified
+        session is left exactly as before - fail closed, never guess by recency."""
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / "241548.json").write_text(
+                json.dumps({"cwd": "/home/user/vamp", "session_id": "orchestrator-id"})
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "orchestrator-id", "title", "/home/user/vamp",
+                    "/home/user/vamp", 100_000, Path("/tmp/orch.jsonl"),
+                ),
+                session_hub.Session(
+                    "Claude", "sonnet1-id", "title", "/home/user/vamp",
+                    "/home/user/vamp", 999_000, Path("/tmp/sonnet1.jsonl"),
+                ),
+            ]
+            metadata = {"sessions": {"Claude:orchestrator-id": {"name": "VAMPULSE-orchestrator"}}}
+            with (
+                patch("session_hub.PID_DIR", pid_dir),
+                patch("session_hub.process_alive", return_value=True),
+                patch("session_hub.claude_history_index", return_value={}),
+            ):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+        self.assertFalse(changed)
+        self.assertEqual(metadata.get("links", {}), {})
+
     def test_adopt_untracked_sessions_backfills_tracking_for_live_claude_process(self):
         with tempfile.TemporaryDirectory() as temp:
             proc_root = Path(temp) / "proc"

@@ -2583,9 +2583,16 @@ def _scan_claude_history(path: Path) -> dict[str, dict]:
                 if display and "title" not in entry:
                     entry["title"] = display
                 entry["cwd"] = row.get("project") or entry.get("cwd")
-                entry["updated_ms"] = max(
-                    int(row.get("timestamp") or 0), int(entry.get("updated_ms") or 0)
-                )
+                stamp = int(row.get("timestamp") or 0)
+                entry["updated_ms"] = max(stamp, int(entry.get("updated_ms") or 0))
+                # When this session first received a prompt. Paired with updated_ms it orders
+                # two sessions in one project against each other, which is what tells a /clear
+                # continuation (started AFTER its predecessor's last prompt) apart from an
+                # unrelated sibling that has merely been running alongside it all along - see
+                # resolve_clear_continuations. Free here: the scan is already reading every row
+                # and is cached by mtime.
+                if stamp:
+                    entry["started_ms"] = min(stamp, int(entry.get("started_ms") or stamp))
     except OSError:
         pass
     return index
@@ -5954,6 +5961,16 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
                 group_session_keys.add(session_key)
 
     session_overrides = metadata.get("sessions", {})
+    # history.jsonl orders two sessions in one project against each other by prompt time, which
+    # is the ONLY evidence that separates the two cases the identified-session guard below has
+    # to tell apart. Already cached by mtime; no transcript is re-read for this.
+    prompt_history = claude_history_index()
+
+    def _first_prompt_ms(session_id: str | None) -> int:
+        return int((prompt_history.get(session_id or "") or {}).get("started_ms") or 0)
+
+    def _last_prompt_ms(session_id: str | None) -> int:
+        return int((prompt_history.get(session_id or "") or {}).get("updated_ms") or 0)
 
     # task-2127: a tracked PID whose own session_id is STILL live (no
     # /clear at all - just a leftover old transcript some OTHER cwd
@@ -5994,18 +6011,31 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
         # just lost the "most recently updated in this shared cwd" race to
         # Vampulse-sonnet1's own, unrelated activity, and got /clear-linked
         # into sonnet1's session instead of being left alone.
-        if (
+        # ...but "the old transcript still exists" is NOT "this PID is still on it". A /clear
+        # never deletes the session it left, so before row772 this guard fired on EVERY named or
+        # grouped Claude row and made their /clear permanently undetectable (user 2026-09-04,
+        # VAMP-work2: a8029483 -> 9b1ee8d0 never linked). What actually separates the two cases
+        # is ORDER, not existence: a /clear continuation receives its first prompt after its
+        # predecessor's last one, while the orchestrator incident's thief had been taking prompts
+        # alongside it the whole time. Only a successor may supersede an identified session.
+        old_last_ms = _last_prompt_ms(old_session_id)
+
+        def _is_successor(session: Session) -> bool:
+            started = _first_prompt_ms(session.session_id)
+            return bool(started and old_last_ms) and started >= old_last_ms
+
+        identified = bool(
             old_key
             and any(session.session_id == old_session_id for session in cwd_sessions)
             and (session_overrides.get(old_key, {}).get("name") or old_key in group_session_keys)
-        ):
-            continue
+        )
         candidates = [
             session
             for session in cwd_sessions
             if session.session_id == old_session_id
             or (
-                session.session_id not in claimed
+                (not identified or _is_successor(session))
+                and session.session_id not in claimed
                 # A session the user has already explicitly named is a
                 # deliberately distinct, identified session - not a fresh,
                 # anonymous /clear continuation to silently absorb. Group
