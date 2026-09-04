@@ -131,3 +131,39 @@ middle thread; the record lives in `/run`, so it survives an app restart but not
 - **Cannot be verified without the user:** that the Running row is clickable and embeds, that a
   fresh Continue-with-other-agent links within one refresh, and that a `/clear` inside a Codex row
   relinks.
+
+## Follow-up — a just-launched session was invisible in Running (2026-09-04)
+
+User: *"when i launch a new session it doesn't appear in the running tab ... so i can't interact
+with the new session."* Reproduced live on three of them at once: tmux `test`, `projects-haiku`
+(Claude, `--session-id` minted) and `projects` (Codex App Server, record `c-2577…`).
+
+**The finding — an authority asymmetry, not a regression.** `group_row_status` trusts
+`tmux_session_alive` outright, so a GROUP row is Running the instant it launches. A STANDALONE row
+is transcript-authoritative: it exists only once `discover_sessions` finds its `.jsonl`/rollout, and
+neither CLI writes one until the first message. So Session Hub launched a live tmux session it could
+not show, and the user could not open it to send the message that would have made it visible.
+
+Two further facts from the same live state:
+
+| # | fact | evidence |
+|---|---|---|
+| RC7 | **the app-server's rollout fd is TRANSIENT** — F2 read it as if it were durable | `open_rollout_keys(267265)` → `[]` while `~/.codex/sessions/…/01a04002….jsonl` existed and the row was live |
+| RC8 | a `--session-id` launch stayed PID-untracked until its first message, so its own `/clear` was undetectable in that window | no `264058.json`/`266176.json` under `PID_DIR` for two live hub-launched Claude PIDs |
+
+### What shipped
+
+- **F7** `codex_app_server_owner_census` falls back to the record's persisted `thread_id` when the
+  app-server currently holds no rollout fd. An open fd still wins (current thread beats last-known).
+- **F8** `parse_claude_cmdline_identity` also reads `--session-id`; `adopt_untracked_sessions`
+  records it as `{"minted": true}`. `resolve_clear_continuations` skips a minted id with no
+  transcript on disk — "gone" and "not yet begun" are opposite facts that look identical from
+  `cwd_sessions` alone, and the second must never link a new empty terminal to a cwd sibling.
+- **F9** `pending_launch_running_rows` renders a Running row for a hub launch with nothing
+  discoverable yet: the live PID tracking file for Claude, the live owner record for Codex (cwd off
+  the remote's own `--cd` argv). `match` is `None`, so activity reads "unknown" and the last-message
+  column is empty until the transcript appears. Deduped by tmux name against the rows already
+  rendered; `enabled_providers` keeps the provider checkboxes a cost gate.
+
+**Not done:** `sessions_json_cli` still lists only discovered sessions, so the TUI and the peer
+resolver do not see a not-yet-messaged launch. F7 does reach them.

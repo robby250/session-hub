@@ -3858,11 +3858,22 @@ def capture_hub_launch(
 
 
 def record_hub_launch(
-    pid: int, cwd: str, session_id: str | None, model: str | None = None
+    pid: int,
+    cwd: str,
+    session_id: str | None,
+    model: str | None = None,
+    *,
+    minted: bool = False,
 ) -> None:
     PID_DIR.mkdir(parents=True, exist_ok=True)
     tracking_file = PID_DIR / f"{pid}.json"
     payload = {"cwd": cwd, "session_id": session_id}
+    if minted:
+        # This id came from `--session-id`, so it names a session that does not exist YET rather
+        # than one observed on disk. resolve_clear_continuations needs the difference: a minted
+        # id with no transcript has not begun, an observed one that lost its transcript has not
+        # either - only the first is a normal, expected state.
+        payload["minted"] = True
     if model:
         # Carries the model chosen in the New Session dialog forward to
         # resolve_clear_continuations, which is the first place this brand
@@ -4300,11 +4311,19 @@ def codex_app_server_owner_census() -> dict[str, str]:
     claims: dict[str, list[str]] = {}
     for record in live_owner_records(REGISTRY_DIR).values():
         keys = open_rollout_keys(record["pid"], sessions_root, PROC_ROOT)
-        if not keys:
-            continue
         # Newest-written rollout first: an App Server momentarily holding two open rollouts
-        # (mid-/clear, or a fork) is working on the one it just wrote to.
-        claims.setdefault(keys[0], []).append(record["name"])
+        # (mid-/clear, or a fork) is working on the one it just wrote to.  The fd is TRANSIENT
+        # though -- an app-server between turns holds none at all (verified live on a just-
+        # launched row, 2026-09-04), which resolved that row to None and dropped it out of the
+        # Running tab.  The record's own thread_id is the durable memory of the same fact,
+        # written at launch and kept current by reconcile_codex_owner_threads, so fall back to it
+        # rather than to no answer.
+        key = keys[0] if keys else (
+            f"Codex:{record['thread_id']}" if record.get("thread_id") else None
+        )
+        if not key:
+            continue
+        claims.setdefault(key, []).append(record["name"])
     return {key: names[0] for key, names in claims.items() if len(names) == 1}
 
 
@@ -5748,8 +5767,10 @@ def standalone_tmux_status(
     return True, name, ("Running" if tmux_session_alive(name, live_names) else "Stopped")
 
 
-def parse_claude_cmdline_identity(cmdline: str) -> tuple[str | None, str | None]:
-    """(--resume SESSION_ID, --name NAME) explicitly present in a claude argv, if any.
+def parse_claude_cmdline_identity(
+    cmdline: str,
+) -> tuple[str | None, str | None, str | None]:
+    """(--resume SESSION_ID, --name NAME, --session-id SESSION_ID) present in a claude argv.
 
     `cmdline` is /proc's NUL-joined argv. Reading these straight off the
     process's own arguments gives an exact identity instead of a guess -
@@ -5757,20 +5778,28 @@ def parse_claude_cmdline_identity(cmdline: str) -> tuple[str | None, str | None]
     untracked processes sharing one cwd (every member of a tmux-launched
     session group does, since none of them get PID-tracked at launch time -
     see tmux_group_launch_command).
+
+    `--session-id` is just as exact as `--resume` and arrives EARLIER: launch_new mints it before
+    the process starts, so it identifies a brand new session in the window before Claude has
+    written a single transcript byte. Without it such a launch stayed untracked until its first
+    message (user 2026-09-04) - long enough for its own /clear to be missed.
     """
     parts = cmdline.split("\x00")
     resume_id = None
     name = None
+    session_id = None
     for index, part in enumerate(parts):
         if part == "--resume" and index + 1 < len(parts) and parts[index + 1]:
             resume_id = parts[index + 1]
         elif part == "--name" and index + 1 < len(parts) and parts[index + 1]:
             name = parts[index + 1]
-    return resume_id, name
+        elif part == "--session-id" and index + 1 < len(parts) and parts[index + 1]:
+            session_id = parts[index + 1]
+    return resume_id, name, session_id
 
 
-def find_untracked_claude_pids() -> list[tuple[int, str, str | None, str | None]]:
-    """(pid, cwd, resume_id, name) for live `claude` CLI processes not yet tracked.
+def find_untracked_claude_pids() -> list[tuple[int, str, str | None, str | None, str | None]]:
+    """(pid, cwd, resume_id, name, session_id) for live `claude` CLI processes not yet tracked.
 
     Best-effort /proc scan: matches any process whose cmdline mentions "claude"
     (covers both a direct binary and a node-shebang-wrapped script) and whose
@@ -5807,8 +5836,8 @@ def find_untracked_claude_pids() -> list[tuple[int, str, str | None, str | None]
             cwd = os.readlink(entry / "cwd")
         except OSError:
             continue
-        resume_id, name = parse_claude_cmdline_identity(cmdline)
-        found.append((pid, cwd, resume_id, name))
+        resume_id, name, session_id = parse_claude_cmdline_identity(cmdline)
+        found.append((pid, cwd, resume_id, name, session_id))
     return found
 
 
@@ -5845,9 +5874,13 @@ def adopt_untracked_sessions(sessions: list[Session]) -> None:
         current = latest_by_cwd.get(session.cwd)
         if not current or session.updated_ms > current.updated_ms:
             latest_by_cwd[session.cwd] = session
-    for pid, cwd, resume_id, name in candidates:
-        if resume_id:
-            record_hub_launch(pid, cwd, resume_id)
+    for pid, cwd, resume_id, name, session_id in candidates:
+        if resume_id or session_id:
+            # Both are exact, and a launch never carries both (--session-id mints a NEW id,
+            # --resume names an existing one), so order between them is arbitrary.
+            record_hub_launch(
+                pid, cwd, resume_id or session_id, minted=not resume_id and bool(session_id)
+            )
             continue
         if name:
             match = next(
@@ -6000,6 +6033,24 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
         old_session_id = entry.get("session_id")
         cwd_sessions = by_cwd.get(entry.get("cwd"), [])
         old_key = f"Claude:{old_session_id}" if old_session_id else None
+        # A MINTED id with no transcript anywhere on disk has not begun - the process was
+        # launched with `--session-id` and has not been messaged yet (adopt_untracked_sessions
+        # records those the moment they launch, before Claude writes a byte). "Gone" and "not yet
+        # begun" look identical from cwd_sessions alone, and treating the second as a /clear
+        # would link a brand new empty session to whatever unrelated sibling happened to be the
+        # newest in a shared cwd. Scoped to minted ids: an observed id whose transcript is gone
+        # keeps its existing behaviour.
+        if (
+            entry.get("minted")
+            and old_session_id
+            and not any(session.session_id == old_session_id for session in cwd_sessions)
+            and not (
+                CLAUDE_PROJECTS
+                / claude_project_key(entry.get("cwd") or "")
+                / f"{old_session_id}.jsonl"
+            ).exists()
+        ):
+            continue
         # An already-identified old session - explicitly named, or the
         # current session_key of a saved group row - must never be treated
         # as "gone" just because some unrelated, more recently updated
@@ -6054,6 +6105,7 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
             continue
         if old_session_id is None:
             pending_model = entry.pop("pending_model", None)
+            entry.pop("minted", None)
             entry["session_id"] = latest.session_id
             tracking_file.write_text(json.dumps(entry))
             claimed.add(latest.session_id)
@@ -6074,11 +6126,126 @@ def resolve_clear_continuations(metadata: dict, sessions: list[Session]) -> bool
             old_session.title if old_session else None
         )
         link_continuation(metadata, old_key, new_key, old_title, "clear")
+        entry.pop("minted", None)
         entry["session_id"] = latest.session_id
         tracking_file.write_text(json.dumps(entry))
         claimed.add(latest.session_id)
         changed = True
     return changed
+
+
+def live_hub_launches() -> list[dict]:
+    """`{"pid", "cwd", "session_id"}` for every live Session-Hub-tracked Claude PID.
+
+    The same PID_DIR tracking files resolve_clear_continuations reads. Dead PIDs are skipped but
+    never unlinked - that function owns their cleanup, and a reader that also deleted would race
+    it.
+    """
+    if not PID_DIR.is_dir():
+        return []
+    launches: list[dict] = []
+    for tracking_file in PID_DIR.glob("*.json"):
+        if not tracking_file.stem.isdigit() or not process_alive(int(tracking_file.stem)):
+            continue
+        try:
+            entry = json.loads(tracking_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(entry, dict):
+            launches.append({**entry, "pid": int(tracking_file.stem)})
+    return launches
+
+
+def codex_remote_cwd(remote_pid: int | None, proc_root: Path | None = None) -> str | None:
+    """The `--cd DIR` a `codex --remote` client was launched with, read off its own argv.
+
+    An owner record names the remote pid but not the directory, and a not-yet-discovered Codex
+    row has no rollout to take one from. The launch argv is the literal value Session Hub passed,
+    so it needs no inference - and unlike /proc/<pid>/cwd it cannot drift if the process chdirs.
+    """
+    if not remote_pid:
+        return None
+    try:
+        parts = (
+            (proc_root or PROC_ROOT) / str(remote_pid) / "cmdline"
+        ).read_bytes().decode("utf-8", "replace").split("\x00")
+    except OSError:
+        return None
+    for index, part in enumerate(parts):
+        if part == "--cd" and index + 1 < len(parts) and parts[index + 1]:
+            return parts[index + 1]
+    return None
+
+
+def pending_launch_running_rows(
+    metadata: dict,
+    sessions: list["Session"],
+    live_names: frozenset[str],
+    rendered_names: set[str],
+    enabled_providers: frozenset[str] = frozenset({"Claude", "Codex"}),
+    registry_dir: Path | None = None,
+    proc_root: Path | None = None,
+) -> list[tuple[str, str, dict, None, str]]:
+    """Running rows for hub launches that have not written a transcript YET.
+
+    A GROUP row is tmux-authoritative - group_row_status trusts tmux_session_alive outright - so
+    it shows up in Running the instant it launches. A STANDALONE session is transcript-
+    authoritative: it only exists once discover_sessions finds its `.jsonl`/rollout, and neither
+    CLI writes one until the first message. So "New Claude/Codex -> Start" launched a real, live
+    tmux session that the Running tab could not show, and the user could not open it to send the
+    first message that would have made it visible (user 2026-09-04).
+
+    Both halves key on launch-time identity bound to a LIVE process - the PID tracking file for
+    Claude, the owner record for Codex - so a row here retires itself the moment the session dies
+    or becomes discoverable. Nothing here is persisted and no name already rendered above is ever
+    rendered twice. `enabled_providers` keeps the per-provider checkboxes a cost gate here too -
+    a disabled provider is not discovered, so it must not reappear through this path either.
+    """
+    discovered = {session.native_key for session in sessions}
+    overrides = metadata.get("sessions", {}) or {}
+    taken = set(rendered_names)
+    rows: list[tuple[str, str, dict, None, str]] = []
+
+    for entry in (live_hub_launches() if "Claude" in enabled_providers else []):
+        session_id, cwd = entry.get("session_id"), entry.get("cwd")
+        if not session_id or not cwd or f"Claude:{session_id}" in discovered:
+            continue
+        # launch_new saves the tmux name it minted under the session's own key, which is exactly
+        # what standalone_tmux_status would resolve once the session exists. No name saved means
+        # nothing ties this PID to a tmux session, so fail closed rather than guess one.
+        saved = (overrides.get(f"Claude:{session_id}") or {}).get("name")
+        # Sanitized the same way standalone_tmux_status does, so the name checked here is the
+        # same tmux identity a resume would attach to.
+        name = sanitize_tmux_session_name(saved) if saved else None
+        if not name or name not in live_names or name in taken:
+            continue
+        taken.add(name)
+        rows.append(
+            (Path(cwd).name or cwd, cwd, {"name": name, "provider": "Claude"}, None, name)
+        )
+
+    codex_records = (
+        live_owner_records(registry_dir or REGISTRY_DIR).values()
+        if "Codex" in enabled_providers
+        else []
+    )
+    for record in codex_records:
+        name = record.get("name")
+        thread_id = record.get("thread_id")
+        if not name or name not in live_names or name in taken:
+            continue
+        if thread_id and f"Codex:{thread_id}" in discovered:
+            # Already discoverable: the ordinary standalone/group path owns it, and it renders a
+            # real match (activity, last message) this placeholder cannot.
+            continue
+        cwd = codex_remote_cwd(record.get("remote_pid"), proc_root)
+        if not cwd:
+            continue
+        taken.add(name)
+        rows.append(
+            (Path(cwd).name or cwd, cwd, {"name": name, "provider": "Codex"}, None, name)
+        )
+    return rows
 
 
 def executable(name: str) -> str:
@@ -9751,6 +9918,20 @@ class SessionHub(QMainWindow):
                     session.title, session.cwd,
                     {"name": name, "provider": session.provider}, session, name,
                 ))
+
+        # A just-launched session has no transcript yet, so neither loop above can see it even
+        # though its tmux session is live and Session Hub itself started it (row772).
+        running += pending_launch_running_rows(
+            self.metadata,
+            live,
+            live_names,
+            {resolved_name for _dn, _cwd, _row, _match, resolved_name in running},
+            frozenset(
+                provider
+                for provider in ("Claude", "Codex")
+                if settings.get(f"enable_{provider.lower()}", True)
+            ),
+        )
 
         # task-2172 row491: preload event-driven off THIS census -- no new tmux subprocess or
         # census pass, reuses exactly the `running` list just built above.

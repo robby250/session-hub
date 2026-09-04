@@ -4530,6 +4530,170 @@ class SessionHubTests(unittest.TestCase):
                 session_hub.adopt_untracked_sessions(sessions)
             self.assertFalse((pid_dir / f"{pid}.json").exists())
 
+    def test_parse_claude_cmdline_identity_reads_a_minted_session_id(self):
+        resume_id, name, session_id = session_hub.parse_claude_cmdline_identity(
+            "claude\x00--name\x00test\x00--session-id\x00a9221d6e\x00"
+        )
+        self.assertIsNone(resume_id)
+        self.assertEqual(name, "test")
+        self.assertEqual(session_id, "a9221d6e")
+
+    def test_adopt_untracked_sessions_tracks_a_minted_session_before_its_transcript(self):
+        """row772: a New Claude launch is identified by --session-id from its first instant, so
+        it must not stay untracked (and its own /clear undetectable) until its first message."""
+        with tempfile.TemporaryDirectory() as temp:
+            proc_root = Path(temp) / "proc"
+            pid_dir = Path(temp) / "pids"
+            target_cwd = Path(temp) / "vamp"
+            target_cwd.mkdir()
+            pid = os.getpid()
+            proc_pid_dir = proc_root / str(pid)
+            proc_pid_dir.mkdir(parents=True)
+            (proc_pid_dir / "cmdline").write_bytes(
+                b"claude\x00--name\x00test\x00--session-id\x00minted-id\x00"
+            )
+            (proc_pid_dir / "cwd").symlink_to(target_cwd)
+            with (
+                patch("session_hub.PROC_ROOT", proc_root),
+                patch("session_hub.PID_DIR", pid_dir),
+            ):
+                session_hub.adopt_untracked_sessions([])
+            tracking = json.loads((pid_dir / f"{pid}.json").read_text())
+        self.assertEqual(tracking["session_id"], "minted-id")
+        self.assertTrue(tracking["minted"])
+
+    def test_resolve_clear_continuations_ignores_a_minted_session_that_never_started(self):
+        """A minted id with no transcript has not BEGUN; treating that as a vanished session
+        would link the brand new terminal to an unrelated sibling in the same cwd."""
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp) / "pids"
+            pid_dir.mkdir()
+            (pid_dir / f"{os.getpid()}.json").write_text(
+                json.dumps(
+                    {"cwd": "/home/user/proj", "session_id": "minted-id", "minted": True}
+                )
+            )
+            sessions = [
+                session_hub.Session(
+                    "Claude", "unrelated-id", "sibling", "/home/user/proj",
+                    "/home/user/proj", 900_000, Path("/tmp/unrelated.jsonl"),
+                )
+            ]
+            metadata = {}
+            with (
+                patch("session_hub.PID_DIR", pid_dir),
+                patch("session_hub.CLAUDE_PROJECTS", Path(temp) / "projects"),
+                patch("session_hub.process_alive", return_value=True),
+                patch("session_hub.claude_history_index", return_value={}),
+            ):
+                changed = session_hub.resolve_clear_continuations(metadata, sessions)
+        self.assertFalse(changed)
+        self.assertEqual(metadata.get("links", {}), {})
+
+    def test_pending_launch_running_rows_shows_a_just_launched_claude_session(self):
+        """row772: a standalone session is only discoverable once its transcript exists, so
+        "New Claude -> Start" produced a live tmux session the Running tab could not show - and
+        the user could not open it to send the first message that would create that transcript."""
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / f"{os.getpid()}.json").write_text(
+                json.dumps({"cwd": "/home/user/proj", "session_id": "minted-id"})
+            )
+            metadata = {"sessions": {"Claude:minted-id": {"name": "test"}}}
+            with patch("session_hub.PID_DIR", pid_dir):
+                rows = session_hub.pending_launch_running_rows(
+                    metadata, [], frozenset({"test"}), set(),
+                    frozenset({"Claude"}),
+                )
+        self.assertEqual(len(rows), 1)
+        _display, cwd, row, match, resolved_name = rows[0]
+        self.assertEqual((cwd, row["name"], row["provider"]), ("/home/user/proj", "test", "Claude"))
+        self.assertIsNone(match)
+        self.assertEqual(resolved_name, "test")
+
+    def test_pending_launch_running_rows_never_repeats_a_discovered_or_rendered_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pid_dir = Path(temp)
+            (pid_dir / f"{os.getpid()}.json").write_text(
+                json.dumps({"cwd": "/home/user/proj", "session_id": "minted-id"})
+            )
+            metadata = {"sessions": {"Claude:minted-id": {"name": "test"}}}
+            discovered = [
+                session_hub.Session(
+                    "Claude", "minted-id", "test", "/home/user/proj",
+                    "/home/user/proj", 900_000, Path("/tmp/test.jsonl"),
+                )
+            ]
+            with patch("session_hub.PID_DIR", pid_dir):
+                # Already discovered - the ordinary standalone path owns it.
+                self.assertEqual(
+                    session_hub.pending_launch_running_rows(
+                        metadata, discovered, frozenset({"test"}), set(), frozenset({"Claude"}),
+                    ),
+                    [],
+                )
+                # Already rendered above under that tmux name.
+                self.assertEqual(
+                    session_hub.pending_launch_running_rows(
+                        metadata, [], frozenset({"test"}), {"test"}, frozenset({"Claude"}),
+                    ),
+                    [],
+                )
+                # Provider checkbox off stays a cost gate here too.
+                self.assertEqual(
+                    session_hub.pending_launch_running_rows(
+                        metadata, [], frozenset({"test"}), set(), frozenset({"Codex"}),
+                    ),
+                    [],
+                )
+
+    def test_pending_launch_running_rows_shows_a_codex_owner_with_no_rollout_yet(self):
+        with tempfile.TemporaryDirectory() as temp:
+            proc_root = Path(temp) / "proc"
+            (proc_root / "4242").mkdir(parents=True)
+            (proc_root / "4242" / "cmdline").write_bytes(
+                b"codex\x00--remote\x00unix:///s.sock\x00--cd\x00/home/user/projects\x00"
+            )
+            records = {
+                "projects": {
+                    "row_id": "projects", "name": "projects",
+                    "thread_id": "", "remote_pid": 4242,
+                }
+            }
+            with patch("session_hub.live_owner_records", lambda *a, **k: records):
+                rows = session_hub.pending_launch_running_rows(
+                    {}, [], frozenset({"projects"}), set(),
+                    frozenset({"Codex"}), proc_root=proc_root,
+                )
+        self.assertEqual(len(rows), 1)
+        _display, cwd, row, match, resolved_name = rows[0]
+        self.assertEqual((cwd, row["provider"], resolved_name), (
+            "/home/user/projects", "Codex", "projects",
+        ))
+        self.assertIsNone(match)
+
+    def test_codex_app_server_owner_census_falls_back_to_the_recorded_thread(self):
+        """An app-server between turns holds no rollout fd at all; the record's own thread_id is
+        the durable memory of the same fact, so a live row must not resolve to None."""
+        records = {
+            "projects": {"pid": 4242, "name": "projects", "thread_id": "01a04002"},
+        }
+        with (
+            patch("session_hub.live_owner_records", lambda *a, **k: records),
+            patch("session_hub.open_rollout_keys", lambda *a, **k: []),
+        ):
+            self.assertEqual(
+                session_hub.codex_app_server_owner_census(), {"Codex:01a04002": "projects"}
+            )
+        with (
+            patch("session_hub.live_owner_records", lambda *a, **k: records),
+            patch("session_hub.open_rollout_keys", lambda *a, **k: ["Codex:live-one"]),
+        ):
+            # An open fd still wins - it is the CURRENT thread, the record is the last known one.
+            self.assertEqual(
+                session_hub.codex_app_server_owner_census(), {"Codex:live-one": "projects"}
+            )
+
     def test_resolve_clear_continuations_first_sighting_records_without_link(self):
         with tempfile.TemporaryDirectory() as temp:
             pid_dir = Path(temp)
