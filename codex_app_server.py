@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -177,33 +178,18 @@ def live_remote_owner_names(registry_dir: Path = REGISTRY_DIR) -> dict[str, str]
 
     App Server liveness alone is insufficient: only a record with a live, start-time-bound
     remote client and a tmux window identity can make a row appear Running. Duplicate owner
-    claims are omitted rather than guessed.
+    claims are omitted rather than guessed - by row id (live_owner_records) AND by tmux NAME
+    here: two records claiming one name is the split-identity state row772 hit live, where the
+    Running tab silently believed one record while peer addressing refused the name as
+    ambiguous. Dropping both is what makes the two disagreements the same visible fault.
     """
-    candidates: dict[str, list[str]] = {}
-    for path in registry_dir.glob("*.json"):
-        try:
-            raw = _read_owner_record(path)
-            record = live_record(path, row_id=raw["row_id"])
-        except (OSError, RuntimeError, ValueError):
-            continue
-        remote_pid = record.get("remote_pid")
-        remote_start = record.get("remote_start_time")
-        remote_window = record.get("remote_window_id")
-        name = record.get("name")
-        if (
-            not isinstance(remote_pid, int)
-            or not remote_start
-            or process_start_time(remote_pid) != remote_start
-            or not remote_window
-            or not name
-        ):
-            continue
-        candidates.setdefault(record["row_id"], []).append(name)
-    return {
-        row_id: names[0]
-        for row_id, names in candidates.items()
-        if len(names) == 1
+    names = {
+        row_id: record["name"] for row_id, record in live_owner_records(registry_dir).items()
     }
+    claims: dict[str, int] = {}
+    for name in names.values():
+        claims[name] = claims.get(name, 0) + 1
+    return {row_id: name for row_id, name in names.items() if claims[name] == 1}
 
 
 def stop_owned_for_row(row_id: str, registry_dir: Path = REGISTRY_DIR) -> bool:
@@ -228,3 +214,131 @@ def wait_ready(endpoint: Path, timeout: float = 5.0) -> bool:
         except OSError:
             time.sleep(0.05)
     return False
+
+
+_ROLLOUT_ID_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$"
+)
+
+
+def open_rollout_keys(pid: int, sessions_root: Path, proc_root: Path = Path("/proc")) -> list[str]:
+    """Codex transcript keys whose rollout JSONL is open on ``pid``, newest write first.
+
+    In App Server mode the tmux pane runs a thin ``codex --remote`` client that holds NO
+    rollout; the transcript is open on the detached ``codex app-server`` process, which is a
+    child of Session Hub and never a descendant of the pane.  Every /proc-descendant walk in
+    session_hub.py therefore resolves an App Server row to None, which is why such a row could
+    not auto-link, could not appear in Running, and could not be addressed by name.  This walks
+    the ONE pid the owner record already names, so ownership needs no discovery at all.
+
+    Ordered by rollout mtime, newest first: a single app-server holding more than one open
+    rollout (mid-/clear, or a fork) is on the most recently written one.  An empty list is
+    itself meaningful - an app-server with no open rollout has no conversation to lose and is
+    the exact signature of an orphan left behind by a remote client that died at startup.
+    """
+    found: list[tuple[float, str]] = []
+    try:
+        descriptors = list((proc_root / str(pid) / "fd").iterdir())
+    except OSError:
+        return []
+    for descriptor in descriptors:
+        try:
+            target = descriptor.resolve(strict=True)
+            target.relative_to(sessions_root)
+            mtime = target.stat().st_mtime
+        except (OSError, ValueError):
+            continue
+        match = _ROLLOUT_ID_RE.search(target.name)
+        if match:
+            found.append((mtime, f"Codex:{match.group(1)}"))
+    seen: set[str] = set()
+    ordered = []
+    for _mtime, key in sorted(found, reverse=True):
+        if key not in seen:
+            seen.add(key)
+            ordered.append(key)
+    return ordered
+
+
+def live_owner_records(registry_dir: Path = REGISTRY_DIR) -> dict[str, dict]:
+    """{row_id: record} for every owner whose App Server AND remote client are both live.
+
+    Same liveness contract as live_remote_owner_names (which returns only the names), exposed
+    whole so a caller that needs the App Server pid or the record path - the identity census and
+    the /clear reconciler - does not re-scan the registry a second time.  Duplicate row_id claims
+    are omitted rather than guessed, exactly as before.
+    """
+    candidates: dict[str, list[dict]] = {}
+    for path in sorted(registry_dir.glob("*.json")):
+        try:
+            raw = _read_owner_record(path)
+            record = live_record(path, row_id=raw["row_id"])
+        except (OSError, RuntimeError, ValueError):
+            continue
+        remote_pid = record.get("remote_pid")
+        remote_start = record.get("remote_start_time")
+        if (
+            not isinstance(remote_pid, int)
+            or isinstance(remote_pid, bool)
+            or not remote_start
+            or process_start_time(remote_pid) != remote_start
+            or not record.get("remote_window_id")
+            or not record.get("name")
+        ):
+            continue
+        candidates.setdefault(record["row_id"], []).append({**record, "path": path})
+    return {
+        row_id: records[0]
+        for row_id, records in candidates.items()
+        if len(records) == 1
+    }
+
+
+def save_owner_thread_id(path: Path, *, row_id: str, thread_id: str) -> bool:
+    """Persist the thread this owner's App Server is CURRENTLY on, atomically.
+
+    The record is the only place a thread change survives across refreshes, and it is bound to
+    one start-time-verified process, so comparing the stored value against the live rollout is
+    what makes a /clear detectable without guessing from cwd or recency.  Refuses to write
+    through a record that is not exactly this row's.
+    """
+    record = _read_owner_record(path)
+    if record["row_id"] != row_id or record["thread_id"] == thread_id:
+        return False
+    record["thread_id"] = thread_id
+    tmp = path.with_name(f".{path.name}.thread.tmp")
+    tmp.write_text(json.dumps(record, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return True
+
+
+def retire_orphan_owner(path: Path, *, row_id: str, sessions_root: Path) -> bool:
+    """Retire an owner record whose App Server holds no conversation, and stop that server.
+
+    Only reachable for a record whose remote client is already provably dead by start time.  An
+    App Server with zero open rollouts has nothing to lose, so this is the recovery path out of
+    the permanent lockout task row772 hit live: a dead remote plus a reserved window owned by a
+    DIFFERENT record made launch_exact refuse forever with no way back through the UI.  Every
+    other ambiguous or still-working case keeps failing closed.
+    """
+    record = _read_owner_record(path)
+    if record["row_id"] != row_id:
+        return False
+    endpoint = Path(record["endpoint"])
+    if endpoint.parent != path.parent or endpoint.name != f"{path.stem}.sock":
+        return False
+    pid = record["pid"]
+    if not record["start_time"] or process_start_time(pid) != record["start_time"]:
+        # Not our process any more; retire the claim only, never signal a stranger.
+        path.unlink(missing_ok=True)
+        return True
+    if open_rollout_keys(pid, sessions_root):
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    endpoint.unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
+    return True

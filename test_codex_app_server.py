@@ -352,6 +352,8 @@ def main() -> int:
 
     _fake_lifecycle_control()
     _fake_session_hub_launch_control()
+    _open_rollout_control()
+    _duplicate_name_control()
 
     source = inspect.getsource(codex_app_server)
     assert "wait_ready" in source and "not record[\"start_time\"]" in source
@@ -405,3 +407,59 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def _rollout(root: Path, session_id: str, mtime: float) -> Path:
+    path = root / f"rollout-2026-09-04T10-16-44-{session_id}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n")
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def _open_rollout_control() -> None:
+    """row772: an App Server row's transcript is open on the DETACHED app-server process, never
+    on the `codex --remote` tmux pane, so the pane-descendant walk in session_hub.py can only
+    ever resolve such a row to None. open_rollout_keys reads the one pid the owner record
+    already names, newest-written rollout first."""
+    from codex_app_server import open_rollout_keys
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        sessions = root / "sessions"
+        older = "01a04cd5-ccd2-7612-8f3d-dfbcb8463814"
+        newer = "01a06b46-e90c-72d1-b225-386780028070"
+        _rollout(sessions, older, 1000.0)
+        _rollout(sessions, newer, 2000.0)
+
+        proc = root / "proc" / "4242" / "fd"
+        proc.mkdir(parents=True)
+        for index, session_id in enumerate((older, newer)):
+            (proc / str(index)).symlink_to(
+                sessions / f"rollout-2026-09-04T10-16-44-{session_id}.jsonl"
+            )
+        # An unrelated fd must never be mistaken for a transcript.
+        (root / "unrelated.sqlite").write_text("")
+        (proc / "9").symlink_to(root / "unrelated.sqlite")
+
+        keys = open_rollout_keys(4242, sessions.resolve(), root / "proc")
+        assert keys == [f"Codex:{newer}", f"Codex:{older}"], keys
+        # An App Server holding no rollout owns no conversation - the orphan signature.
+        assert open_rollout_keys(4243, sessions.resolve(), root / "proc") == []
+
+
+def _duplicate_name_control() -> None:
+    """row772: two live records claiming one tmux name is the split-identity state where the
+    Running tab silently believed one record while peer addressing refused the name as
+    ambiguous. Both must drop, so the two disagreements become one visible fault."""
+    from codex_app_server import live_remote_owner_names
+
+    records = {
+        "group:/p#row": {"name": "row", "row_id": "group:/p#row"},
+        "row": {"name": "row", "row_id": "row"},
+    }
+    with patch.object(codex_app_server, "live_owner_records", lambda *a, **k: records):
+        assert live_remote_owner_names(Path("/nonexistent")) == {}
+    single = {"group:/p#row": {"name": "row", "row_id": "group:/p#row"}}
+    with patch.object(codex_app_server, "live_owner_records", lambda *a, **k: single):
+        assert live_remote_owner_names(Path("/nonexistent")) == {"group:/p#row": "row"}

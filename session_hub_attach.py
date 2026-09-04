@@ -326,10 +326,17 @@ def attach_or_launch(
         row_id = target.get("override_key") or target.get("session_key")
         if not isinstance(row_id, str) or not row_id:
             raise AttachError("Codex session has no stable ownership key")
+        # Only a Codex identity is a Codex thread id. A row mid-swap (Continue with other
+        # agent) still carries the `Claude:<uuid>` it came from, and passing that through built
+        # `codex --remote ... resume Claude:<uuid>`: the remote client died at startup and its
+        # orphaned App Server record then blocked every later Launch of the row (row772,
+        # 2026-09-04). None means "start a fresh thread", which is the correct fallback.
         session_id = target.get("session_id") or target.get("session_key")
-        if isinstance(session_id, str) and session_id.startswith("Codex:"):
-            session_id = session_id.split(":", 1)[1]
-        if session_id is not None and not isinstance(session_id, str):
+        if not isinstance(session_id, str):
+            session_id = None
+        elif session_id.startswith("Codex:"):
+            session_id = session_id.split(":", 1)[1] or None
+        elif ":" in session_id:
             session_id = None
         try:
             SessionHubController(metadata_path).launch_exact(

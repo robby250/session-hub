@@ -32,9 +32,14 @@ from terminal_profile import (  # noqa: E402  (see terminal_profile.py -- shared
 from datetime import date, datetime
 from pathlib import Path
 from codex_app_server import (
-    discard_stale_record, live_remote_owner_names, record_for_row, stop_owned,
-    stop_owned_for_row,
+    REGISTRY_DIR, discard_stale_record, live_owner_records, live_remote_owner_names,
+    open_rollout_keys, record_for_row, save_owner_thread_id, stop_owned, stop_owned_for_row,
 )
+# REGISTRY_DIR is imported (and threaded through every registry call below, rather than left to
+# each function's own default) so a test can redirect the App Server owner registry the same way
+# _test_sandbox redirects XDG_DATA_HOME. test_codex_app_server already patched
+# `session_hub.REGISTRY_DIR`, against a name that did not exist here -- the patch raised instead
+# of isolating, so those launch controls were reading the real runtime registry.
 
 # Keep headless row control screen-inert: dispatch before importing PyQt6.  The controller is
 # deliberately a separate module so CLI callers never construct QApplication or SessionHub.
@@ -3386,6 +3391,65 @@ def resolve_pending_codex_group_rows(
     return changed
 
 
+def reconcile_codex_owner_threads(metadata: dict) -> bool:
+    """Follow a Codex App Server row across a `/clear` (or a thread fork) and link the two.
+
+    `/clear` inside a Codex row starts a new rollout inside the SAME App Server process, which
+    Session Hub never launched and so never saw -- the row simply became a stranger in All
+    Sessions, exactly as a Claude `/clear` did before resolve_clear_continuations.  That function
+    cannot help here: it is Claude-only and keys on the PID-tracking files record_hub_launch
+    writes for hub-launched Claude terminals.
+
+    The anchor is deliberately NOT the row.  A standalone Codex row's `row_id` IS its native key
+    (resume_session passes `session_key=session.key`), so a `/clear` invalidates the very thing
+    we would key on; a group row's `override_key` is stable but rename_group_row_in rewrites it
+    without touching the runtime record.  Anchor instead on one owner record's own start-time-
+    bound process lifetime -- same record, same App Server pid, two sequential observations:
+
+        prev = record["thread_id"]                       last thread this exact process was on
+        now  = newest-mtime rollout fd open on record["pid"]        the thread it is on now
+
+    `live_owner_records` binds pid to start_time, so a reused pid can never inherit another
+    process's `prev`, and no cwd, recency or name heuristic enters the decision at all.  A fork
+    is indistinguishable from a `/clear` -- both are continuations, so both link, which is right.
+    Two `/clear`s while Session Hub is closed link first->last and skip the middle thread.
+    """
+    sessions_root = CODEX_SESSIONS.resolve()
+    changed = False
+    for row_id, record in live_owner_records(REGISTRY_DIR).items():
+        keys = open_rollout_keys(record["pid"], sessions_root, PROC_ROOT)
+        if not keys:
+            continue
+        new_key = keys[0]
+        new_id = new_key.split(":", 1)[1]
+        previous = record["thread_id"]
+        if previous == new_id:
+            continue
+        # A previous value carrying a provider prefix is not a thread id at all but a row's
+        # saved session_key that leaked through before _thread_id refused non-Codex keys.  It
+        # names no Codex conversation, so there is nothing to link it to -- just correct it.
+        if previous and ":" not in previous:
+            link_continuation(
+                metadata, f"Codex:{previous}", new_key, record.get("name"), "clear"
+            )
+            changed = True
+        # The record write is runtime state, never metadata -- it must not make this function
+        # claim a metadata change and trigger a write_metadata on every idle refresh.
+        save_owner_thread_id(record["path"], row_id=row_id, thread_id=new_id)
+        for group in metadata.get("groups", {}).values():
+            for row in group.get("rows", []):
+                if row.get("override_key") != row_id:
+                    continue
+                # The owner record is exact ownership, not discovery, so it can bind the row
+                # directly instead of waiting for resolve_pending_codex_group_rows' census.
+                if row.get("session_key") != new_key:
+                    row["session_key"] = new_key
+                    changed = True
+                if row.pop("codex_pending_since", None) is not None:
+                    changed = True
+    return changed
+
+
 def pending_codex_exact_owner(
     row: dict,
     by_key: dict[str, Session],
@@ -4121,8 +4185,18 @@ def codex_tmux_native_key(
     (refresh_running_tab) uses `tmux_native_key_census` instead, which shares
     ONE `tmux list-panes -a` snapshot across every row rather than spawning
     this function's own `list-panes -t <name>` once per row.
+
+    The App Server registry is consulted first and answers exactly (row772): a `codex --remote`
+    pane holds no rollout at all, so for such a row the pane walk below can only ever return
+    None -- which is what stopped resolve_pending_links from completing a Claude->Codex handoff.
+    Skipped when a caller injects `proc_root`/`sessions_root`, since those callers are asking
+    about a synthetic tree the real runtime registry knows nothing about.
     """
     name = sanitize_tmux_session_name(name)
+    if proc_root is None and sessions_root is None:
+        for native_key, owner_name in codex_app_server_owner_census().items():
+            if owner_name == name:
+                return native_key
     tmux = shutil.which("tmux")
     if not tmux:
         return None
@@ -4200,6 +4274,33 @@ def tmux_name_by_native_key_failing_closed(census: dict[str, str]) -> dict[str, 
     return {key: owners[0] for key, owners in owners_by_key.items() if len(owners) == 1}
 
 
+def codex_app_server_owner_census() -> dict[str, str]:
+    """{native_key: tmux_name} for every live App Server row, read from the owner registry.
+
+    In App Server mode the tmux pane runs a thin `codex --remote` client that holds NO rollout
+    fd; the transcript is open on the detached `codex app-server`, a child of Session Hub that
+    is never a descendant of the pane.  The pane-descendant walk every other census here does
+    therefore resolves such a row to None, which is what made an App Server row unable to
+    auto-link after a Continue-with-other-agent, invisible in the Running tab, and unaddressable
+    by name (row772 live incident, 2026-09-04).
+
+    This needs no discovery at all: the owner record already names the exact App Server pid, so
+    one /proc read per live row yields the exact rollout it has open.  Fails closed on ambiguity
+    the same way the pane census does - a tmux name claimed by two live rows resolves to
+    neither.
+    """
+    sessions_root = CODEX_SESSIONS.resolve()
+    claims: dict[str, list[str]] = {}
+    for record in live_owner_records(REGISTRY_DIR).values():
+        keys = open_rollout_keys(record["pid"], sessions_root, PROC_ROOT)
+        if not keys:
+            continue
+        # Newest-written rollout first: an App Server momentarily holding two open rollouts
+        # (mid-/clear, or a fork) is working on the one it just wrote to.
+        claims.setdefault(keys[0], []).append(record["name"])
+    return {key: names[0] for key, names in claims.items() if len(names) == 1}
+
+
 def compute_codex_tmux_owner_census(
     pane_snapshot: dict[str, tuple[str, str, str]] | None = None,
 ) -> dict[str, str]:
@@ -4208,12 +4309,18 @@ def compute_codex_tmux_owner_census(
     refresh_running_tab/sessions_json_cli already computed independently (task-2156). Factored
     out so codex_duplicate_row_losers's callers share one call site instead of re-deriving the
     census inline; call once per refresh/CLI/dialog/click pass, never from inside a per-row loop.
+
+    The App Server registry is merged in on top (row772): it is an exact ownership record, while
+    the pane walk is discovery, so where both speak the registry wins.  Neither can see what the
+    other sees - a plain `codex` pane holds its own rollout and files no record; an App Server
+    row files a record and its pane holds nothing - so the union is what covers both launch modes.
     """
     pane_snapshot = tmux_pane_activity_snapshot() if pane_snapshot is None else pane_snapshot
     pane_pid_by_name = {
         name: pid for name, (_pane_id, pid, _activity) in pane_snapshot.items()
     }
-    return tmux_name_by_native_key_failing_closed(tmux_native_key_census(pane_pid_by_name))
+    census = tmux_name_by_native_key_failing_closed(tmux_native_key_census(pane_pid_by_name))
+    return {**census, **codex_app_server_owner_census()}
 
 
 def codex_duplicate_row_losers(
@@ -7524,7 +7631,7 @@ class ManageGroupDialog(QDialog):
         # after an external restart) resolves identically here instead of reading Stopped/wrong.
         live_names = tmux_live_session_names()
         tmux_name_by_native_key = compute_codex_tmux_owner_census()
-        codex_owner_by_row_id = live_remote_owner_names()
+        codex_owner_by_row_id = live_remote_owner_names(REGISTRY_DIR)
         # populate_session_table ends with setSortingEnabled(True), which re-sorts the table by the
         # last-clicked header on the spot -- so `pairs` order is NOT the visual row order any more.
         # Writing the group-only columns by enumerate() index put Status / Session ID / Transcripts
@@ -9505,7 +9612,7 @@ class SessionHub(QMainWindow):
         # `tmux has-session` (was up to 2 subprocesses per row).
         pane_snapshot = tmux_live_pane_snapshot()
         live_names = frozenset(pane_snapshot)
-        codex_owner_by_row_id = live_remote_owner_names()
+        codex_owner_by_row_id = live_remote_owner_names(REGISTRY_DIR)
 
         # task-2156: ONE shared batched identity view, computed before the group-row
         # loop below so it can decide EACH row's actual tmux target, not just its
@@ -9518,6 +9625,11 @@ class SessionHub(QMainWindow):
             if tmux_owner_by_native_key is not None
             else compute_codex_tmux_owner_census(pane_snapshot)
         )
+        # Ordered before resolve_pending_codex_group_rows: an App Server row's owner record is
+        # exact ownership, so binding from it leaves that census with only the panes it can
+        # actually see (row772).
+        if reconcile_codex_owner_threads(self.metadata):
+            write_metadata(self.metadata)
         if resolve_pending_codex_group_rows(
             self.metadata, live, tmux_owner_by_native_key=tmux_name_by_native_key
         ):
@@ -9808,7 +9920,7 @@ class SessionHub(QMainWindow):
         if row.get("provider") == "Codex":
             from session_hub_control import ControlError, SessionHubController
             try:
-                return SessionHubController(METADATA_PATH).stop(cwd, name)
+                return SessionHubController(METADATA_PATH, registry_dir=REGISTRY_DIR).stop(cwd, name)
             except (ControlError, OSError, RuntimeError, ValueError) as error:
                 return {"status": "error", "message": str(error)}
         stop_tmux_session(name)
@@ -11181,7 +11293,7 @@ class SessionHub(QMainWindow):
         if not name:
             raise RuntimeError("Codex App Server launch requires a tmux session name")
         from session_hub_control import SessionHubController
-        SessionHubController(METADATA_PATH).launch_exact(
+        SessionHubController(METADATA_PATH, registry_dir=REGISTRY_DIR).launch_exact(
             row_id=row_id, name=name, cwd=cwd, thread_id=session_id,
             process_cwd=source_cwd or cwd,
         )
@@ -11202,12 +11314,12 @@ class SessionHub(QMainWindow):
                     process.terminate()
             return
         try:
-            stop_owned_for_row(row_id)
+            stop_owned_for_row(row_id, REGISTRY_DIR)
         except (OSError, RuntimeError, ValueError):
             # A stale single record can be retired after binding validation; an
             # ambiguous set remains untouched and fail-closed.
             try:
-                record_path = record_for_row(row_id)
+                record_path = record_for_row(row_id, REGISTRY_DIR)
             except RuntimeError:
                 # record_for_row raises for multiple owners.  Never turn that ambiguity into a
                 # replacement launch: the caller must see the fail-closed refusal.
@@ -11803,12 +11915,36 @@ class SessionHub(QMainWindow):
                     "target_tmux_name": tmux_name if target in ("Claude", "Codex") else None,
                 }
             )
+            if group_row is not None and target == "Codex":
+                # The row's saved session_key is still the Claude conversation being swapped
+                # AWAY from. Left in place it makes find_group_member_session render the dead
+                # Claude session as this row, and SessionHubController._thread_id used to hand
+                # that `Claude:<uuid>` to `codex --remote ... resume` as a thread id. Mark the
+                # row pending instead: it fails closed until resolve_pending_codex_group_rows
+                # binds it to the real rollout, exactly like a fresh group-row launch.
+                group_row.pop("session_key", None)
+                group_row["codex_pending_since"] = int(datetime.now().timestamp() * 1000) - 1000
             self.launch(
                 target,
                 None,
                 session.cwd,
                 model=model,
                 reasoning_effort=reasoning_effort if target == "Codex" else None,
+                # Every other Codex launch site passes session_key; this one did not, so
+                # _launch_codex_app_server fell back to `row_id = tmux_name` and filed the App
+                # Server owner record under the BARE tmux name. The Running tab looks that
+                # registry up by override_key, so the row it had just launched was invisible to
+                # it -- and a later Launch found a second, differently-keyed record and refused
+                # forever (row772, 2026-09-04). Codex only: for Codex `launch` returns before
+                # ever reading session_key as an override bucket (it is purely the App Server
+                # row id), while for Antigravity the same argument would newly apply the SOURCE
+                # session's env/flag overrides to the destination -- a change this fix does not
+                # intend to make.
+                session_key=(
+                    (group_row["override_key"] if group_row is not None else logical_key)
+                    if target == "Codex"
+                    else None
+                ),
                 tmux_name=tmux_name,
             )
 
@@ -11988,7 +12124,7 @@ class SessionHub(QMainWindow):
         if provider == "Codex":
             from session_hub_control import ControlError, SessionHubController
             try:
-                result = SessionHubController(METADATA_PATH).launch(
+                result = SessionHubController(METADATA_PATH, registry_dir=REGISTRY_DIR).launch(
                     cwd, name, resume=bool(row.get("session_key"))
                 )
                 self._announce_running_launch(result.get("name") or name)
@@ -12120,7 +12256,7 @@ class SessionHub(QMainWindow):
         if row.get("provider", "Claude") == "Codex":
             from session_hub_control import ControlError, SessionHubController
             try:
-                result = SessionHubController(METADATA_PATH).launch(cwd, name, resume=True)
+                result = SessionHubController(METADATA_PATH, registry_dir=REGISTRY_DIR).launch(cwd, name, resume=True)
                 self._announce_running_launch(result.get("name") or name)
                 return result
             except (ControlError, OSError, RuntimeError) as error:
@@ -12530,7 +12666,7 @@ def sessions_json_cli() -> int:
     # A managed Codex remote client does not have to expose its rollout through a
     # transcript FD, so the pane census can legitimately miss it even while the
     # App Server registry proves the exact row -> tmux owner live.
-    codex_owner_by_row_id = live_remote_owner_names()
+    codex_owner_by_row_id = live_remote_owner_names(REGISTRY_DIR)
     sessions = discover_sessions(metadata, tmux_owner_by_native_key=tmux_name_by_native_key)
     settings = metadata.get("settings", {})
     live: list[Session] = []
@@ -12547,6 +12683,10 @@ def sessions_json_cli() -> int:
     # task-2156: same shared batched identity view refresh_running_tab uses, so the
     # TUI/JSON path stops reading a live-but-externally-renamed row as Stopped/
     # unknown too (the brief names this path explicitly).
+    # Same authority and same order as refresh_running_tab -- the headless/TUI/peer JSON must
+    # never disagree with the GUI about which thread a row is on.
+    if reconcile_codex_owner_threads(metadata):
+        write_metadata(metadata)
     if resolve_pending_codex_group_rows(
         metadata, live, tmux_owner_by_native_key=tmux_name_by_native_key
     ):
@@ -12740,7 +12880,7 @@ def stop_group_row_cli(argv: list[str]) -> int:
     if row.get("provider") == "Codex":
         from session_hub_control import ControlError, SessionHubController
         try:
-            result = SessionHubController(METADATA_PATH).stop(cwd, name)
+            result = SessionHubController(METADATA_PATH, registry_dir=REGISTRY_DIR).stop(cwd, name)
         except (ControlError, OSError, RuntimeError, ValueError) as error:
             result = {"status": "error", "message": str(error)}
     else:
@@ -12776,7 +12916,7 @@ def stop_session_cli(argv: list[str]) -> int:
         print(json.dumps({"status": "error", "message": f"{key!r} is not launched in tmux."}))
         return 1
     if session.provider == "Codex":
-        stop_owned_for_row(session.key)
+        stop_owned_for_row(session.key, REGISTRY_DIR)
     stop_tmux_session(name)
     print(json.dumps({"status": "ok"}))
     return 0

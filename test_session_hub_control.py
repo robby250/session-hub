@@ -206,3 +206,32 @@ def test_bad_row_and_wrong_provider_fail_closed(tmp_path):
         assert "Codex" in str(error)
     else:
         raise AssertionError("wrong-provider row was accepted")
+
+
+def _thread_id(session_key):
+    controller = control.SessionHubController(Path("/nonexistent/metadata.json"))
+    return controller._thread_id({"session_key": session_key} if session_key is not None else {})
+
+
+def test_thread_id_refuses_a_non_codex_session_key():
+    """row772: a row mid-swap still carries `Claude:<uuid>`; passing it through built
+    `codex --remote ... resume Claude:<uuid>`, whose remote client died at startup and left an
+    orphaned App Server whose record then blocked every later Launch of that row."""
+    assert _thread_id("Codex:01a06b46-e90c-72d1-b225-386780028070") == (
+        "01a06b46-e90c-72d1-b225-386780028070"
+    )
+    assert _thread_id("Claude:b2a5d02f-cf86-451f-980f-b95dd533b00e") is None
+    assert _thread_id("Antigravity:abc") is None
+    assert _thread_id("Codex:") is None
+    assert _thread_id("") is None
+    assert _thread_id(None) is None
+
+
+def test_attach_refuses_a_non_codex_session_key_as_a_thread_id():
+    """The same guard on the `session-hub attach NAME` fast path, which resolves its own
+    thread id instead of going through SessionHubController._thread_id."""
+    import session_hub_attach
+
+    source = Path(session_hub_attach.__file__).read_text()
+    assert 'elif ":" in session_id:' in source
+    assert 'session_id.split(":", 1)[1] or None' in source

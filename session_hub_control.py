@@ -17,11 +17,12 @@ from typing import Callable
 
 from codex_app_server import (
     REGISTRY_DIR, app_server_argv, discard_stale_record, endpoint_for,
-    live_record, publish_record, record_for_row, remote_tui_argv, stop_owned,
-    wait_ready,
+    live_record, publish_record, record_for_row, remote_tui_argv,
+    retire_orphan_owner, stop_owned, wait_ready,
 )
 
 REMOTE_WINDOW = "__session_hub_codex_remote__"
+CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
 _TMUX_NAME_UNSAFE = re.compile(r"[.:]")
 
 
@@ -172,6 +173,30 @@ class SessionHubController:
         # process identity no longer exists and its stale record may be replaced.
         return _start_time(remote_pid) != remote_start
 
+    def _retire_if_orphaned(self, path: Path, row_id: str, owner: dict) -> bool:
+        """Retire an owner record left behind by a remote client that never really ran.
+
+        Both conditions must hold, and neither is a heuristic: the remote client is gone by
+        start-time comparison (never by signalling it), and the App Server has no rollout JSONL
+        open, so it is holding no conversation.  That pair is the exact signature of a remote
+        launched with an invalid thread id - see _thread_id - which exits at startup and strands
+        its server.  Anything still working, ambiguous, or merely detached keeps failing closed.
+        """
+        remote_pid = owner.get("remote_pid")
+        remote_start = owner.get("remote_start_time")
+        if (
+            not isinstance(remote_pid, int)
+            or isinstance(remote_pid, bool)
+            or not isinstance(remote_start, str)
+            or not remote_start
+            or _start_time(remote_pid) == remote_start
+        ):
+            return False
+        try:
+            return retire_orphan_owner(path, row_id=row_id, sessions_root=CODEX_SESSIONS.resolve())
+        except (OSError, RuntimeError, ValueError):
+            return False
+
     def _remove_created_remote_window(self, session: str, window_id: str) -> None:
         """Kill only a newly-created reserved window after proving its exact identity."""
         windows = [(wid, wname) for wid, wname in self._windows(session)
@@ -200,10 +225,18 @@ class SessionHubController:
         return record_for_row(row_id, self.registry_dir)
 
     def _thread_id(self, row: dict) -> str | None:
+        """The Codex thread id this row resumes, or None to start a fresh one.
+
+        A non-``Codex:`` session_key is NOT a thread id and must never be passed through.  A row
+        mid-swap (Continue with other agent) still carries the Claude key it came from, and
+        returning it verbatim built ``codex --remote ... resume Claude:<uuid>`` - an invalid
+        thread id whose remote client died on startup, leaving an orphaned App Server whose
+        record then blocked every later Launch of the row (row772 live incident, 2026-09-04).
+        """
         key = row.get("session_key")
-        if not isinstance(key, str) or not key:
+        if not isinstance(key, str) or not key.startswith("Codex:"):
             return None
-        return key.split(":", 1)[1] if key.startswith("Codex:") else key
+        return key.split(":", 1)[1] or None
 
     def status(self, cwd: str, name: str) -> dict:
         row, row_id = self._row(cwd, name)
@@ -249,19 +282,30 @@ class SessionHubController:
                     allow_existing = True
                 except ControlError:
                     if not self._remote_identity_can_be_recreated(name, owner):
-                        raise
-                    allow_existing = False
-                window_id, created = self._ensure_remote_window(
-                    name, cwd, Path(owner["endpoint"]), owner.get("thread_id") or None,
-                    allow_existing=allow_existing,
-                )
-                owner = self._save_remote_identity(
-                    existing, pid=self._remote_pid(name, window_id), window_id=window_id
-                )
-                return {"status": "resumed" if owner["thread_id"] else "running", "name": name,
-                        "row_id": row_id, "thread_id": owner["thread_id"],
-                        "window_id": window_id, "reused": True,
-                        "window_created": created}
+                        # Last resort before failing closed: a record whose remote client is
+                        # provably dead and whose App Server holds NO open rollout owns no
+                        # conversation, so retiring it loses nothing.  Without this the row772
+                        # state is a PERMANENT lockout - the dead owner's window is gone, but a
+                        # DIFFERENT record's reserved window in the same tmux session makes
+                        # _remote_identity_can_be_recreated refuse, and Stop refuses for the
+                        # same reason, so the UI offers no way back at all.
+                        if not self._retire_if_orphaned(existing, row_id, owner):
+                            raise
+                        existing = None
+                    else:
+                        allow_existing = False
+                if existing is not None:
+                    window_id, created = self._ensure_remote_window(
+                        name, cwd, Path(owner["endpoint"]), owner.get("thread_id") or None,
+                        allow_existing=allow_existing,
+                    )
+                    owner = self._save_remote_identity(
+                        existing, pid=self._remote_pid(name, window_id), window_id=window_id
+                    )
+                    return {"status": "resumed" if owner["thread_id"] else "running", "name": name,
+                            "row_id": row_id, "thread_id": owner["thread_id"],
+                            "window_id": window_id, "reused": True,
+                            "window_created": created}
 
         self.registry_dir.mkdir(parents=True, exist_ok=True)
         endpoint = endpoint_for(row_id, self.registry_dir)
@@ -315,7 +359,15 @@ class SessionHubController:
         if owner_path is None:
             return {"status": "stopped", "name": name, "row_id": row_id, "already_stopped": True}
         owner = live_record(owner_path, row_id=row_id)
-        self._validate_remote_identity(name, owner)
+        try:
+            self._validate_remote_identity(name, owner)
+        except ControlError:
+            # Same recovery launch_exact takes: a dead remote plus a conversation-less App
+            # Server is an orphan, and Stop refusing it too is what left row772 with no way out
+            # of the lockout from either direction.
+            if not self._retire_if_orphaned(owner_path, row_id, owner):
+                raise
+            return {"status": "stopped", "name": name, "row_id": row_id, "already_stopped": True}
         # Kill only the Hub-owned remote pane's process, then the Hub-owned App Server. The
         # session and all composer/legacy panes remain untouched.
         remote_pid = owner.get("remote_pid")
